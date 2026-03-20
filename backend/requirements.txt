@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+numpy
+scipy
+scikit-fem
+openai
+python-dotenv
