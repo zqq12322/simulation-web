@@ -10,6 +10,7 @@ from thermal import router as thermal_router
 from modal import router as modal_router
 from mesh_quality import router as mesh_quality_router
 from convergence import router as convergence_router
+from convergence_study import router as convergence_study_router
 from projects import router as projects_router
 from auth import router as auth_router
 
@@ -58,6 +59,7 @@ app.include_router(thermal_router, prefix="/api")
 app.include_router(modal_router, prefix="/api")
 app.include_router(mesh_quality_router, prefix="/api")
 app.include_router(convergence_router, prefix="/api")
+app.include_router(convergence_study_router, prefix="/api")
 app.include_router(projects_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 

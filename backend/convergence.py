@@ -165,12 +165,78 @@ def richardson_limit(
     return float(values[-1]) + (float(values[-1]) - float(values[-2])) / factor
 
 
+def _richardson_ratio_function(order: float, sizes: Sequence[float]) -> float:
+    """
+    Richardson 关系左边的那个函数：``f(p) = (h1^p − h2^p) / (h2^p − h3^p)``。
+
+    它来自误差模型 ``e_k = C·h_k^p``：相邻差值之比就是分子分母之比。
+    加密比均匀（`h2 = h1/q`、`h3 = h1/q²`）时 `f(p) = q^p`，于是
+    `p = log(r)/log(q)`——也就是常用的那个公式。**但真实网格常常不均匀**
+    （见 `generalized_order` 的说明），那时这个函数才是对的。
+    """
+    h1, h2, h3 = (float(size) for size in sizes[-3:])
+    numerator = h1 ** order - h2 ** order
+    denominator = h2 ** order - h3 ** order
+    if denominator <= 0.0:
+        return float("inf")
+    return numerator / denominator
+
+
+def generalized_order(
+    values: Sequence[float], sizes: Sequence[float]
+) -> Optional[float]:
+    """
+    用**实测**网格尺寸估计收敛阶（非均匀加密下的正确做法）。
+
+    为什么需要它：`observed_order` 假设"每级网格尺寸减半"。但 gmsh 的
+    `mesh_size` 只是**名义**目标，真实网格并不按它成比例加密——实测
+    `test_part.step` 用 3/1.5/0.75 划出来的单元数是 426/1366/9462，
+    折算成平均单元尺寸后加密比是 1.47 和 1.91，**不是 2**。在这种数据上
+    套 `log(r)/log(2)` 会算出错的阶数。
+
+    做法：解 ``(h1^p − h2^p)/(h2^p − h3^p) = |Δ1|/|Δ2|``（二分法）。
+    `f` 关于 `p` 单调递增，所以解唯一；解不存在时返回 `None`，含义是
+    "**没有任何正的阶数能解释这组数据**"——那通常是还没进入渐近区，
+    而不是阶数为负。
+
+    `sizes` 只需与 `values` 同长且递减；绝对尺度无关（只用比值）。
+    """
+    if len(values) < 3 or len(sizes) != len(values):
+        return None
+    earlier = abs(float(values[-2]) - float(values[-3]))
+    later = abs(float(values[-1]) - float(values[-2]))
+    if earlier <= 0.0 or later <= 0.0:
+        return None
+    target = earlier / later
+
+    h1, h2, h3 = (float(size) for size in sizes[-3:])
+    if not (h1 > h2 > h3 > 0.0):
+        return None
+
+    # f 的下确界（p → 0+）就是对数比值；目标比它小的话，没有任何 p > 0 能解释
+    floor_value = (math.log(h1) - math.log(h2)) / (math.log(h2) - math.log(h3))
+    if target <= floor_value:
+        return None
+
+    low, high = 1e-6, 20.0
+    if _richardson_ratio_function(high, sizes) < target:
+        return None          # 阶数高于 20 —— 不现实，视为"测不出"
+    for _ in range(200):
+        middle = 0.5 * (low + high)
+        if _richardson_ratio_function(middle, sizes) < target:
+            low = middle
+        else:
+            high = middle
+    return 0.5 * (low + high)
+
+
 def assess(
     values: Sequence[float],
     ratio: float = DEFAULT_REFINEMENT_RATIO,
     expected_order: Optional[float] = None,
     order_tolerance: float = 0.35,
     label: str = "结果",
+    sizes: Optional[Sequence[float]] = None,
 ) -> Dict[str, object]:
     """
     给一串"随加密变化"的数值下结论。
@@ -178,19 +244,36 @@ def assess(
     判定顺序是刻意的：**先看能不能判**（级数够不够、单不单调、差异有没有变小），
     再看**阶数对不对**。这样"尚未收敛"和"收敛但阶数不对"是两句不同的话——
     前者要继续加密，后者说明离散格式或实现有问题，处理方式完全不同。
+
+    `sizes` 给出**实测**的各级网格尺寸（只需与 `values` 同长且递减，绝对尺度
+    无关）时会改用 `generalized_order` 估阶，并用最后两级的真实比值做外推。
+    真实网格（gmsh 的非结构网格）常常不按名义尺寸成比例加密，此时
+    `log(r)/log(2)` 那种算法会给出错的阶数——所以能拿到实测尺寸就一定要给。
     """
     numbers = [float(value) for value in values]
     differences = successive_differences(numbers)
-    order = observed_order(numbers, ratio)
     monotone = is_monotone(numbers)
-    limit = richardson_limit(numbers, order, ratio)
+
+    if sizes is not None and len(sizes) == len(numbers):
+        order = generalized_order(numbers, sizes)
+        # 外推只用最后两级的**真实**加密比
+        local_ratio = (
+            float(sizes[-2]) / float(sizes[-1]) if len(sizes) >= 2 else ratio
+        )
+        estimator = "generalized"
+    else:
+        order = observed_order(numbers, ratio)
+        local_ratio = float(ratio)
+        estimator = "uniform-ratio"
+    limit = richardson_limit(numbers, order, local_ratio)
 
     result: Dict[str, object] = {
         "label": label,
         "values": numbers,
         "differences": differences,
         "levels": len(numbers),
-        "refinement_ratio": float(ratio),
+        "refinement_ratio": float(local_ratio),
+        "order_estimator": estimator,
         "monotone": monotone,
         "observed_order": order,
         "expected_order": expected_order,
@@ -226,11 +309,24 @@ def assess(
         return result
 
     if order is None:
-        result["verdict"] = (
-            f"{label}：加密后相邻两级的差异**没有变小**"
-            f"（{differences[-2]:.6g} → {differences[-1]:.6g}），说明尚未进入收敛区。"
-            "请继续加密，或检查是否存在应力奇异（尖角、点载荷）。"
-        )
+        # 这条分支的措辞很重要：**没有任何正的收敛阶能解释这组数据**，
+        # 可能的原因不止一个，把人只往"奇异"上引会让他白加密好几天。
+        if estimator == "generalized":
+            result["verdict"] = (
+                f"{label}：相邻两级差值的变化**与网格加密的幅度不匹配**"
+                f"（差值 {differences[-2]:.6g} → {differences[-1]:.6g}），"
+                "没有任何正的收敛阶能解释这组数据。常见原因："
+                "① 还停在前渐近区（起始网格太粗，或级数不够）；"
+                "② 该量本身不收敛（应力奇异：尖角、点载荷、单点约束）；"
+                "③ 各级网格并没有按预期幅度加密（逐级单元数见下）。"
+                "建议先加一级或用更细的起始网格，再看结论是否改变。"
+            )
+        else:
+            result["verdict"] = (
+                f"{label}：加密后相邻两级的差异**没有变小**"
+                f"（{differences[-2]:.6g} → {differences[-1]:.6g}），说明尚未进入收敛区。"
+                "请继续加密，或检查是否存在应力奇异（尖角、点载荷）。"
+            )
         return result
 
     if expected_order is not None and abs(order - expected_order) > order_tolerance:

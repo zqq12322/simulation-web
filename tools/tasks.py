@@ -2177,6 +2177,128 @@ def task_verify(args: argparse.Namespace) -> int:
                 f"NaN={nan_count}, max={result['max_stress']:.2f}",
             )
 
+            # --- 用户模型的 h-收敛检查 ------------------------------------------
+            # 上面那条基准证明的是"这套离散会按理论阶收敛"，是**格式**的性质；
+            # 这一条证明的是"**这个模型**的结果随加密稳定下来"，是**模型**的性质。
+            # 两者缺一不可：格式收敛不等于你的网格够细。
+            #
+            # 用同一份配置（body）跑四级。注意它划的是几何的**临时副本**——
+            # 若残留会在仓库里变成未跟踪文件，所以下面专门查一次。
+            #
+            # 用 4 级而不是 3 级：3 级常常还停在前渐近区（实测 3/1.5/0.75 时
+            # 判为"未进入收敛区"，补到 4 级就正常了）。这也是接口的默认值。
+            study = _http_json(
+                "POST",
+                f"{API_BASE}/api/convergence/study",
+                {
+                    "analysis_type": "structural",
+                    "setup": dict(body),
+                    "levels": 4,
+                    "base_mesh_size": 3.0,
+                },
+                headers=api_headers,
+            )
+            counts = [level["elements"] for level in study["levels"]]
+            notes_text = " ".join(study["notes"])
+            check(
+                "收敛检查：跑满 4 级且单元数逐级递增",
+                len(study["levels"]) == 4 and counts == sorted(counts)
+                and counts[0] < counts[-1],
+                f"单元数 {counts}",
+            )
+            check(
+                "收敛检查：每个考察量都有逐级数值与判定",
+                set(study["quantities"]) == set(study["assessments"])
+                and all(
+                    len(study["assessments"][name]["values"]) == len(study["levels"])
+                    for name in study["quantities"]
+                ),
+                f"{study['quantities']} -> status={study['status']}",
+            )
+            # 实测加密比必须被报出来：gmsh 的 mesh_size 只是名义目标，真实网格
+            # 不按它成比例加密（实测 1.47/1.91/1.92，不是 2.00）。不说这一点，
+            # 用户看到"差值没变小"只会以为自己的模型有问题。
+            check(
+                "收敛检查：按实测加密比估阶（而非名义的 2.00）",
+                all(
+                    study["assessments"][name].get("order_estimator") == "generalized"
+                    for name in study["quantities"]
+                )
+                and "实际加密比" in notes_text,
+                notes_text.split("实际加密比")[-1][:44] if "实际加密比" in notes_text
+                else "说明里没有实测加密比",
+            )
+            # 这个功能最容易犯的错：拿"两次结果接近"当成"结果可信"。
+            # 所以结论或说明里必须一直带着这条限定。
+            check(
+                "收敛检查：带着『自收敛≠模型正确』的限定",
+                "不代表模型" in study["verdict"] or "不能" in notes_text,
+                study["verdict"],
+            )
+            check(
+                "收敛检查：说明里点出应力奇异与临时副本",
+                "应力奇异" in notes_text and "临时副本" in notes_text,
+                f"{len(study['notes'])} 条说明",
+            )
+            # 级数不足时不许硬下结论（这里显式只给 2 级，应当被 400 拒绝）
+            too_few = _http_status(
+                "POST",
+                f"{API_BASE}/api/convergence/study",
+                {
+                    "analysis_type": "structural",
+                    "setup": dict(body),
+                    "mesh_sizes": [3.0, 1.5],
+                },
+                headers=api_headers,
+            )
+            check(
+                "收敛检查：级数不足被拒（400）",
+                too_few == 400,
+                "两级结果接近可能是收敛，也可能是两处错得一样",
+            )
+
+            # 异步路径：这个接口要跑 3~4 次"划网格 + 求解"，同步实现对大模型
+            # 必然超时，所以必须能用 /api/jobs/convergence 提交并轮询到结果。
+            submitted = _http_json(
+                "POST",
+                f"{API_BASE}/api/jobs/convergence",
+                {
+                    "analysis_type": "structural",
+                    "setup": dict(body),
+                    "levels": 3,
+                    "base_mesh_size": 4.0,
+                },
+                headers=api_headers,
+            )
+            study_job: dict = {}
+            for _ in range(120):
+                time.sleep(0.5)
+                study_job = _http_json(
+                    "GET", f"{API_BASE}/api/jobs/{submitted['job_id']}",
+                    headers=api_headers,
+                )
+                if study_job.get("status") in ("succeeded", "failed"):
+                    break
+            job_study = study_job.get("result") or {}
+            check(
+                "收敛检查：异步任务路径可用（提交 -> 轮询 -> 结果）",
+                study_job.get("status") == "succeeded"
+                and job_study.get("status") in ("converged", "marginal", "not-converged")
+                and len(job_study.get("levels") or []) == 3,
+                f"job={study_job.get('status')} study={job_study.get('status')}",
+            )
+
+            # 临时几何/网格必须删干净：残留会在 `git status` 里变成未跟踪文件
+            # （上一轮 POST /api/generate-cube 重写被跟踪的 STEP 就是这么埋的坑）
+            uploads = BACKEND / "uploads"
+            if uploads.exists():
+                leftovers = sorted(path.name for path in uploads.glob("conv_*"))
+                check(
+                    "收敛检查：临时文件已清理",
+                    not leftovers,
+                    f"残留 {leftovers}" if leftovers else "uploads/ 里没有 conv_* 残留",
+                )
+
             # 前端显示变形要用到这四个字段（见 Scene3D / utils/deformation.ts）。
             # 后端字段一旦改名，前端只会静默地"不显示变形"或算出 NaN 放大系数，
             # 因此在这里把字段契约固定下来。

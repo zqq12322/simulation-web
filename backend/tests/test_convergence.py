@@ -32,6 +32,7 @@ from convergence import (
     assess,
     exact_gradient,
     exact_temperature,
+    generalized_order,
     is_monotone,
     measure_errors,
     observed_order,
@@ -197,7 +198,104 @@ class AssessTest(unittest.TestCase):
         self.assertAlmostEqual(result["observed_order"], 2.0, places=12)
 
 
-class ManufacturedSolutionTest(unittest.TestCase):
+class GeneralizedOrderTest(unittest.TestCase):
+    """
+    广义 Richardson 阶数：用**实测**网格尺寸估阶。
+
+    为什么必须单独测：真实网格（gmsh 划的非结构网格）不会按名义尺寸成比例
+    加密——实测 `test_part.step` 用 3/1.5/0.75 划出来的单元数是 426/1366/9462，
+    折算加密比是 1.47 和 1.91。在这种数据上套 `log(r)/log(2)` 会算出错的阶数。
+    """
+
+    @staticmethod
+    def _sequence(order: float, sizes, exact: float = 0.0, constant: float = 1.0):
+        """`u_k = u* + C·h_k^p`（误差按 h^p 衰减的合成序列）。"""
+        return [exact + constant * size ** order for size in sizes]
+
+    def test_recovers_the_order_with_uniform_sizes(self):
+        sizes = [1.0, 0.5, 0.25]
+        values = self._sequence(2.0, sizes)
+        self.assertAlmostEqual(generalized_order(values, sizes), 2.0, places=9)
+
+    def test_recovers_the_order_with_non_uniform_sizes(self):
+        """
+        非均匀加密也必须能恢复正确阶数——这正是它存在的理由。
+
+        用 1 / 0.6 / 0.3 造 p = 2 的序列；若错误地按"每级减半"算，
+        会得到 log(r)/log(2) ≈ 2.245 而不是 2。
+        """
+        sizes = [1.0, 0.6, 0.3]
+        values = self._sequence(2.0, sizes)
+        self.assertAlmostEqual(generalized_order(values, sizes), 2.0, places=9)
+        # 对照：按均匀比估计会偏掉，说明这个函数不是多余的
+        naive = observed_order(values, ratio=2.0)
+        self.assertGreater(abs(naive - 2.0), 0.2)
+
+    def test_recovers_first_order_with_non_uniform_sizes(self):
+        sizes = [0.5, 0.2, 0.05]
+        values = self._sequence(1.0, sizes)
+        self.assertAlmostEqual(generalized_order(values, sizes), 1.0, places=9)
+
+    def test_is_scale_invariant(self):
+        """只用尺寸的比值，所以整体缩放网格不影响结果。"""
+        sizes = [1.0, 0.6, 0.3]
+        values = self._sequence(1.5, sizes)
+        scaled = [size * 1000.0 for size in sizes]
+        self.assertAlmostEqual(
+            generalized_order(values, sizes),
+            generalized_order(values, scaled),
+            places=12,
+        )
+
+    def test_growing_differences_have_no_positive_order(self):
+        """
+        差值**变大**且变大的幅度超出网格加密所能解释的范围 ⇒ 返回 None。
+
+        返回 None 而不是负数：负的"阶数"没有物理含义，真实结论是
+        "没有任何正的收敛阶能解释这组数据"。
+        """
+        sizes = [1.0, 0.9, 0.8]          # 加密幅度很小
+        values = [1.0, 0.5, -2.0]        # 差值却在变大
+        self.assertIsNone(generalized_order(values, sizes))
+
+    def test_needs_matching_lengths_and_three_levels(self):
+        self.assertIsNone(generalized_order([1.0, 0.5], [1.0, 0.5]))
+        self.assertIsNone(generalized_order([1.0, 0.5, 0.25], [1.0, 0.5]))
+        self.assertIsNone(generalized_order([], []))
+
+    def test_rejects_non_decreasing_sizes(self):
+        self.assertIsNone(generalized_order([1.0, 0.5, 0.25], [1.0, 0.5, 0.5]))
+        self.assertIsNone(generalized_order([1.0, 0.5, 0.25], [0.25, 0.5, 1.0]))
+
+    def test_zero_differences_are_rejected(self):
+        self.assertIsNone(generalized_order([1.0, 1.0, 0.9], [1.0, 0.5, 0.25]))
+        self.assertIsNone(generalized_order([1.0, 0.9, 0.9], [1.0, 0.5, 0.25]))
+
+    def test_assess_prefers_the_generalized_estimator_when_sizes_given(self):
+        """`assess(sizes=...)` 必须真的改用它，并在结果里标明用了哪一个。"""
+        sizes = [1.0, 0.6, 0.3]
+        values = self._sequence(2.0, sizes)
+        result = assess(values, sizes=sizes, label="测试量")
+        self.assertEqual(result["order_estimator"], "generalized")
+        self.assertAlmostEqual(result["observed_order"], 2.0, places=9)
+
+        without = assess(values, ratio=2.0, label="测试量")
+        self.assertEqual(without["order_estimator"], "uniform-ratio")
+
+    def test_extrapolation_uses_the_measured_local_ratio(self):
+        """
+        外推必须用最后两级的**真实**加密比。
+
+        取 p = 1、尺寸 1 / 0.5 / 0.25（末两级比 2）时极限应等于 u*；
+        取 1 / 0.6 / 0.3（末两级比 2）同理，但若误用 2.0 而不是实际比，
+        结果会偏。这里用 p = 2、末两级比 2 与 3 各验一次。
+        """
+        for sizes, ratio_last in (([1.0, 0.5, 0.25], 2.0), ([1.0, 0.6, 0.2], 3.0)):
+            values = self._sequence(2.0, sizes, exact=5.0)
+            result = assess(values, sizes=sizes, expected_order=2.0, label="测试量")
+            self.assertAlmostEqual(result["refinement_ratio"], ratio_last, places=9)
+            self.assertAlmostEqual(result["extrapolated_limit"], 5.0, places=6)
+
     """第 2 层：制造解本身与误差度量的自洽性。"""
 
     def test_exact_solution_is_harmonic(self):

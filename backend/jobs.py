@@ -246,3 +246,22 @@ async def submit_modal_job(request: dict):
 
     job = submit("modal", functools.partial(solve_modal_impl, request=modal_request))
     return {"job_id": job.id, "status": job.status, "poll": f"/api/jobs/{job.id}"}
+
+
+@router.post("/jobs/convergence", status_code=202)
+async def submit_convergence_job(request: dict):
+    """
+    异步 h-收敛检查：立即返回 job_id，用 GET /api/jobs/{job_id} 轮询。
+
+    这个接口**必须**是异步的：它要跑 3~4 次"划网格 + 求解"，而单元数按 h³
+    增长——同步接口在大模型上必然超时（用户拿到 502，而任务其实还在算）。
+    """
+    from convergence_study import StudyRequest, study_impl
+
+    try:
+        study_request = StudyRequest(**request)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"请求体不合法：{exc}")
+
+    job = submit("convergence", functools.partial(study_impl, request=study_request))
+    return {"job_id": job.id, "status": job.status, "poll": f"/api/jobs/{job.id}"}
