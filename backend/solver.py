@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional
 import numpy as np
 from skfem import *
 from skfem.helpers import dot, grad, trace, sym_grad, eye, identity, ddot
@@ -9,7 +9,7 @@ import os
 import gmsh
 
 # Import local modules
-from config import resolve_upload_path
+from config import resolve_upload_path, validate_length_unit, length_scale_to_meter
 from logging_config import get_logger
 from geometry import FaceInfo
 from materials import MATERIALS_DB
@@ -193,6 +193,9 @@ class SolverRequest(BaseModel):
     material_id: str
     boundary_conditions: List[BoundaryCondition]
     faces: List[FaceInfo] = [] # Optional face metadata from frontend
+    #: 几何坐标的长度单位（"m" 或 "mm"）。内部会换算成米再求解，
+    #: 因此结果始终是 SI：位移 m、应力 Pa。
+    length_unit: Optional[str] = None
 
 class SolverResult(BaseModel):
     status: str
@@ -204,12 +207,28 @@ class SolverResult(BaseModel):
     reaction_forces: Dict[str, List[float]] # { "node_index": [fx, fy, fz] }
     #: 被忽略或降级处理的边界条件说明（前端应展示给用户，避免"静默错误结果"）
     warnings: List[str] = []
+    #: 返回值的单位约定（结果一律为 SI，便于与材料库自洽）
+    units: Dict[str, str] = {
+        "length": "m",
+        "displacement": "m",
+        "stress": "Pa",
+        "force": "N",
+        "pressure": "Pa",
+    }
+    #: 本次求解采用的输入长度单位（便于前端核对与展示）
+    length_unit: str = "m"
 
 @router.post("/solve", response_model=SolverResult)
 async def solve_simulation(request: SolverRequest):
     """
     Perform Linear Static Structural Analysis using scikit-fem.
     """
+    try:
+        length_unit = validate_length_unit(request.length_unit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    length_scale = length_scale_to_meter(length_unit)
+
     # Check for demo mode shortcut
     if request.geometry_filename == "default_cube.step" and len(request.boundary_conditions) > 0:
         # If it's the demo cube, we can try to return a pre-calculated result if available, 
@@ -258,6 +277,15 @@ async def solve_simulation(request: SolverRequest):
 
         # Load mesh into scikit-fem（同时取回「面 → 边界三角形」映射）
         mesh, face_triangles = load_tet_mesh_from_msh(msh_path)
+
+        # 单位换算：几何坐标先换算成米再组装，于是材料 E（Pa）、载荷（N）与
+        # 结果（m / Pa）全部落在 SI 上。mesh_size 与坐标同单位，无需单独换算。
+        if length_scale != 1.0:
+            mesh = MeshTet(np.ascontiguousarray(mesh.p * length_scale), mesh.t)
+            logger.info(
+                "长度单位 %s：坐标已换算为米（×%g）", length_unit, length_scale
+            )
+
         logger.info(
             "网格已载入：%d 个单元 / %d 个节点；可精确定位的面 %d 个",
             mesh.t.shape[1], mesh.p.shape[1], len(face_triangles),
@@ -290,6 +318,16 @@ async def solve_simulation(request: SolverRequest):
 
         supported_types = {"fixed", "displacement", "force", "pressure"}
         model_centroid = mesh.p.mean(axis=1)
+        # 容差一律用**相对模型尺度**表示：坐标已被换算成米，绝对容差
+        # （原先的 1e-2）在毫米模型上会大到把整个模型都选进来。
+        model_span = float(
+            max(
+                mesh.p[0].max() - mesh.p[0].min(),
+                mesh.p[1].max() - mesh.p[1].min(),
+                mesh.p[2].max() - mesh.p[2].min(),
+                1e-30,
+            )
+        )
 
         for bc in request.boundary_conditions:
             x, y, z = mesh.p
@@ -336,16 +374,15 @@ async def solve_simulation(request: SolverRequest):
                 # 退化路径：几何搜索（保留旧行为，供 STL / 旧网格使用）
                 if target_face and target_face.normal:
                     nx, ny, nz = target_face.normal
-                    cx, cy, cz = target_face.center
+                    # 面元数据来自原几何（输入单位），需与已换算的网格坐标对齐
+                    cx, cy, cz = (c * length_scale for c in target_face.center)
                     dist_to_plane = np.abs(
                         (x - cx) * nx + (y - cy) * ny + (z - cz) * nz
                     )
-                    target_nodes_indices = np.where(dist_to_plane < 1e-2)[0]
+                    target_nodes_indices = np.where(dist_to_plane < model_span * 1e-3)[0]
 
                 if len(target_nodes_indices) == 0:
-                    bbox_dims = [x.max() - x.min(), y.max() - y.min(), z.max() - z.min()]
-                    max_dim = max(bbox_dims) if bbox_dims else 1.0
-                    tol = max(max_dim * 0.1, 1e-3)
+                    tol = model_span * 0.1
 
                     idx = bc.entityIndex % 6
                     if idx == 0: mask = x < x.min() + tol
@@ -574,6 +611,7 @@ async def solve_simulation(request: SolverRequest):
             stresses=stresses,
             reaction_forces=reaction_forces,
             warnings=solver_warnings,
+            length_unit=length_unit,
         )
 
     except HTTPException:

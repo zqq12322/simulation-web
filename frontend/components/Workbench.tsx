@@ -410,7 +410,10 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
             geometry_filename: modelName,
             material_id: selectedMaterial?.id || 'structural_steel', // Default if not selected
             boundary_conditions: validBCs,
-            faces: facesData // Pass B-Rep face metadata to solver
+            faces: facesData, // Pass B-Rep face metadata to solver
+            // 几何坐标的长度单位。默认 mm：CAD 零件基本都是毫米，
+            // 后端会换算成米再求解，结果始终是 SI（位移 m、应力 Pa）。
+            length_unit: solverSettings?.lengthUnit || 'mm'
         });
 
         console.log('Solver completed:', response.data);

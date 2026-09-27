@@ -41,6 +41,9 @@ FRONTEND_URL = os.environ.get("SIMCLOUD_FRONTEND", "http://localhost:3000")
 #: `dev --detach` 记录子进程 PID，供 `stop` 使用
 _STATE_FILE = ROOT / ".dev-pids.json"
 
+#: 服务端口（后端 8000 / 前端 3000），`stop` 会按端口兜底清理
+_SERVICE_PORTS = (8000, 3000)
+
 # ---------------------------------------------------------------- 输出helpers
 
 def _configure_streams() -> None:
@@ -216,8 +219,14 @@ def task_dev(args: argparse.Namespace) -> int:
 
 def _dev_detached(backend_cmd: list, frontend_cmd: list) -> int:
     """后台启动前后端，等后端就绪后返回；PID 写入 .dev-pids.json 供 stop 使用。"""
+    busy = _ports_in_use(_SERVICE_PORTS)
+    if busy:
+        warn(
+            f"端口 {busy} 已被占用——很可能已有服务在跑。"
+            "若确实是遗留进程，先执行 `stop`，否则本次启动会失败并写入错误的 PID。"
+        )
     if _STATE_FILE.exists():
-        warn("检测到 .dev-pids.json，可能已有后台服务；先执行 `stop` 或删除该文件")
+        warn(f"检测到 {_STATE_FILE.name}，可能已有后台服务（先 stop 或删除该文件）")
 
     backend_log = ROOT / ".dev-backend.log"
     frontend_log = ROOT / ".dev-frontend.log"
@@ -245,28 +254,86 @@ def _dev_detached(backend_cmd: list, frontend_cmd: list) -> int:
 
 
 def task_stop(args: argparse.Namespace) -> int:
-    """停止由 `dev --detach` 启动的后台服务。"""
-    if not _STATE_FILE.exists():
-        warn(f"未找到 {_STATE_FILE.name}，说明没有由本工具后台启动的服务")
-        return 0
+    """
+    停止后台服务。
 
-    try:
-        state = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        fail(f"{_STATE_FILE.name} 读取失败：{exc}")
-        return 1
+    两道保险，原因都是真实踩过的：
 
-    stopped = []
-    for name, pid in state.items():
-        if _kill_tree(int(pid)):
-            stopped.append(f"{name}(PID {pid})")
+    1. **不能只信 `.dev-pids.json`**：如果先前遗留了别的进程占着端口，
+       `dev --detach` 会启动失败却仍写入新的 PID，状态文件于是指向一个
+       "没在监听"的进程，真正的服务反而活着（本轮 verify 就是被这种陈旧
+       进程用**旧代码**服务的，表现为响应里缺字段）。
+    2. **一次 kill 可能不够**：Windows 上 `python -m uvicorn` 会出现
+       "启动器 + 实际监听"两个 python 进程，杀掉其中一个，另一个仍持有
+       监听套接字。所以按端口反复"查—杀"直到真正释放。
+    """
+    stopped: list[str] = []
 
-    _STATE_FILE.unlink(missing_ok=True)
-    if stopped:
-        ok("已停止：" + "、".join(stopped))
+    if _STATE_FILE.exists():
+        try:
+            state = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            warn(f"{_STATE_FILE.name} 读取失败（忽略）：{exc}")
+            state = {}
+        for name, pid in state.items():
+            if _kill_tree(int(pid)):
+                stopped.append(f"{name}(PID {pid})")
+        _STATE_FILE.unlink(missing_ok=True)
     else:
-        info("记录的进程已经不在运行")
+        info(f"未找到 {_STATE_FILE.name}，改为按端口清理")
+
+    for _ in range(6):
+        remaining = sorted({pid for port in _SERVICE_PORTS for pid in _listening_pids(port)})
+        if not remaining:
+            break
+        for pid in remaining:
+            if _kill_tree(pid):
+                stopped.append(f"端口占用进程(PID {pid})")
+        time.sleep(0.5)
+
+    if stopped:
+        ok("已停止：" + "、".join(dict.fromkeys(stopped)))
+
+    still_busy = {port: pids for port in _SERVICE_PORTS if (pids := _listening_pids(port))}
+    if still_busy:
+        warn(f"仍有进程占用端口：{still_busy}，请手动结束它们")
+        return 1
+    if not stopped:
+        info("没有发现需要停止的服务")
     return 0
+
+
+def _listening_pids(port: int) -> list:
+    """
+    找出正在监听某端口的进程 PID（跨平台，只用系统自带工具）。
+
+    Windows 用 ``netstat -ano``；POSIX 用 ``lsof``（缺失时返回空表，
+    调用方会退化为"按 PID 文件停止"）。
+    """
+    pids: list = []
+    try:
+        if IS_WINDOWS:
+            output = subprocess.run(
+                ["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True
+            ).stdout
+            for line in output.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[3].upper() == "LISTENING":
+                    if parts[1].endswith(f":{port}"):
+                        pids.append(int(parts[4]))
+        else:
+            output = subprocess.run(
+                ["lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                capture_output=True, text=True,
+            ).stdout
+            pids = [int(token) for token in output.split() if token.strip().isdigit()]
+    except (OSError, ValueError):
+        return []
+    return sorted(set(pids))
+
+
+def _ports_in_use(ports) -> list:
+    return [port for port in ports if _listening_pids(port)]
 
 
 def _spawn_detached(cmd: list, cwd: Path, log_path: Path):
@@ -513,6 +580,22 @@ def task_verify(args: argparse.Namespace) -> int:
                 "立方体拉伸 vs 解析解 FL/AE",
                 0.5 < ratio < 1.05,
                 f"ratio={ratio:.3f} (期望 0.5~1.0)",
+            )
+
+            # 单位制：同一份网格按 mm 解释时，长度缩小 1000 倍 ⇒ 面积缩小 1e6 倍
+            # ⇒ 应力放大 1e6 倍（位移放大 1000 倍）。这是端到端的单位换算校验。
+            cube_mm = _http_json("POST", f"{API_BASE}/api/solve", dict(cube_body, length_unit="mm"))
+            stress_ratio = cube_mm["max_stress"] / cube_result["max_stress"]
+            check(
+                "单位换算 (mm vs m：应力 ×1000²)",
+                abs(stress_ratio - 1e6) < 1e6 * 1e-6,
+                f"ratio={stress_ratio:.1f} (期望 1000000)",
+            )
+            check(
+                "结果单位声明为 SI",
+                cube_mm.get("units", {}).get("stress") == "Pa"
+                and cube_mm.get("length_unit") == "mm",
+                f"units={cube_mm.get('units')}, length_unit={cube_mm.get('length_unit')}",
             )
         except Exception as exc:
             check("求解器物理校准", False, f"{type(exc).__name__}: {exc}")

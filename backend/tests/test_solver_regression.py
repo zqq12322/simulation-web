@@ -602,6 +602,120 @@ class DisplacementParsingTest(unittest.TestCase):
         self.assertEqual(_parse_displacement(bc), (7.0, 0.0, 0.0))
 
 
+class LengthUnitTest(unittest.TestCase):
+    """
+    长度单位换算。
+
+    此前坐标被直接当成米：一个「10 单位见方」的 CAD 零件被算成 10 米，
+    1000 N 载荷得到 10 Pa —— 数值上没有物理意义。
+    现在按 ``length_unit`` 先把坐标换算成米，结果永远是 SI（m / Pa）。
+
+    这里用**同一份网格**分别按 m 与 mm 求解，断言：
+      - 应力比恰好是 1000²（面积随长度平方缩放）；
+      - 位移比恰好是 1000（位移随长度一次缩放）；
+      - 按 mm 解释时应力落在真实量级（10 MPa 而不是 10 Pa）。
+    """
+
+    SCALE = 1000.0          # 1 m = 1000 mm
+    FORCE = 1000.0
+
+    @classmethod
+    def _solve_with_unit(cls, unit):
+        mesh = _cube_mesh()
+        minus_x = _face_with_normal(mesh.faces, 0, -1)
+        plus_x = _face_with_normal(mesh.faces, 0, +1)
+        bcs = [
+            BoundaryCondition(id="fix", name="固定端", type="fixed",
+                              applicationType="face", entityIndex=minus_x.id),
+            BoundaryCondition(id="pull", name="拉力", type="force",
+                              applicationType="face", entityIndex=plus_x.id,
+                              force={"x": cls.FORCE, "y": 0.0, "z": 0.0}),
+        ]
+        request = SolverRequest(
+            geometry_filename=CUBE,
+            material_id="structural_steel",
+            boundary_conditions=bcs,
+            faces=mesh.faces,
+            length_unit=unit,
+        )
+        return mesh, asyncio.run(solve_simulation(request))
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mesh, cls.meter = cls._solve_with_unit("m")
+        _, cls.millimeter = cls._solve_with_unit("mm")
+
+    def test_result_declares_si_units(self):
+        self.assertEqual(self.meter.units["stress"], "Pa")
+        self.assertEqual(self.meter.units["displacement"], "m")
+        self.assertEqual(self.meter.length_unit, "m")
+        self.assertEqual(self.millimeter.length_unit, "mm")
+
+    def test_default_is_meter_for_backward_compatibility(self):
+        """不传 length_unit 时应与显式传 "m" 完全一致（不静默改变既有结果）。"""
+        mesh = _cube_mesh()
+        minus_x = _face_with_normal(mesh.faces, 0, -1)
+        plus_x = _face_with_normal(mesh.faces, 0, 1)
+        bcs = [
+            BoundaryCondition(id="fix", name="固定端", type="fixed",
+                              applicationType="face", entityIndex=minus_x.id),
+            BoundaryCondition(id="pull", name="拉力", type="force",
+                              applicationType="face", entityIndex=plus_x.id,
+                              force={"x": self.FORCE, "y": 0.0, "z": 0.0}),
+        ]
+        default_result = asyncio.run(solve_simulation(SolverRequest(
+            geometry_filename=CUBE, material_id="structural_steel",
+            boundary_conditions=bcs, faces=mesh.faces,
+        )))
+        self.assertEqual(default_result.length_unit, "m")
+        self.assertAlmostEqual(
+            default_result.max_stress, self.meter.max_stress, places=9
+        )
+
+    def test_stress_scales_with_length_squared(self):
+        """应力 = 力 / 面积，面积按长度平方缩放 ⇒ 比值应为 1000²。"""
+        self.assertGreater(self.meter.max_stress, 0.0)
+        ratio = self.millimeter.max_stress / self.meter.max_stress
+        self.assertAlmostEqual(ratio, self.SCALE ** 2, delta=self.SCALE ** 2 * 1e-6)
+
+    def test_displacement_scales_linearly_with_length(self):
+        """位移 ≈ FL/AE，长度一次缩放 ⇒ 比值应为 1000。"""
+        self.assertGreater(self.meter.max_displacement, 0.0)
+        ratio = self.millimeter.max_displacement / self.meter.max_displacement
+        self.assertAlmostEqual(ratio, self.SCALE, delta=self.SCALE * 1e-6)
+
+    def test_millimeter_interpretation_is_physically_meaningful(self):
+        """
+        按毫米解释时，「10mm 见方、1000 N」的应力应在 10 MPa 量级
+        （力 1000 N / 面积 (0.01 m)² = 1e-4 m² ⇒ 1e7 Pa）。
+        """
+        # 名义应力；峰值会略高（孔/夹持效应），故给区间
+        nominal = self.FORCE / (0.01 ** 2)
+        self.assertGreater(self.millimeter.max_stress, nominal * 0.5)
+        self.assertLess(self.millimeter.max_stress, nominal * 20.0)
+
+    def test_invalid_unit_is_rejected(self):
+        from fastapi import HTTPException
+
+        request = SolverRequest(
+            geometry_filename=CUBE, material_id="structural_steel",
+            boundary_conditions=[], length_unit="inch",
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(solve_simulation(request))
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_unit_validation_helper(self):
+        import config
+
+        self.assertEqual(config.validate_length_unit(None), config.DEFAULT_LENGTH_UNIT)
+        self.assertEqual(config.validate_length_unit("MM"), "mm")
+        self.assertEqual(config.length_scale_to_meter("mm"), 1e-3)
+        self.assertEqual(config.length_scale_to_meter("m"), 1.0)
+        with self.assertRaises(ValueError):
+            config.validate_length_unit("ft")
+
+
 class SolverInputValidationTest(unittest.TestCase):
     def test_rejects_path_traversal_filename(self):
         from fastapi import HTTPException

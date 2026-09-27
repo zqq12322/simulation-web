@@ -47,6 +47,8 @@ export interface SolverSettings {
   parameters: {
     [key: string]: number | string | boolean;
   };
+  /** 几何坐标的长度单位。后端据此换算成米，结果一律为 SI（位移 m、应力 Pa）。 */
+  lengthUnit?: 'm' | 'mm';
   status: 'not_configured' | 'configured' | 'solving' | 'solved' | 'failed';
 }
 

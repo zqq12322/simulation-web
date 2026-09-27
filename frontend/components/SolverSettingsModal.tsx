@@ -76,6 +76,12 @@ const SolverSettingsModal: React.FC<SolverSettingsModalProps> = ({
     gravity: true
   });
 
+  // 几何坐标的长度单位。默认 mm：CAD 导出的零件基本是毫米，
+  // 若按 m 解释会把 10mm 的零件当成 10m，结果差 6 个数量级。
+  const [lengthUnit, setLengthUnit] = useState<'m' | 'mm'>(
+    currentSettings?.lengthUnit || 'mm'
+  );
+
   // 根据求解器类型获取可用求解器列表
   const getAvailableSolvers = (type: SolverType): string[] => {
     switch (type) {
@@ -149,6 +155,7 @@ const SolverSettingsModal: React.FC<SolverSettingsModalProps> = ({
     setSolverType(type);
     setSolverName(currentSettings?.solverName || getAvailableSolvers(type)[0]);
     setBasicParameters(currentSettings?.parameters || getDefaultParameters(type));
+    setLengthUnit(currentSettings?.lengthUnit || 'mm');
   }, [isOpen, currentSettings]);
 
   // Analysis type currently shown in the details panel
@@ -171,6 +178,8 @@ const SolverSettingsModal: React.FC<SolverSettingsModalProps> = ({
       solverType,
       solverName,
       parameters: basicParameters,
+      // 几何坐标的长度单位；后端据此换算成米（结果一律 SI）
+      lengthUnit,
       status: 'configured'
     };
     onSolverSettingsSave(settings);
@@ -234,6 +243,31 @@ const SolverSettingsModal: React.FC<SolverSettingsModalProps> = ({
                   <option key={name} value={name}>{name}</option>
                 ))}
               </select>
+            </div>
+
+            <div className="border-t border-[#333844] pt-4">
+              <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">
+                Length unit
+              </label>
+              <div className="flex gap-2">
+                {(['mm', 'm'] as const).map((unit) => (
+                  <button
+                    key={unit}
+                    onClick={() => setLengthUnit(unit)}
+                    className={`flex-1 px-3 py-2 rounded text-sm transition-colors ${
+                      lengthUnit === unit
+                        ? 'bg-[#2a2f3e] text-white border border-blue-500'
+                        : 'bg-[#161a25] text-gray-300 border border-[#333844] hover:text-white'
+                    }`}
+                  >
+                    {unit}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-2 text-xs text-gray-500 leading-relaxed">
+                几何坐标的单位。选错会让结果差好几个数量级：1000 N 作用在 10×10 的面上，
+                按 mm 是 10 MPa，按 m 只有 10 Pa。后端会换算成米再求解，结果始终是 SI。
+              </p>
             </div>
 
             <p className="text-xs text-gray-500 leading-relaxed border-t border-[#333844] pt-4">

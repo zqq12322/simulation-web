@@ -49,6 +49,19 @@ GMSH_TERMINAL: Final[int] = int(os.getenv("GMSH_TERMINAL", "1"))
 #: 日志级别（DEBUG / INFO / WARNING / ERROR）。排查问题时设成 DEBUG。
 LOG_LEVEL: Final[str] = os.getenv("LOG_LEVEL", "INFO").upper()
 
+# --------------------------------------------------------------- 单位制
+#: 支持的长度单位 → **米** 的换算系数。
+#:
+#: 为什么要换算：几何坐标来自 CAD，通常是毫米；而材料 E（Pa）、载荷（N）都是
+#: 标准 SI。此前坐标被直接当米用，于是「10 单位见方的零件 + 1000 N」算出 10 Pa
+#: 这种没有物理意义的结果。现在先把坐标换算成米再组装，保证结果始终是 SI
+#: （位移 m、应力 Pa），与材料库的单位自洽。
+LENGTH_UNIT_TO_METER: Final[dict] = {"m": 1.0, "mm": 1e-3}
+
+#: API 默认长度单位。保持 SI（"m"）以免静默改变既有调用方的结果；
+#: 前端会显式发送用户选择的单位（默认 mm）。
+DEFAULT_LENGTH_UNIT: Final[str] = os.getenv("DEFAULT_LENGTH_UNIT", "m").lower()
+
 
 def ensure_upload_dir() -> Path:
     """确保上传目录存在并返回该目录。"""
@@ -109,3 +122,22 @@ def validate_mesh_size(mesh_size) -> float:
         )
 
     return value
+
+
+def validate_length_unit(unit) -> str:
+    """
+    校验长度单位并返回规范化后的值。
+
+    ``mesh_size`` 与几何坐标使用**同一个**长度单位，因此换单位时不需要换算
+    mesh_size——它随坐标一起被缩放。
+    """
+    value = str(unit if unit is not None else DEFAULT_LENGTH_UNIT).strip().lower()
+    if value not in LENGTH_UNIT_TO_METER:
+        supported = "、".join(sorted(LENGTH_UNIT_TO_METER))
+        raise ValueError(f"不支持的长度单位 '{unit}'，仅支持：{supported}")
+    return value
+
+
+def length_scale_to_meter(unit: str) -> float:
+    """取「该单位 → 米」的缩放系数。"""
+    return LENGTH_UNIT_TO_METER[validate_length_unit(unit)]
