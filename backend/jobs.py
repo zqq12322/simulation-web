@@ -226,3 +226,17 @@ async def submit_thermal_job(request: dict):
 
     job = submit("thermal", functools.partial(solve_thermal_impl, request=thermal_request))
     return {"job_id": job.id, "status": job.status, "poll": f"/api/jobs/{job.id}"}
+
+
+@router.post("/jobs/modal", status_code=202)
+async def submit_modal_job(request: dict):
+    """异步模态分析：立即返回 job_id，用 GET /api/jobs/{job_id} 轮询。"""
+    from modal import ModalRequest, solve_modal_impl
+
+    try:
+        modal_request = ModalRequest(**request)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"请求体不合法：{exc}")
+
+    job = submit("modal", functools.partial(solve_modal_impl, request=modal_request))
+    return {"job_id": job.id, "status": job.status, "poll": f"/api/jobs/{job.id}"}

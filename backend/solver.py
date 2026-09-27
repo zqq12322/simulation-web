@@ -14,6 +14,8 @@ from fe_utils import (
     compute_model_span,
     load_tet_mesh_from_msh,   # 由 fe_utils 提供，这里再导出以兼容既有调用方式
     nodal_tributary_areas,
+    parse_displacement,
+    parse_force,
     resolve_target_nodes,
 )
 from gmsh_session import ensure_initialized as _ensure_gmsh, open_model_file, start_model
@@ -28,18 +30,13 @@ logger = get_logger(__name__)
 
 
 def _parse_force(force) -> tuple:
-    """把前端传来的力（dict / Vector3 / list）统一成 ``(fx, fy, fz)``。"""
-    if isinstance(force, dict):
-        return (
-            float(force.get('x', 0.0) or 0.0),
-            float(force.get('y', 0.0) or 0.0),
-            float(force.get('z', 0.0) or 0.0),
-        )
-    if hasattr(force, 'x'):
-        return (float(force.x), float(force.y), float(force.z))
-    if isinstance(force, (list, tuple)) and len(force) == 3:
-        return (float(force[0]), float(force[1]), float(force[2]))
-    return (0.0, 0.0, 0.0)
+    """
+    把前端传来的力（dict / Vector3 / list）统一成 ``(fx, fy, fz)``。
+
+    实现在 ``fe_utils.parse_force``（模态求解器也要用同一套解析规则），
+    这里保留同名别名以兼容既有调用与测试。
+    """
+    return parse_force(force)
 
 
 def _parse_pressure(bc) -> float:
@@ -55,8 +52,8 @@ def _parse_pressure(bc) -> float:
 
 
 def _parse_displacement(bc) -> tuple:
-    """取强制位移值，统一成 ``(ux, uy, uz)``（dict / Vector3 / list 均可）。"""
-    return _parse_force(getattr(bc, "displacement", None))
+    """取强制位移值 ``(ux, uy, uz)``（dict / Vector3 / list 均可）。"""
+    return parse_displacement(bc)
 
 
 def surface_normal_from_triangles(points: np.ndarray, triangles: np.ndarray,

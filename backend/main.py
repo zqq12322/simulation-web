@@ -8,6 +8,7 @@ from solver import router as solver_router
 from ai_assistant import router as ai_router
 from jobs import router as jobs_router
 from thermal import router as thermal_router
+from modal import router as modal_router
 
 # 集中配置：上传目录为绝对路径，CORS 来源可用环境变量覆盖
 from config import CORS_ALLOW_ORIGINS, UPLOAD_DIR, ensure_upload_dir
@@ -18,7 +19,7 @@ logger = get_logger(__name__)
 
 app = FastAPI(
     title="SimCloud AI 仿真后端",
-    description="几何导入 / 网格划分 / 线弹性静力求解 / AI 助手",
+    description="几何导入 / 网格划分 / 线弹性静力 / 稳态热传导 / 模态分析 / AI 助手",
     version="0.2.0",
 )
 
@@ -45,6 +46,7 @@ app.include_router(solver_router, prefix="/api")
 app.include_router(ai_router, prefix="/api")
 app.include_router(jobs_router, prefix="/api")
 app.include_router(thermal_router, prefix="/api")
+app.include_router(modal_router, prefix="/api")
 
 @app.get("/")
 async def root():

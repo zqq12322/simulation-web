@@ -80,8 +80,12 @@ def load_tet_mesh_from_msh(msh_path: str):
     if not cells:
         raise ValueError("No 4-node tetrahedral elements found in the mesh file.")
 
-    t = np.vstack(cells).T.astype(np.int64)  # shape (4, n_elements)
-    points = nodes.T  # shape (3, n_nodes)
+    # shape (4, n_elements)。转置得到的是 F-order 视图，而 skfem 按维度切片时
+    # 需要 C-order，否则对 >1000 单元/顶点的网格会打印
+    # "Transforming over N elements to C_CONTIGUOUS" 警告（见 skfem/mesh/mesh.py）。
+    # 它只是日志噪声，但会淹没真正的警告，所以在这里一次转换掉。
+    t = np.ascontiguousarray(np.vstack(cells).T.astype(np.int64))
+    points = np.ascontiguousarray(nodes.T)  # shape (3, n_nodes)
 
     # scikit-fem 要求单元雅可比为正，负的就翻转节点顺序。
     # 注意 NumPy >= 2.0 的 np.cross 沿**末轴**计算，因此先转置成 (n_elements, 3)。
@@ -120,6 +124,32 @@ def nodal_tributary_areas(points: np.ndarray, triangles: np.ndarray) -> np.ndarr
         np.add.at(areas, triangles[:, corner], share)
 
     return areas
+
+
+def parse_force(value) -> Tuple[float, float, float]:
+    """
+    把前端传来的矢量（``dict`` / ``Vector3`` / ``list`` / ``None``）统一成
+    ``(fx, fy, fz)``。
+
+    结构求解器用它读 ``force``，传热/模态用它读各自的矢量字段——放在这里是为了
+    只有一份实现（见模块文档：同一个规则写两遍，本项目已经吃过亏）。
+    """
+    if isinstance(value, dict):
+        return (
+            float(value.get("x", 0.0) or 0.0),
+            float(value.get("y", 0.0) or 0.0),
+            float(value.get("z", 0.0) or 0.0),
+        )
+    if hasattr(value, "x"):
+        return (float(value.x), float(value.y), float(value.z))
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        return (float(value[0]), float(value[1]), float(value[2]))
+    return (0.0, 0.0, 0.0)
+
+
+def parse_displacement(bc) -> Tuple[float, float, float]:
+    """取强制位移值 ``(ux, uy, uz)``。"""
+    return parse_force(getattr(bc, "displacement", None))
 
 
 def compute_model_span(mesh) -> float:
