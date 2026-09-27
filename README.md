@@ -31,7 +31,10 @@
 │   ├── constraints.py          # 边界条件数据模型 + 设置校验
 │   ├── ai_assistant.py         # DeepSeek 助手：chat / diagnose / configure
 │   ├── supabase_client.py      # 可选云存储
-│   ├── config.py               # ★ 集中配置：绝对路径、上传/网格限制、CORS
+│   ├── config.py               # ★ 集中配置：绝对路径、上传/网格限制、CORS、单位制
+│   ├── jobs.py                 # ★ 后台任务：单线程工作器（gmsh 非线程安全）+ /api/jobs/*
+│   ├── gmsh_session.py         # Gmsh 会话（主线程初始化一次，进程内复用）
+│   ├── material_store.py       # 材料库持久化（SQLite）
 │   ├── generate_step.py        # 生成测试件（方块挖通孔）
 │   ├── generate_stl.py
 │   ├── tests/                  # unittest 回归测试（含物理校准，无需启动服务器）
@@ -51,7 +54,8 @@
 ├── docs/                       # 项目文档（先读这里）
 │   ├── 01-开发流程与长期计划.md
 │   ├── 02-学习路线.md
-│   └── 03-修复记录.md
+│   ├── 03-修复记录.md
+│   └── 04-如何扩展求解器.md
 ├── tools/
 │   └── tasks.py                # ★ 跨平台任务入口：setup / dev / test / verify / build / clean / doctor
 ├── scripts/                    # Windows 薄封装（转发到 tools/tasks.py，不另写实现）
@@ -145,7 +149,11 @@ cd frontend && npm run dev
 | POST | `/api/upload-geometry` | 上传几何；STEP/IGES 自动转 STL 供网页预览 |
 | GET | `/api/geometry/{filename}/metadata` | 提取 B-Rep 面/边/顶点（类型、面积、中心、法线） |
 | POST | `/api/generate-mesh` | 生成四面体网格，返回节点/单元/面/边/顶点 |
-| POST | `/api/solve` | 线弹性静力求解，返回位移/应力/支反力 |
+| POST | `/api/solve` | 线弹性静力求解（同步；大模型请用 `/api/jobs/solve`） |
+| POST | `/api/jobs/generate-mesh` | **异步**划分网格：立即返回 `job_id`（202） |
+| POST | `/api/jobs/solve` | **异步**求解：立即返回 `job_id`（202） |
+| GET | `/api/jobs/{job_id}` | 查询任务状态与结果（`queued`/`running`/`succeeded`/`failed`） |
+| GET | `/api/jobs` | 列出最近的任务与队列状态 |
 | POST | `/api/validate-setup` | 求解前校验（材料、约束、载荷是否齐全） |
 | POST | `/api/ai/chat` | AI 问答 |
 | POST | `/api/ai/diagnose` | AI 诊断仿真设置/报错 |
@@ -175,7 +183,7 @@ cd frontend && npm run dev
 | 几何拾取 | 面标签靠包围盒中心近似 | 复杂件上标签可能错位 |
 | 结果后处理 | 仅整体云图 | 无剖切/等值面/动画/报告导出 |
 | 项目管理 | 前端内存 mock，刷新即丢 | 无登录/数据库 |
-| 长任务 | 同步 HTTP 请求 | 大网格会超时 |
+| 长任务 | ✅ 已提供异步任务接口 `/api/jobs/*`（提交→轮询），前端已改用；任务在**单线程**工作器里排队（gmsh 非线程安全） | 任务表在进程内，**服务重启即丢**（生产级需外部队列） |
 | 前端 i18n | 中英文混杂 | 体验不统一 |
 | LandingPage | 部分按钮为占位链接 | 无实际功能 |
 
@@ -242,7 +250,23 @@ cd frontend && npm run dev
 | 协作指南 | 新增 `CONTRIBUTING.md`：验证命令、红线、提交规范、新增功能/测试模板、常见问题 | 新人不知道「改完要跑什么、什么不能提交」 |
 | CI | 新增 `.github/workflows/ci.yml`：push/PR 自动跑后端测试 + 前端类型检查与构建 | 靠人记得跑测试不可靠 |
 
-### 阶段 2 续 · 材料持久化（本轮新增）
+### 阶段 3 · 长任务异步化（本轮新增）
+
+| 项 | 落地内容 | 意义 |
+|---|---|---|
+| 异步任务接口 | 新增 `backend/jobs.py`：`POST /api/jobs/generate-mesh`、`POST /api/jobs/solve` 立即返回 `job_id`，`GET /api/jobs/{job_id}` 轮询状态与结果；另有 `GET /api/jobs` 看队列 | 此前网格/求解同步阻塞 HTTP，**大模型必然超时**（用户拿到 502，而任务其实还在算） |
+| 单线程工作器 | 所有 gmsh 操作（**包括原同步端点**）都排进同一个单线程执行器 | gmsh 是进程级全局状态、**非线程安全**；串行执行既消除并发破坏，也让事件循环保持响应 |
+| 前端 | `Workbench` 改为「提交 → 每 700ms 轮询」，并在 Job status 里显示"排队中…/计算中…" | 大模型只是"变慢"，不再超时；上限 15 分钟 |
+| 验证 | 新增 `test_jobs.py`（10 个用例：生命周期、失败落错误、404、结果序列化、**严格串行**、异步结果与同步接口逐位一致）；`verify` 新增两项端到端检查 | — |
+
+**顺带发现并修掉一个 gmsh 的硬约束**：`gmsh.initialize()` / `finalize()` 会调用
+`signal.signal()`，而**信号处理只能在主线程设置** —— 所以不能在工作线程里
+initialize/finalize（会抛 `ValueError: signal only works in main thread`）。
+现在改为**主线程初始化一次、进程内复用会话**，每次操作前 `gmsh.clear()`
+（见 `backend/gmsh_session.py`）。这同时修掉一个潜在缺陷：以前靠"每请求一次
+initialize"获得干净状态，gmsh 一旦复用模型就会不断累积。
+
+### 阶段 2 续 · 材料持久化
 
 | 项 | 落地内容 | 意义 |
 |---|---|---|

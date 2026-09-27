@@ -10,6 +10,8 @@ import gmsh
 
 # Import local modules
 from config import resolve_upload_path, validate_length_unit, length_scale_to_meter
+from gmsh_session import ensure_initialized as _ensure_gmsh, open_model_file, start_model
+from jobs import run_in_worker
 from logging_config import get_logger
 from geometry import FaceInfo
 from materials import MATERIALS_DB
@@ -69,16 +71,14 @@ def load_tet_mesh_from_msh(msh_path: str):
     不必再用「点到平面距离」去猜；同时可以算出每个节点的**归属面积**，
     从而施加真实的面载荷（traction）而不是把合力平均分给节点。
     """
-    if not gmsh.isInitialized():
-        gmsh.initialize()
+    # 会话级 gmsh：只 open（内部等价 clear + merge），不 initialize/finalize
+    # —— 信号处理只能在主线程设置，见 gmsh_session.py
+    open_model_file(msh_path)
     gmsh.option.setNumber("General.Terminal", 0)
-    gmsh.clear()
 
     face_triangles: Dict[int, np.ndarray] = {}
 
     try:
-        gmsh.open(msh_path)
-
         node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
         nodes = np.asarray(node_coords, dtype=np.float64).reshape(-1, 3)
         node_tags = np.asarray(node_tags, dtype=np.int64)
@@ -110,9 +110,9 @@ def load_tet_mesh_from_msh(msh_path: str):
                 triangles.append(np.asarray(fconn, dtype=np.int64).reshape(-1, 3))
             if triangles:
                 face_triangles[int(face_tag)] = tag_to_index[np.vstack(triangles)]
-    finally:
-        if gmsh.isInitialized():
-            gmsh.finalize()
+    except Exception:
+        # 读取失败就把已解析的网格信息清空，由调用方处理异常
+        raise
 
     if not cells:
         raise ValueError("No 4-node tetrahedral elements found in the mesh file.")
@@ -218,10 +218,9 @@ class SolverResult(BaseModel):
     #: 本次求解采用的输入长度单位（便于前端核对与展示）
     length_unit: str = "m"
 
-@router.post("/solve", response_model=SolverResult)
-async def solve_simulation(request: SolverRequest):
+async def solve_impl(request: "SolverRequest"):
     """
-    Perform Linear Static Structural Analysis using scikit-fem.
+    线弹性静力求解（实现，在后台工作线程中执行，见 jobs.py）。
     """
     try:
         length_unit = validate_length_unit(request.length_unit)
@@ -262,16 +261,12 @@ async def solve_simulation(request: SolverRequest):
         if not os.path.exists(msh_path):
             # If not found, generate it now (fallback)
             logger.info("网格文件不存在，正在现场生成：%s", msh_path)
-            if not gmsh.isInitialized():
-                gmsh.initialize()
-            gmsh.clear()
-            gmsh.model.add("SolverModel")
+            start_model("SolverModel")
             gmsh.merge(file_path)
             gmsh.option.setNumber("Mesh.MeshSizeMin", 1.0) # Default size
             gmsh.option.setNumber("Mesh.MeshSizeMax", 1.0)
             gmsh.model.mesh.generate(3)
             gmsh.write(msh_path)
-            gmsh.finalize()
         else:
             logger.info("使用已缓存的网格：%s", msh_path)
 
@@ -617,9 +612,18 @@ async def solve_simulation(request: SolverRequest):
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        # Ensure gmsh is finalized if error occurs during mesh generation/loading
-        if gmsh.isInitialized():
-            gmsh.finalize()
+        # 不再 finalize gmsh：会话在进程内复用（信号处理只能在主线程设置，
+        # 而且这里可能运行在工作线程里）。失败时留下日志即可。
+        logger.exception("求解失败")
         raise HTTPException(status_code=500, detail=f"Solver failed: {str(e)}")
+
+@router.post("/solve", response_model=SolverResult)
+async def solve_simulation(request: SolverRequest):
+    """
+    线弹性静力求解（同步接口）。
+
+    实现排在单线程工作器里执行，原因见 geometry.py 末尾的说明：
+    gmsh 非线程安全，且求解是 CPU 密集操作。
+    大模型建议改用 POST /api/jobs/solve（提交后轮询，避免请求超时）。
+    """
+    return await run_in_worker(solve_impl, request=request)

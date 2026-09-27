@@ -73,6 +73,38 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   // 后端在求解时可能忽略/降级某些边界条件；必须展示出来，
   // 否则用户会以为"求解成功"就等于结果可信。
   const [solverWarnings, setSolverWarnings] = useState<string[]>([]);
+  // 后台任务进度文案（网格/求解各一份）
+  const [meshJobStatus, setMeshJobStatus] = useState<string>('');
+  const [solveJobStatus, setSolveJobStatus] = useState<string>('');
+
+  /**
+   * 轮询后台任务直到结束。
+   *
+   * 网格划分与求解是耗时操作：同步接口会让请求超时（大模型上尤其明显），
+   * 后端改为 /api/jobs/* —— 提交立即返回 job_id，再轮询状态与结果。
+   * 任务本身在单线程工作器里排队执行（gmsh 非线程安全），所以大模型只是
+   * "变慢"，不会再超时。
+   */
+  const pollJob = async (
+    jobId: string,
+    onStatus?: (text: string) => void
+  ): Promise<any> => {
+    const deadline = Date.now() + 15 * 60 * 1000; // 最多等 15 分钟
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      const { data } = await axios.get(`${API_BASE_URL}/api/jobs/${jobId}`);
+      onStatus?.(
+        data.status === 'queued'
+          ? '排队中…'
+          : data.status === 'running'
+          ? '计算中…'
+          : data.status
+      );
+      if (data.status === 'succeeded') return data.result;
+      if (data.status === 'failed') throw new Error(data.error || '任务失败');
+      if (Date.now() > deadline) throw new Error('任务超时（超过 15 分钟）');
+    }
+  };
   
   // Simulation tree state
   const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({
@@ -325,26 +357,26 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     setMeshSettings(prev => prev ? { ...prev, status: 'meshing' } : { ...resolvedSettings, status: 'meshing' });
 
     try {
-      // Call Backend API
-      const response = await axios.post(`${API_BASE_URL}/api/generate-mesh`, null, {
-        params: {
-          filename: modelName,
-          mesh_size: resolvedSettings.meshSize
-        }
+      // 异步任务接口：提交后立即返回 job_id，再轮询。
+      // （网格划分/求解是耗时操作，同步接口在大模型上会让请求超时）
+      const { data: job } = await axios.post(`${API_BASE_URL}/api/jobs/generate-mesh`, {
+        filename: modelName,
+        mesh_size: resolvedSettings.meshSize,
       });
+      const result = await pollJob(job.job_id, setMeshJobStatus);
 
-      console.log('Mesh generation completed:', response.data);
+      console.log('Mesh generation completed:', result);
       
       // Store real mesh data
-      setMeshData(response.data);
-      if (response.data.faces) {
-          setFacesData(response.data.faces);
+      setMeshData(result);
+      if (result.faces) {
+          setFacesData(result.faces);
       }
-      if (response.data.edges) {
-          setEdgesData(response.data.edges);
+      if (result.edges) {
+          setEdgesData(result.edges);
       }
-      if (response.data.vertices) {
-          setVerticesData(response.data.vertices);
+      if (result.vertices) {
+          setVerticesData(result.vertices);
       }
 
       // Update status to meshed
@@ -405,8 +437,8 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
             return bc;
         });
 
-        // Call Backend Solver API
-        const response = await axios.post(`${API_BASE_URL}/api/solve`, {
+        // 异步任务接口：提交后轮询（同网格划分的理由）
+        const { data: job } = await axios.post(`${API_BASE_URL}/api/jobs/solve`, {
             geometry_filename: modelName,
             material_id: selectedMaterial?.id || 'structural_steel', // Default if not selected
             boundary_conditions: validBCs,
@@ -415,18 +447,19 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
             // 后端会换算成米再求解，结果始终是 SI（位移 m、应力 Pa）。
             length_unit: solverSettings?.lengthUnit || 'mm'
         });
+        const solveResult = await pollJob(job.job_id, setSolveJobStatus);
 
-        console.log('Solver completed:', response.data);
+        console.log('Solver completed:', solveResult);
         
         // Merge solver results into meshData (or keep separate)
         // We need to pass stress/displacement to Scene3D
         setMeshData(prev => ({
             ...prev,
-            ...response.data // displacements, stresses, max_stress, etc.
+            ...solveResult // displacements, stresses, max_stress, etc.
         }));
 
         // 展示被忽略/降级的边界条件（若有）
-        setSolverWarnings(Array.isArray(response.data?.warnings) ? response.data.warnings : []);
+        setSolverWarnings(Array.isArray(solveResult?.warnings) ? solveResult.warnings : []);
 
         // Update status to solved
         setSolverSettings(prev => prev ? { ...prev, status: 'solved' } : null);
@@ -720,8 +753,8 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
              <div className="flex items-center justify-between text-xs text-gray-400">
                 <span className="font-medium">Job status</span>
                 <div className="flex items-center gap-2">
-                   {isMeshing && <span className="text-yellow-500 flex items-center"><Activity size={12} className="mr-1 animate-pulse" /> Meshing...</span>}
-                   {isSolving && <span className="text-blue-500 flex items-center"><Activity size={12} className="mr-1 animate-pulse" /> Solving...</span>}
+                   {isMeshing && <span className="text-yellow-500 flex items-center"><Activity size={12} className="mr-1 animate-pulse" /> 网格 {meshJobStatus || '处理中…'}</span>}
+                   {isSolving && <span className="text-blue-500 flex items-center"><Activity size={12} className="mr-1 animate-pulse" /> 求解 {solveJobStatus || '处理中…'}</span>}
                    {!isMeshing && !isSolving && <span>Idle</span>}
                 </div>
              </div>

@@ -6,6 +6,7 @@ from constraints import router as constraints_router
 from geometry import router as geometry_router
 from solver import router as solver_router
 from ai_assistant import router as ai_router
+from jobs import router as jobs_router
 
 # 集中配置：上传目录为绝对路径，CORS 来源可用环境变量覆盖
 from config import CORS_ALLOW_ORIGINS, UPLOAD_DIR, ensure_upload_dir
@@ -41,6 +42,7 @@ app.include_router(constraints_router, prefix="/api")
 app.include_router(geometry_router, prefix="/api")
 app.include_router(solver_router, prefix="/api")
 app.include_router(ai_router, prefix="/api")
+app.include_router(jobs_router, prefix="/api")
 
 @app.get("/")
 async def root():

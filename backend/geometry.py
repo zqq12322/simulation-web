@@ -12,6 +12,14 @@ from logging_config import get_logger
 
 logger = get_logger(__name__)
 
+# 所有 gmsh 操作都排队到单线程工作器里执行（gmsh 非线程安全，见 jobs.py）
+from jobs import run_in_worker
+
+# gmsh 会话必须在**主线程**初始化（信号处理限制），模块导入即在主线程
+from gmsh_session import ensure_initialized as _ensure_gmsh, start_model
+
+_ensure_gmsh()
+
 # 集中配置：路径与限制（UPLOAD_DIR 为绝对路径，不再依赖工作目录）
 from config import (
     UPLOAD_DIR,
@@ -162,17 +170,13 @@ def extract_entity_metadata():
 
     return faces_metadata, edges_metadata, vertices_metadata
 
-@router.post("/generate-cube")
-async def generate_cube_geometry():
+async def generate_cube_geometry_impl():
     """
-    Generate a default 10x10x10 cube STEP file for demonstration.
+    生成默认 10x10x10 立方体 STEP（实现，在后台工作线程中执行，见 jobs.py）。
     """
     try:
-        if not gmsh.isInitialized():
-            gmsh.initialize()
-        
-        gmsh.clear()
-        gmsh.model.add("DefaultCube")
+        # 会话级 gmsh：不再 initialize/finalize（信号处理只能在主线程设置，见 gmsh_session）
+        start_model("DefaultCube")
         
         # Create a box at origin, size 10x10x10
         # x, y, z, dx, dy, dz
@@ -187,19 +191,14 @@ async def generate_cube_geometry():
         
         gmsh.write(file_path)
         
-        gmsh.finalize()
-        
         return {"filename": filename, "message": "Default cube generated"}
         
     except Exception as e:
-        if gmsh.isInitialized():
-            gmsh.finalize()
         raise HTTPException(status_code=500, detail=f"Failed to generate cube: {str(e)}")
 
-@router.post("/upload-geometry")
-async def upload_geometry(file: UploadFile = File(...)):
+async def upload_geometry_impl(file: UploadFile = File(...)):
     """
-    Upload a geometry file (STL, STEP, etc.) to the server and Supabase Storage.
+    上传几何文件（实现，在后台工作线程中执行，见 jobs.py）。
     """
     try:
         # 1. 先校验文件名（防路径穿越/扩展名白名单）与大小，再落盘供 Gmsh 处理
@@ -230,10 +229,7 @@ async def upload_geometry(file: UploadFile = File(...)):
         # Convert STEP/IGES to STL for web visualization
         if file.filename.lower().endswith(('.step', '.stp', '.iges', '.igs')):
             try:
-                if not gmsh.isInitialized():
-                    gmsh.initialize()
-                gmsh.clear()
-                gmsh.model.add("ConversionModel")
+                start_model("ConversionModel")
                 gmsh.merge(file_path)
                 
                 # Fast 2D meshing for visualization
@@ -283,11 +279,9 @@ class GeometryMetadata(BaseModel):
     vertices: List[VertexInfo] = []
     message: str
 
-@router.get("/geometry/{filename}/metadata", response_model=GeometryMetadata)
-async def get_geometry_metadata(filename: str):
+async def get_geometry_metadata_impl(filename: str):
     """
-    Extract geometry metadata (faces, etc.) without generating a full mesh.
-    Useful for visualization and boundary condition setup.
+    提取 B-Rep 元数据（实现，在后台工作线程中执行，见 jobs.py）。
     """
     try:
         file_path = str(resolve_upload_path(filename))
@@ -298,20 +292,12 @@ async def get_geometry_metadata(filename: str):
         raise HTTPException(status_code=404, detail="Geometry file not found")
 
     try:
-        if not gmsh.isInitialized():
-            gmsh.initialize()
-        
-        # Clear previous models
-        gmsh.clear()
-        gmsh.model.add("MetadataModel")
-        
-        # Merge the geometry file
+        # 清空上一个模型并导入几何（会话级 gmsh，不 initialize/finalize）
+        start_model("MetadataModel")
         gmsh.merge(file_path)
 
         faces_metadata, edges_metadata, vertices_metadata = extract_entity_metadata()
 
-        gmsh.finalize()
-        
         return GeometryMetadata(
             faces=faces_metadata,
             edges=edges_metadata,
@@ -322,15 +308,11 @@ async def get_geometry_metadata(filename: str):
     except HTTPException:
         raise
     except Exception as e:
-        if gmsh.isInitialized():
-            gmsh.finalize()
         raise HTTPException(status_code=500, detail=f"Metadata extraction failed: {str(e)}")
 
-@router.post("/generate-mesh", response_model=MeshInfo)
-async def generate_mesh(filename: str, mesh_size: float = 0.5):
+async def generate_mesh_impl(filename: str, mesh_size: float = 0.5):
     """
-    Generate a 3D tetrahedral mesh from the uploaded geometry using Gmsh.
-    Also extracts B-Rep face metadata for STEP/IGES files.
+    生成三维四面体网格（实现，在后台工作线程中执行，见 jobs.py）。
     """
     # 校验文件名与网格尺寸，避免非法输入进入 Gmsh
     try:
@@ -347,11 +329,10 @@ async def generate_mesh(filename: str, mesh_size: float = 0.5):
         raise HTTPException(status_code=404, detail="Geometry file not found")
 
     try:
-        # Initialize Gmsh
-        if not gmsh.isInitialized():
-            gmsh.initialize()
+        # 会话级 gmsh：start_model 会清空上一个模型（以前依赖每次 initialize 得到干净状态，
+        # gmsh 复用后必须显式清理，否则模型会不断累积）
+        start_model("Model")
         gmsh.option.setNumber("General.Terminal", GMSH_TERMINAL)
-        gmsh.model.add("Model")
 
         # Merge the geometry file
         # Gmsh supports STL, STEP, IGES, etc.
@@ -411,8 +392,6 @@ async def generate_mesh(filename: str, mesh_size: float = 0.5):
         if len(elements) == 0:
              logger.warning("未生成任何三维单元，网格可能只有面或划分失败")
         
-        gmsh.finalize()
-
         return MeshInfo(
             nodes=nodes,
             elements=elements,
@@ -426,7 +405,41 @@ async def generate_mesh(filename: str, mesh_size: float = 0.5):
     except HTTPException:
         raise
     except Exception as e:
-        if gmsh.isInitialized():
-            gmsh.finalize()
         logger.exception("网格划分失败")
         raise HTTPException(status_code=500, detail=f"Meshing failed: {str(e)}")
+
+# ===========================================================================
+#  同步端点：排进单线程工作队列并等待结果。
+#
+#  为什么不直接在事件循环里跑 gmsh：
+#    gmsh 是进程级全局状态、非线程安全；而网格划分又是 CPU 密集的，
+#    放在事件循环里会阻塞整个服务。统一走 jobs 的单线程工作器后：
+#      * 所有 gmsh 操作天然串行，不会互相破坏；
+#      * 事件循环保持响应（可以继续轮询任务状态）；
+#      * 同一套实现既服务同步接口，也服务异步任务接口（/api/jobs/*）。
+# ===========================================================================
+
+@router.post("/generate-cube")
+async def generate_cube_geometry():
+    """生成演示立方体 STEP（同步接口）。"""
+    return await run_in_worker(generate_cube_geometry_impl)
+
+
+@router.post("/upload-geometry")
+async def upload_geometry(file: UploadFile = File(...)):
+    """上传几何文件（同步接口）。"""
+    return await run_in_worker(upload_geometry_impl, file=file)
+
+
+@router.get("/geometry/{filename}/metadata", response_model=GeometryMetadata)
+async def get_geometry_metadata(filename: str):
+    """提取 B-Rep 元数据（同步接口）。"""
+    return await run_in_worker(get_geometry_metadata_impl, filename=filename)
+
+
+@router.post("/generate-mesh", response_model=MeshInfo)
+async def generate_mesh(filename: str, mesh_size: float = 0.5):
+    """生成网格（同步接口）。大模型建议改用 POST /api/jobs/generate-mesh。"""
+    return await run_in_worker(
+        generate_mesh_impl, filename=filename, mesh_size=mesh_size
+    )

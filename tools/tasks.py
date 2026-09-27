@@ -597,6 +597,32 @@ def task_verify(args: argparse.Namespace) -> int:
                 and cube_mm.get("length_unit") == "mm",
                 f"units={cube_mm.get('units')}, length_unit={cube_mm.get('length_unit')}",
             )
+
+            # 异步任务：提交 -> 轮询 -> 结果必须与同步接口一致
+            # （大模型不会再让请求超时；gmsh 非线程安全，所以任务在单线程里排队）
+            submitted = _http_json(
+                "POST",
+                f"{API_BASE}/api/jobs/generate-mesh",
+                {"filename": "test_part.step", "mesh_size": 1.2},
+            )
+            job_payload: dict = {}
+            for _ in range(120):
+                time.sleep(0.5)
+                job_payload = _http_json("GET", f"{API_BASE}/api/jobs/{submitted['job_id']}")
+                if job_payload.get("status") in ("succeeded", "failed"):
+                    break
+
+            job_result = job_payload.get("result") or {}
+            check(
+                "异步任务（提交→轮询→完成）",
+                job_payload.get("status") == "succeeded",
+                f"status={job_payload.get('status')}",
+            )
+            check(
+                "异步结果与同步接口一致",
+                len(job_result.get("nodes", [])) == len(mesh["nodes"]),
+                f"async={len(job_result.get('nodes', []))} sync={len(mesh['nodes'])}",
+            )
         except Exception as exc:
             check("求解器物理校准", False, f"{type(exc).__name__}: {exc}")
 
