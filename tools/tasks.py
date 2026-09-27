@@ -1115,6 +1115,134 @@ def _check_frontend_auth_math(node: str) -> tuple[bool, str]:
     return ok, ("令牌存取 / 请求头 / 错误区分 均符合断言" if ok else detail)
 
 
+#: 项目配置（自动保存）的纯逻辑断言。
+#: 重点锁三件事：组装只带该带的字段、**按键排序的稳定签名**（否则每次重渲染都会
+#: 写一次库）、以及恢复时对不认识的内容必须丢弃并报告。
+_PROJECT_SETUP_SELFTEST = r"""
+import { SETUP_VERSION, buildSetupPayload, describeSaveStatus,
+         describeSetupBadge, restoreSetup, setupSignature,
+         stableStringify } from './projectSetup.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+const bc = { id: 'bc1', name: '固定端', type: 'fixed',
+             applicationType: 'face', entityIndex: 1, color: '#f00' };
+const source = {
+  modelName: 'test_part.step',
+  selectedMaterial: { id: 'structural_steel', name: '结构钢' },
+  boundaryConditions: [bc],
+  meshSettings: { id: 'm1', meshSize: 1.5, status: 'meshed' },
+  solverSettings: { id: 's1', solverType: 'structural', lengthUnit: 'mm' },
+};
+
+// 1) 组装：版本号、字段映射、深拷贝
+const payload = buildSetupPayload(source);
+check('版本号', payload.version === SETUP_VERSION);
+check('几何文件名', payload.geometryFilename === 'test_part.step');
+check('材料只取 id', payload.materialId === 'structural_steel');
+check('边界条件条数', payload.boundaryConditions.length === 1);
+check('求解设置带上', payload.solverSettings.lengthUnit === 'mm');
+
+// 深拷贝：之后再改界面状态不该影响已经组装好的文档
+source.boundaryConditions.push({ ...bc, id: 'bc2' });
+source.meshSettings.meshSize = 99;
+check('深拷贝边界条件', payload.boundaryConditions.length === 1,
+      String(payload.boundaryConditions.length));
+check('深拷贝网格设置', payload.meshSettings.meshSize === 1.5,
+      String(payload.meshSettings.meshSize));
+
+const empty = buildSetupPayload({ modelName: null, selectedMaterial: null,
+  boundaryConditions: [], meshSettings: null, solverSettings: null });
+check('空状态可组装', empty.geometryFilename === null
+      && empty.materialId === null && empty.boundaryConditions.length === 0);
+
+// 2) 稳定签名：键顺序不同必须得到同一个签名
+check('stableStringify 对键排序',
+      stableStringify({ b: 1, a: 2 }) === stableStringify({ a: 2, b: 1 }),
+      stableStringify({ b: 1, a: 2 }));
+check('stableStringify 递归排序',
+      stableStringify({ x: { b: 1, a: 2 } }) === stableStringify({ x: { a: 2, b: 1 } }));
+check('数组顺序仍然有意义',
+      stableStringify([1, 2]) !== stableStringify([2, 1]));
+
+const reordered = { version: 1,
+  solverSettings: { lengthUnit: 'mm', id: 's1', solverType: 'structural' },
+  meshSettings: { status: 'meshed', meshSize: 1.5, id: 'm1' },
+  boundaryConditions: [bc], materialId: 'structural_steel',
+  geometryFilename: 'test_part.step' };
+check('签名与键顺序无关', setupSignature(payload) === setupSignature(reordered),
+      setupSignature(payload) === setupSignature(reordered) ? '' : '键顺序不同却得到不同签名');
+check('签名忽略 version',
+      setupSignature({ ...payload, version: 99 }) === setupSignature(payload));
+check('真正改动会改变签名',
+      setupSignature({ ...payload, geometryFilename: 'other.step' })
+      !== setupSignature(payload));
+check('缺失配置的签名为空串',
+      setupSignature(null) === '' && setupSignature(undefined) === '');
+
+// 3) 恢复：认识的内容拿回来，不认识的内容丢弃并报告
+const restored = restoreSetup(payload);
+check('恢复几何', restored.geometryFilename === 'test_part.step');
+check('恢复材料 id', restored.materialId === 'structural_steel');
+check('恢复边界条件', restored.boundaryConditions.length === 1);
+check('恢复网格设置', restored.meshSettings.meshSize === 1.5);
+check('完好文档没有警告', restored.warnings.length === 0,
+      JSON.stringify(restored.warnings));
+
+const broken = restoreSetup({
+  version: 99,
+  geometryFilename: 123,
+  materialId: null,
+  boundaryConditions: 'not-an-array',
+  meshSettings: [1, 2, 3],
+  solverSettings: { ok: true },
+});
+check('版本不符要报告', broken.warnings.some(w => w.includes('99')),
+      JSON.stringify(broken.warnings));
+check('类型不对的字段被丢弃', broken.geometryFilename === null
+      && broken.boundaryConditions.length === 0 && broken.meshSettings === null);
+// 1 条版本警告 + 3 条字段警告（geometryFilename / boundaryConditions / meshSettings）
+check('每一项问题都有说明', broken.warnings.length === 4,
+      JSON.stringify(broken.warnings));
+check('能认的还是认了', broken.solverSettings.ok === true);
+check('空文档安全', restoreSetup(null).geometryFilename === null
+      && restoreSetup(null).warnings.length === 0
+      && restoreSetup(undefined).boundaryConditions.length === 0
+      && restoreSetup('nonsense').warnings.length === 0);
+
+// 4) 保存状态文案：error 绝不能显示成"已保存"
+const failed = describeSaveStatus('error', { error: '后端不可用' });
+check('失败文案不说已保存', !failed.includes('已保存'), failed);
+check('失败文案带原因', failed.includes('后端不可用'), failed);
+check('保存中文案', describeSaveStatus('saving').includes('保存'));
+check('已保存文案', describeSaveStatus('saved',
+      { savedAt: '2026-03-18T00:00:00+00:00' }).startsWith('已保存'));
+check('时间戳非法时有兜底',
+      describeSaveStatus('saved', { savedAt: 'garbage' }) === '已保存');
+check('初始状态文案', describeSaveStatus('idle') === '未修改');
+
+// 5) 仪表盘标记
+check('已配置标记', describeSetupBadge(true) === '已配置');
+check('空项目标记', describeSetupBadge(false) === '空项目'
+      && describeSetupBadge(null) === '空项目');
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+def _check_frontend_project_setup_math(node: str) -> tuple[bool, str]:
+    """用 node 执行 `frontend/utils/projectSetup.ts` 里的纯函数并断言其行为。"""
+    ok, detail = _run_node_module_selftest(node, _PROJECT_SETUP_SELFTEST)
+    return ok, ("组装 / 稳定签名 / 恢复校验 / 状态文案 均符合断言" if ok else detail)
+
+
 def _check_modal_display_chain(node: str, payload: dict) -> tuple[bool, str]:
     """
     把后端真实返回的模态结果喂给前端的取场逻辑。
@@ -1183,6 +1311,9 @@ def task_verify(args: argparse.Namespace) -> int:
 
             passed, detail = _check_frontend_auth_math(node_bin)
             check("认证工具（node 执行前端纯函数）", passed, detail)
+
+            passed, detail = _check_frontend_project_setup_math(node_bin)
+            check("项目配置自动保存（node 执行前端纯函数）", passed, detail)
         else:
             check("TypeScript 类型检查", False, "未找到 node")
 
@@ -1736,6 +1867,118 @@ def task_verify(args: argparse.Namespace) -> int:
                 "被拒绝的操作没有产生任何副作用",
                 still.get("title") == "改名后",
                 f"title={still.get('title')}",
+            )
+
+            # ---- 项目配置（仿真设置的持久化）----
+            # 在此之前几何/材料/边界条件/网格与求解设置全在浏览器内存里，
+            # 重新打开项目是一个空白工作台。这组检查验证配置真的落库了。
+            setup_document = {
+                "version": 1,
+                "geometryFilename": "test_part.step",
+                "materialId": "structural_steel",
+                "boundaryConditions": [
+                    {"id": "bc_fix", "name": "固定端", "type": "fixed",
+                     "applicationType": "face", "entityIndex": 1, "color": "#ff0000"},
+                    {"id": "bc_load", "name": "拉力", "type": "force",
+                     "applicationType": "face", "entityIndex": 2, "color": "#00ff00",
+                     "force": {"x": 1000.0, "y": 0.0, "z": 0.0}},
+                ],
+                "meshSettings": {"id": "m1", "meshType": "tetrahedral",
+                                 "meshSize": 1.2, "status": "meshed",
+                                 "refinementRegions": [], "quality": 0.8},
+                "solverSettings": {"id": "s1", "solverType": "structural",
+                                   "solverName": "default", "lengthUnit": "mm",
+                                   "parameters": {"timeStep": 0.1},
+                                   "status": "configured"},
+            }
+
+            empty_setup = _http_json(
+                "GET", f"{API_BASE}/api/projects/{created_id}/setup",
+                headers=alice_headers,
+            )
+            check(
+                "新项目没有配置时返回 200 + null（不是 404）",
+                empty_setup.get("setup") is None and empty_setup.get("savedAt") is None,
+                f"setup={empty_setup.get('setup')}",
+            )
+
+            saved_setup = _http_json(
+                "PUT", f"{API_BASE}/api/projects/{created_id}/setup",
+                setup_document, headers=alice_headers,
+            )
+            check(
+                "保存配置后原样读回",
+                saved_setup.get("setup", {}).get("materialId") == "structural_steel"
+                and len(saved_setup.get("setup", {}).get("boundaryConditions", [])) == 2
+                and bool(saved_setup.get("savedAt")),
+                f"materialId={saved_setup.get('setup', {}).get('materialId')} "
+                f"savedAt={saved_setup.get('savedAt')}",
+            )
+
+            resolved = _http_json(
+                "GET", f"{API_BASE}/api/projects/{created_id}/setup",
+                headers=alice_headers,
+            )
+            check(
+                "重新取回配置内容一致（含中文与嵌套设置）",
+                resolved.get("setup") == saved_setup.get("setup"),
+                "两次读取应完全一致",
+            )
+
+            alice_list = _http_json(
+                "GET", f"{API_BASE}/api/projects", headers=alice_headers
+            )
+            entry = next(
+                (item for item in alice_list if item.get("id") == created_id), {}
+            ) if isinstance(alice_list, list) else {}
+            check(
+                "列表里标出已配置，但**不带**完整配置",
+                entry.get("hasSetup") is True and "setup" not in entry,
+                f"hasSetup={entry.get('hasSetup')} keys={sorted(entry)[:4]}...",
+            )
+
+            check(
+                "别人读不到我的配置（404）",
+                _http_status(
+                    "GET", f"{API_BASE}/api/projects/{created_id}/setup",
+                    headers=bob_headers,
+                ) == 404,
+                "配置同样按属主隔离",
+            )
+
+            check(
+                "非法几何文件名被拒（复用上传的校验规则）",
+                _http_status(
+                    "PUT", f"{API_BASE}/api/projects/{created_id}/setup",
+                    dict(setup_document, geometryFilename="../../etc/passwd.step"),
+                    headers=alice_headers,
+                ) == 422,
+                "配置里的文件名之后会被用于请求几何端点，必须同样校验",
+            )
+
+            oversized = dict(setup_document,
+                             meshSettings={"blob": "x" * (300 * 1024)})
+            check(
+                "超大配置被拒（413）",
+                _http_status(
+                    "PUT", f"{API_BASE}/api/projects/{created_id}/setup",
+                    oversized, headers=alice_headers,
+                ) == 413,
+                "配置是 UI 状态快照，正常只有几 KB",
+            )
+
+            cleared = _http_json(
+                "DELETE", f"{API_BASE}/api/projects/{created_id}/setup",
+                headers=alice_headers,
+            )
+            after_clear = _http_json(
+                "GET", f"{API_BASE}/api/projects/{created_id}/setup",
+                headers=alice_headers,
+            )
+            check(
+                "清空配置后项目还在、配置为空",
+                cleared.get("cleared") is True and after_clear.get("setup") is None,
+                f"setup={after_clear.get('setup')}",
             )
 
             _http_json(

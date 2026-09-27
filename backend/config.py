@@ -88,6 +88,19 @@ PASSWORD_MAX_LENGTH: Final[int] = 200
 USERNAME_MIN_LENGTH: Final[int] = 3
 USERNAME_MAX_LENGTH: Final[int] = 32
 
+# ------------------------------------------------------------------- 项目配置
+#: 项目仿真配置（几何/材料/边界条件/网格与求解设置）的最大字节数。
+#: 这是一份**前端 UI 状态**的快照，正常只有几 KB；设上限是为了防止有人往里面
+#: 塞任意大的东西把数据库撑爆。
+SIMULATION_SETUP_MAX_BYTES: Final[int] = int(
+    os.getenv("SIMCLOUD_SETUP_MAX_BYTES", str(256 * 1024))
+)
+
+#: 一份配置里允许的边界条件条数上限
+SIMULATION_SETUP_MAX_BCS: Final[int] = int(
+    os.getenv("SIMCLOUD_SETUP_MAX_BCS", "100")
+)
+
 
 def ensure_upload_dir() -> Path:
     """确保上传目录存在并返回该目录。"""

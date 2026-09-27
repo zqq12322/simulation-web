@@ -28,6 +28,7 @@ export interface ProjectRecord {
   simulationType?: unknown;
   isPrivate?: unknown;
   ownerId?: unknown;
+  hasSetup?: unknown;
   createdAt?: unknown;
   updatedAt?: unknown;
 }
@@ -86,6 +87,8 @@ export function toProject(record: ProjectRecord | null | undefined): Project | n
     // 缺失与 null 都表示"无主"（后端用 owner_id IS NULL 表达遗留项目）。
     // 归一化成 null，界面就不必区分 undefined / null 两种情况。
     ownerId: typeof record.ownerId === 'string' && record.ownerId ? record.ownerId : null,
+    // 列表接口只给"配过没有"的标记（完整配置走 /setup 子资源）
+    hasSetup: record.hasSetup === true,
   };
 }
 

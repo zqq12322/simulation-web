@@ -51,6 +51,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -72,14 +73,17 @@ CREATE TABLE IF NOT EXISTS projects (
     simulation_type TEXT NOT NULL DEFAULT 'General',
     is_private      INTEGER NOT NULL DEFAULT 1,
     owner_id        TEXT,
+    setup           TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
 """
 
-#: 后加的列：``owner_id``（接上登录时新增）。老库会自动补列，旧行为 NULL。
+#: 后加的列：``owner_id``（接上登录时新增）、``setup``（仿真配置 JSON）。
+#: 老库会自动补列，旧行为 NULL。
 _MIGRATIONS = {
     "owner_id": "TEXT",
+    "setup": "TEXT",
 }
 
 
@@ -90,6 +94,27 @@ def _now() -> str:
 def new_project_id() -> str:
     """服务端生成的项目 ID（12 位十六进制，与 job id 风格一致）。"""
     return uuid.uuid4().hex[:12]
+
+
+def parse_setup(raw: Optional[str]) -> Optional[dict]:
+    """
+    把存储里的配置 JSON 解析成 dict；**空值或坏数据都返回 ``None``**。
+
+    这条规则必须只有一份实现：`get_setup`（详情）与 `_row_to_dict`（列表里的
+    `hasSetup` 标记）都要用它。否则会出现"列表说已配置、打开却是空的"——
+    一个很小但确实在骗人的不一致（本模块的测试就是这么发现的：
+    `hasSetup` 原本只判断字符串非空，坏 JSON 也算"已配置"）。
+
+    这里刻意**不打日志**（列表接口会逐行调用，会刷屏）；需要诊断的那条路径
+    （`get_setup`）自己判断并记录。
+    """
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 class ProjectStore(SqliteStore):
@@ -297,9 +322,74 @@ class ProjectStore(SqliteStore):
 
         return self.get_project(project_id, owner_id)
 
+    # ------------------------------------------------------------- 仿真配置
+    def get_setup(
+        self, project_id: str, owner_id: Optional[str] = None
+    ) -> Optional[dict]:
+        """
+        取项目的仿真配置：``{"setup": dict|None, "savedAt": str|None}``。
+
+        **项目不存在或不属于该属主时返回 ``None``**（调用方转 404）。
+        注意区分两种"空"：
+        - 项目不存在 → ``None``（404）
+        - 项目存在但没保存过配置 → ``{"setup": None, ...}``（200）
+
+        混在一起会让前端把"还没配过"当成"项目没了"。
+        """
+        with self._cursor() as connection:
+            row = connection.execute(
+                "SELECT setup, updated_at FROM projects WHERE id = ? AND owner_id IS ?",
+                (project_id, owner_id),
+            ).fetchone()
+        if row is None:
+            return None
+
+        raw = row["setup"]
+        parsed = parse_setup(raw)
+        if raw and parsed is None:
+            # 库里的内容坏了：如实按"空"处理并留日志，而不是让端点 500
+            # （500 的话用户完全不知道发生了什么，也不知道配置已经丢了）
+            logger.warning("项目 %s 的仿真配置无法解析，已按空处理", project_id)
+        if parsed is None:
+            return {"setup": None, "savedAt": None}
+        return {"setup": parsed, "savedAt": row["updated_at"]}
+
+    def set_setup(
+        self, project_id: str, setup: dict, owner_id: Optional[str] = None
+    ) -> Optional[dict]:
+        """
+        覆盖保存仿真配置；项目不存在或不属于该属主时返回 ``None``。
+
+        **整份覆盖**而不是局部合并：配置是一份文档，局部合并表达不了
+        "删掉一个边界条件"这类操作（前端发来的本来就是完整状态）。
+        """
+        payload = json.dumps(setup, ensure_ascii=False, separators=(",", ":"))
+        with self._cursor() as connection:
+            cursor = connection.execute(
+                "UPDATE projects SET setup = ?, updated_at = ?"
+                " WHERE id = ? AND owner_id IS ?",
+                (payload, _now(), project_id, owner_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+        logger.info("已保存项目 %s 的仿真配置（%d 字节）", project_id, len(payload))
+        return self.get_setup(project_id, owner_id)
+
+    def clear_setup(self, project_id: str, owner_id: Optional[str] = None) -> bool:
+        """清空仿真配置（保留项目本身）。"""
+        with self._cursor() as connection:
+            cursor = connection.execute(
+                "UPDATE projects SET setup = NULL, updated_at = ?"
+                " WHERE id = ? AND owner_id IS ?",
+                (_now(), project_id, owner_id),
+            )
+            return cursor.rowcount > 0
+
     # ------------------------------------------------------------- 工具
     @staticmethod
     def _row_to_dict(row: sqlite3.Row) -> dict:
+        keys = row.keys()
+        setup = row["setup"] if "setup" in keys else None
         return {
             "id": row["id"],
             "title": row["title"],
@@ -307,6 +397,11 @@ class ProjectStore(SqliteStore):
             "simulationType": row["simulation_type"],
             "isPrivate": bool(row["is_private"]),
             "ownerId": row["owner_id"],
+            # 列表里**不返回完整配置**（可能很大）：只给一个"配过没有"的标记，
+            # 仪表盘据此显示"已配置 / 空项目"。完整内容走 /setup 子资源。
+            # 用 `parse_setup` 而不是 `bool(setup)`：坏 JSON 必须与详情页
+            # 保持一致（都算"空"），否则会出现"列表说已配置、打开却是空的"。
+            "hasSetup": parse_setup(setup) is not None,
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }

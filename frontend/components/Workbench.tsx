@@ -21,7 +21,9 @@ import {
   Sliders,
   Activity,
   BarChart2,
-  FileBox
+  FileBox,
+  Save,
+  RefreshCw
 } from 'lucide-react';
 import axios from 'axios';
 import { currentAuthHeaders, isUnauthorized, notifySessionExpired } from '../utils/authApi';
@@ -34,6 +36,13 @@ import SolverSettingsModal from './SolverSettingsModal';
 import AIAssistantPanel, { AIAssistantPanelRef } from './AIAssistantPanel';
 import { Project, Material, AnyBoundaryCondition, MeshSettings, SolverSettings } from '../types';
 import { formatFrequency, modeDisplayField } from '../utils/modalModes';
+import {
+  buildSetupPayload,
+  describeSaveStatus,
+  restoreSetup,
+  setupSignature,
+  type SaveStatus,
+} from '../utils/projectSetup';
 
 interface WorkbenchProps {
   project: Project;
@@ -82,6 +91,153 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   // 模态分析：当前显示的阶次（0 起）。模态结果里每个振型都是一个位移场，
   // 切换阶次只是换掉要显示的位移场，见 handleSelectMode。
   const [selectedMode, setSelectedMode] = useState<number>(0);
+
+  // ---- 项目配置的加载与自动保存 ----
+  //
+  // 在这之前几何/材料/边界条件/网格与求解设置**全在内存里**：关掉页面就没了，
+  // 重新打开项目是一个空白工作台——"项目"这个概念的承诺其实是空的。
+  const [setupStatus, setSetupStatus] = useState<SaveStatus>('idle');
+  const [setupSavedAt, setSetupSavedAt] = useState<string | null>(null);
+  const [setupError, setSetupError] = useState<string | null>(null);
+  const [setupLoading, setSetupLoading] = useState(true);
+  const [setupWarnings, setSetupWarnings] = useState<string[]>([]);
+  /** 上次落库的配置签名；用它判断"有没有真的变"，避免每次重渲染都写库 */
+  const lastSavedSignature = React.useRef<string>('');
+
+  const saveSetup = React.useCallback(async (
+    overrides?: Partial<{
+      modelName: string | null;
+      selectedMaterial: Material | null;
+      boundaryConditions: AnyBoundaryCondition[];
+      meshSettings: MeshSettings | null;
+      solverSettings: SolverSettings | null;
+    }>
+  ): Promise<boolean> => {
+    const payload = buildSetupPayload({
+      modelName: overrides?.modelName !== undefined ? overrides.modelName : modelName,
+      selectedMaterial: overrides?.selectedMaterial !== undefined
+        ? overrides.selectedMaterial : selectedMaterial,
+      boundaryConditions: overrides?.boundaryConditions ?? boundaryConditions,
+      meshSettings: overrides?.meshSettings !== undefined
+        ? overrides.meshSettings : meshSettings,
+      solverSettings: overrides?.solverSettings !== undefined
+        ? overrides.solverSettings : solverSettings,
+    });
+    const signature = setupSignature(payload);
+    if (signature === lastSavedSignature.current) return true;   // 没变，不必写
+
+    setSetupStatus('saving');
+    setSetupError(null);
+    try {
+      const { data } = await axios.put(
+        `${API_BASE_URL}/api/projects/${project.id}/setup`,
+        payload,
+        { headers: currentAuthHeaders() },
+      );
+      lastSavedSignature.current = setupSignature(data?.setup ?? payload);
+      setSetupSavedAt(data?.savedAt ?? null);
+      setSetupStatus('saved');
+      return true;
+    } catch (error: any) {
+      console.error('保存项目配置失败:', error);
+      if (isUnauthorized(error)) {
+        notifySessionExpired('登录已失效，请重新登录后再保存配置。');
+      }
+      // **不能显示成"已保存"**：用户会以为配置存下来了，下次打开才发现全丢了
+      setSetupStatus('error');
+      setSetupError(
+        error?.response?.data?.detail || error?.message || '未知错误'
+      );
+      return false;
+    }
+  }, [
+    API_BASE_URL, project.id, modelName, selectedMaterial,
+    boundaryConditions, meshSettings, solverSettings,
+  ]);
+
+  // 打开项目时恢复配置。**只在项目 id 变化时加载一次**：否则自动保存触发的
+  // 状态变化会让这个 effect 反复跑，把用户正在编辑的内容覆盖回旧值。
+  React.useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      setSetupLoading(true);
+      try {
+        const { data } = await axios.get(
+          `${API_BASE_URL}/api/projects/${project.id}/setup`,
+          { headers: currentAuthHeaders() },
+        );
+        if (cancelled) return;
+
+        const restored = restoreSetup(data?.setup);
+        setMeshSettings(restored.meshSettings);
+        setSolverSettings(restored.solverSettings);
+        setBoundaryConditions(restored.boundaryConditions);
+        setModelName(restored.geometryFilename);
+        setSetupWarnings(restored.warnings);
+        setSetupSavedAt(data?.savedAt ?? null);
+
+        // 材料只有 id：去后端换成完整对象；换不到（材料被删了）就留空并说明
+        if (restored.materialId) {
+          try {
+            const material = await axios.get(
+              `${API_BASE_URL}/api/materials/${restored.materialId}`,
+              { headers: currentAuthHeaders() },
+            );
+            if (!cancelled) setSelectedMaterial(material.data);
+          } catch {
+            if (!cancelled) {
+              setSetupWarnings(prev => [
+                ...prev,
+                `材料 ${restored.materialId} 已不在材料库中，请重新选择。`,
+              ]);
+            }
+          }
+        }
+
+        // 记下"刚加载时的样子"：之后只有真正改动才会触发自动保存
+        lastSavedSignature.current = setupSignature(
+          buildSetupPayload({
+            modelName: restored.geometryFilename,
+            selectedMaterial: null,
+            boundaryConditions: restored.boundaryConditions,
+            meshSettings: restored.meshSettings,
+            solverSettings: restored.solverSettings,
+          })
+        );
+        setSetupStatus(restored.warnings.length || data?.setup ? 'saved' : 'idle');
+      } catch (error: any) {
+        if (cancelled) return;
+        console.error('加载项目配置失败:', error);
+        if (isUnauthorized(error)) {
+          notifySessionExpired('登录已失效，请重新登录。');
+          return;
+        }
+        setSetupStatus('error');
+        setSetupError(error?.response?.data?.detail || error?.message || '加载失败');
+      } finally {
+        if (!cancelled) setSetupLoading(false);
+      }
+    };
+    load();
+    return () => { cancelled = true; };
+    // 只依赖项目 id：配置的其余状态由自动保存负责
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [API_BASE_URL, project.id]);
+
+  // 自动保存（防抖 1.5 秒）。配置改变时写回后端，状态条如实显示结果。
+  React.useEffect(() => {
+    if (setupLoading) return;
+    const payload = buildSetupPayload({
+      modelName, selectedMaterial, boundaryConditions, meshSettings, solverSettings,
+    });
+    if (setupSignature(payload) === lastSavedSignature.current) return;
+
+    const timer = setTimeout(() => { void saveSetup(); }, 1500);
+    return () => clearTimeout(timer);
+  }, [
+    setupLoading, modelName, selectedMaterial, boundaryConditions,
+    meshSettings, solverSettings, saveSetup,
+  ]);
 
   /**
    * 轮询后台任务直到结束。
@@ -344,7 +500,6 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   };
 
   const handleGenerateMesh = async (settingsOverride?: MeshSettings) => {
-    console.log('Attempting to generate mesh with settings:', settingsOverride || meshSettings);
     
     if (!modelName) {
       alert("请先导入几何模型。");
@@ -365,6 +520,10 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     if (!meshSettings) {
       setMeshSettings(resolvedSettings);
     }
+
+    // 先把配置落库再动耗时操作：网格/求解可能跑几分钟，用户在中途刷新或
+    // 换设备时不该丢掉刚配好的东西。（override 的网格设置还没进 state，显式传）
+    await saveSetup({ meshSettings: resolvedSettings });
 
     setIsMeshing(true);
     
@@ -497,6 +656,9 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
       );
       return;
     }
+
+    // 先把配置落库再提交耗时任务（同网格划分的理由）
+    await saveSetup();
 
     setIsSolving(true);
       
@@ -648,6 +810,33 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
           <div className="flex flex-col">
              <span className="text-sm font-semibold text-white leading-tight">{project.title}</span>
              <span className="text-xs text-text-secondary leading-tight">Geometries / 1</span>
+          </div>
+          {/* 配置保存状态。**必须如实**：保存失败不能显示成"已保存"，
+              否则用户会以为配置存下来了，下次打开才发现全丢了。 */}
+          <div
+            className={`flex items-center gap-1.5 px-2 py-1 rounded text-xs border ${
+              setupStatus === 'error'
+                ? 'bg-red-500/10 text-red-300 border-red-500/40'
+                : setupStatus === 'saving'
+                ? 'bg-yellow-500/10 text-yellow-200 border-yellow-500/30'
+                : 'bg-white/5 text-text-secondary border-border'
+            }`}
+            title={setupError || '项目配置会自动保存到后端'}
+          >
+            {setupStatus === 'saving'
+              ? <RefreshCw size={11} className="animate-spin" />
+              : <Save size={11} />}
+            {setupLoading
+              ? '加载配置中…'
+              : describeSaveStatus(setupStatus, { savedAt: setupSavedAt, error: setupError })}
+            {setupStatus === 'error' && (
+              <button
+                onClick={() => void saveSetup()}
+                className="ml-1 underline hover:text-white"
+              >
+                重试
+              </button>
+            )}
           </div>
         </div>
 

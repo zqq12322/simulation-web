@@ -17,13 +17,16 @@
 
 from __future__ import annotations
 
+import json
 import re
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from auth import require_user
+from config import SIMULATION_SETUP_MAX_BCS, SIMULATION_SETUP_MAX_BYTES, resolve_upload_path
+from constraints import BoundaryCondition
 from logging_config import get_logger
 from project_store import SIMULATION_TYPES, get_store
 
@@ -105,9 +108,73 @@ class ProjectResponse(BaseModel):
     #: 属主用户 id。当前实现里你只会看到自己的项目，因此它总是等于你本人；
     #: 保留在响应里是为了让"归属"这件事显式可见（也便于将来做共享）。
     ownerId: Optional[str] = None
+    #: 是否保存过仿真配置（完整内容走 /setup 子资源，列表里不带，避免响应过大）
+    hasSetup: bool = False
     #: ISO-8601 UTC 字符串；前端用 new Date(...) 解析
     createdAt: str
     updatedAt: str
+
+
+# ------------------------------------------------------- 仿真配置（项目文档）
+
+class SimulationSetup(BaseModel):
+    """
+    项目的仿真配置——几何、材料、边界条件、网格与求解设置的一份快照。
+
+    校验策略是**分级**的，这一点是刻意的：
+
+    - **后端自己要消费的字段从严**：`geometryFilename` 会用与上传同样的规则校验
+      （纯文件名 + 扩展名白名单），因为前端之后会拿它去请求几何端点；
+      `boundaryConditions` 直接用 `BoundaryCondition` 校验（`extra="forbid"`），
+      它们会被原样送回求解器。
+    - **纯前端 UI 设置从宽但有界**：`meshSettings` / `solverSettings` 只要求是
+      JSON 对象，不逐字段校验。它们属于界面状态，形状会随界面迭代而变化，
+      在这里钉死会把后端和前端 UI 耦合起来——**每次改界面都要同时改后端**。
+      代价是这些字段存进去什么就是什么，因此用总量上限兜底。
+    """
+
+    #: 配置文档版本。将来形状变化时靠它做迁移，而不是猜。
+    version: Literal[1] = 1
+    #: 几何文件名（与上传目录里的名字一致）；没导入几何时为 None
+    geometryFilename: Optional[str] = None
+    #: 材料 id；材料库允许删除，所以这里不要求在库中存在
+    materialId: Optional[str] = Field(default=None, max_length=64)
+    #: 边界条件（会被原样送回求解器，因此严格校验）
+    boundaryConditions: List[BoundaryCondition] = []
+    #: 网格与求解设置（纯界面状态，从宽）
+    meshSettings: Optional[Dict[str, Any]] = None
+    solverSettings: Optional[Dict[str, Any]] = None
+
+    @field_validator("geometryFilename")
+    @classmethod
+    def _validate_geometry(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        # 复用上传时的同一套规则：拒绝路径穿越/盘符/非法扩展名。
+        # 这里**不检查文件是否存在**——几何可能已被清理，但配置仍应能保存下来
+        # （用户的边界条件不该因为文件没了就丢掉）。
+        try:
+            resolve_upload_path(value)
+        except ValueError as exc:
+            raise ValueError(f"geometryFilename 不合法：{exc}")
+        return value
+
+    @field_validator("boundaryConditions")
+    @classmethod
+    def _limit_boundary_conditions(cls, value):
+        if len(value) > SIMULATION_SETUP_MAX_BCS:
+            raise ValueError(
+                f"边界条件条数超过上限（{SIMULATION_SETUP_MAX_BCS}）"
+            )
+        return value
+
+
+class SimulationSetupResponse(BaseModel):
+    """``GET /setup`` 的返回。项目存在但没配过时 ``setup`` 为 ``null``（200，不是 404）。"""
+
+    setup: Optional[SimulationSetup] = None
+    #: 上次保存时间；从未保存过为 None
+    savedAt: Optional[str] = None
 
 
 #: 所有项目端点都必须登录。**按属主过滤**（而不是"先查出来再判断"）：
@@ -213,6 +280,75 @@ async def delete_project(project_id: str, user: dict = OwnedUser):
     if not get_store().delete(project_id, user["id"]):
         raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
     return {"deleted": True, "id": project_id}
+
+
+# --------------------------------------------------------------- 仿真配置
+#
+# 为什么是独立子资源而不是塞进项目对象：
+# 配置可能几十 KB（几何是边界条件 + 网格/求解设置的快照），而 `/api/projects`
+# 是列表接口——把配置塞进去会让列表响应成倍变大。列表只需要一个 `hasSetup`
+# 标记，完整内容按需取。
+
+
+@router.get("/projects/{project_id}/setup", response_model=SimulationSetupResponse)
+async def get_project_setup(project_id: str, user: dict = OwnedUser):
+    """
+    取项目的仿真配置。
+
+    项目不存在/不属于自己 → **404**；
+    项目存在但从未保存过配置 → **200 且 ``setup`` 为 ``null``**。
+    两者必须分开：混起来前端会把"还没配过"当成"项目没了"。
+    """
+    stored = get_store().get_setup(project_id, user["id"])
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+    return SimulationSetupResponse(**stored)
+
+
+@router.put("/projects/{project_id}/setup", response_model=SimulationSetupResponse)
+async def put_project_setup(
+    project_id: str, request: SimulationSetup, user: dict = OwnedUser
+):
+    """
+    覆盖保存仿真配置（整份替换，不做局部合并）。
+
+    为什么整份覆盖：配置是一份**文档**，前端发来的本来就是完整状态。
+    局部合并反而表达不了"删掉一个边界条件"。
+
+    超过大小上限返回 **413**：配置是前端 UI 状态的快照，正常只有几 KB，
+    超限说明发来的东西不对（或者有人想拿它当文件存储用）。
+    """
+    # exclude_none=True：不存 None 值。它们与"没有这个字段"等价，但会让文档膨胀
+    # ——每个边界条件会多出十来个 null（Pydantic 会把所有未填的可选字段补成 None）
+    # ——并且让"存进去什么、读回来就是什么"不再成立。
+    # 实测：不用它时，前端发去 2 个边界条件，读回来每个都多了 10 个 null 字段。
+    payload = request.model_dump(exclude_none=True)
+    size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    if size > SIMULATION_SETUP_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"仿真配置过大（{size} 字节 > {SIMULATION_SETUP_MAX_BYTES} 字节）"
+            ),
+        )
+
+    saved = get_store().set_setup(project_id, payload, user["id"])
+    if saved is None:
+        raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+    return SimulationSetupResponse(**saved)
+
+
+@router.delete("/projects/{project_id}/setup")
+async def delete_project_setup(project_id: str, user: dict = OwnedUser):
+    """
+    清空仿真配置（保留项目本身）。
+
+    用途：把项目重置为空工作台。**不做成"删项目"**——用户想重配一遍，
+    不该连项目名和描述一起丢掉。
+    """
+    if not get_store().clear_setup(project_id, user["id"]):
+        raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+    return {"cleared": True, "id": project_id}
 
 
 @router.get("/project-metadata")

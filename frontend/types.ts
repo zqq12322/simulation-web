@@ -24,6 +24,12 @@ export interface Project {
    * 测试账号（`tools/tasks.py verify`），用户下次登录就发现项目不见了。
    */
   ownerId?: string | null;
+  /**
+   * 是否保存过仿真配置（几何/材料/边界条件/网格与求解设置）。
+   *
+   * 注意这是**列表接口**给的标记，完整配置走 `GET /api/projects/{id}/setup`。
+   */
+  hasSetup?: boolean;
 }
 
 export type ViewState = 'dashboard' | 'workbench';

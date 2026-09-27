@@ -14,6 +14,7 @@ import {
   toProject,
   toProjectList,
 } from './utils/projectsApi';
+import { describeSetupBadge } from './utils/projectSetup';
 import {
   AuthSession,
   SESSION_EXPIRED_EVENT,
@@ -509,6 +510,15 @@ function App() {
                       未归属
                     </div>
                   )}
+
+                  {/* 配置状态：让"打开是空工作台"这件事在点进去之前就可见 */}
+                  <div className={`absolute bottom-3 right-3 px-2 py-0.5 rounded text-[10px] border ${
+                    proj.hasSetup
+                      ? 'bg-green-500/15 border-green-500/40 text-green-300'
+                      : 'bg-white/5 border-border text-text-secondary'
+                  }`}>
+                    {describeSetupBadge(proj.hasSetup)}
+                  </div>
 
                   <div className="absolute bottom-3 left-3 px-2 py-1 bg-black/60 backdrop-blur rounded text-xs text-text-secondary">
                     No preview available
