@@ -29,6 +29,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -434,6 +435,27 @@ def _http_json(method: str, url: str, payload: Any = None, timeout: float = 120.
     return json.loads(body) if body else None
 
 
+def _http_status(method: str, url: str, payload: Any = None, timeout: float = 120.0) -> int:
+    """
+    发一个请求并**返回状态码**（成功与失败都返回），用于断言错误码。
+
+    与 `_http_json` 的区别：`_http_json` 把非 2xx 当异常抛出——那对"验证正常流程"
+    很方便，但要断言"这个请求应当被拒绝"就必须能拿到 4xx/5xx 本身。
+    """
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as error:
+        return int(error.code)
+
+
 def _face_by_normal(faces, axis: int, sign: int):
     """按真实法向挑面——不能假设 face id 1..6 就是 ±X/±Y/±Z。"""
     for face in faces:
@@ -738,6 +760,98 @@ def _check_frontend_modal_math(node: str) -> tuple[bool, str]:
     return ok, ("阶次列表 / 频率格式化 / 振型取场 均符合断言" if ok else detail)
 
 
+#: 项目列表的"接口 → 界面"映射断言。
+#: 重点锁住一个真实崩溃：后端 `createdAt` 是 ISO **字符串**，而 `Project.createdAt`
+#: 声明为 `Date`。旧代码直接 `.toLocaleDateString()`，接上真实接口就抛
+#: TypeError —— 断言里显式证明了旧写法会炸、新写法不会。
+_PROJECTS_API_SELFTEST = r"""
+import { SIMULATION_TYPES, describeProjectError, formatCreatedAt,
+         parseTimestamp, toProject, toProjectList } from './projectsApi.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+const record = {
+  id: 'abc123', title: '悬臂梁', description: '10×10×100',
+  simulationType: 'FEA', isPrivate: false,
+  createdAt: '2026-03-18T00:00:00+00:00', updatedAt: '2026-03-18T00:00:00+00:00',
+};
+
+// 1) 映射：时间戳必须变成 Date 对象，界面其余部分才能放心用
+const project = toProject(record);
+check('映射非空', project !== null);
+check('createdAt 转成 Date', project.createdAt instanceof Date,
+      typeof project.createdAt);
+check('createdAt 值正确', project.createdAt.toISOString() === '2026-03-18T00:00:00.000Z',
+      project.createdAt.toISOString());
+check('simulationType 保留', project.simulationType === 'FEA');
+check('isPrivate 保留为 false', project.isPrivate === false);
+
+// 2) 回归：**字符串没有 toLocaleDateString** —— 旧代码就是这么崩的
+check('字符串不是 Date（旧写法必然抛错）',
+      typeof '2026-03-18T00:00:00+00:00'.toLocaleDateString === 'undefined');
+check('工具函数能吃字符串', formatCreatedAt(record.createdAt) !== '—',
+      formatCreatedAt(record.createdAt));
+check('工具函数能吃 Date', formatCreatedAt(new Date('2026-03-18T00:00:00Z')) !== '—');
+
+// 3) 坏数据不能渲染出 Invalid Date / 空白卡片
+check('非法时间戳显示占位符', formatCreatedAt('garbage') === '—');
+check('缺失时间戳显示占位符', formatCreatedAt(undefined) === '—'
+      && formatCreatedAt(null) === '—');
+check('非法时间解析为 null', parseTimestamp('not-a-date') === null
+      && parseTimestamp(null) === null);
+check('缺 id 的记录被丢弃', toProject({ title: 'x' }) === null);
+check('缺 title 的记录被丢弃', toProject({ id: 'x' }) === null);
+check('null 记录被丢弃', toProject(null) === null && toProject(undefined) === null);
+check('未知 simulationType 回落 General',
+      toProject({ id: 'x', title: 't', simulationType: 'CFD2' }).simulationType === 'General');
+check('缺 description 回落空串', toProject({ id: 'x', title: 't' }).description === '');
+
+// 4) 列表映射：坏记录被过滤，而不是让整个列表渲染失败
+check('非数组返回空列表', toProjectList('x').length === 0
+      && toProjectList(null).length === 0 && toProjectList(undefined).length === 0);
+check('坏记录被过滤', toProjectList([record, null, {}, { id: 'y' }]).length === 1);
+check('好记录全部保留', toProjectList([record, { id: 'y', title: 'B' }]).length === 2);
+
+// 5) 后端可选值只有这四个（与 backend/project_store.py 的 SIMULATION_TYPES 一致）
+check('simulationType 取值表', SIMULATION_TYPES.join(',') === 'CFD,FEA,Thermal,General',
+      SIMULATION_TYPES.join(','));
+
+// 6) 错误翻译：不同原因必须给不同的话，而不是笼统的 "出错了"
+const network = describeProjectError({ code: 'ERR_NETWORK' });
+check('网络错误提到后端/启动', network.includes('后端'), network);
+const refused = describeProjectError({ code: 'ECONNREFUSED' });
+check('连接被拒也提到后端', refused.includes('后端'), refused);
+const notFound = describeProjectError({ response: { status: 404 } });
+check('404 说明项目不存在', notFound.includes('不存在'), notFound);
+const invalid = describeProjectError({ response: { status: 422 } });
+check('422 说明请求不合法', invalid.includes('不合法'), invalid);
+const badRequest = describeProjectError({
+  response: { status: 400, data: { detail: '项目名称不能为空' } } });
+check('400 透出后端 detail', badRequest.includes('项目名称不能为空'), badRequest);
+const serverError = describeProjectError({ response: { status: 500 } });
+check('5xx 标出状态码', serverError.includes('500'), serverError);
+check('普通 Error 透出 message',
+      describeProjectError(new Error('boom')) === 'boom');
+check('未知输入有兜底', describeProjectError(null) === '未知错误。'
+      && describeProjectError(undefined) === '未知错误。');
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+def _check_frontend_projects_math(node: str) -> tuple[bool, str]:
+    """用 node 执行 `frontend/utils/projectsApi.ts` 里的纯函数并断言其行为。"""
+    ok, detail = _run_node_module_selftest(node, _PROJECTS_API_SELFTEST)
+    return ok, ("记录映射 / 时间戳解析 / 错误翻译 均符合断言" if ok else detail)
+
+
 def _check_modal_display_chain(node: str, payload: dict) -> tuple[bool, str]:
     """
     把后端真实返回的模态结果喂给前端的取场逻辑。
@@ -800,6 +914,9 @@ def task_verify(args: argparse.Namespace) -> int:
 
             passed, detail = _check_frontend_modal_math(node_bin)
             check("模态阶次与频率显示（node 执行前端纯函数）", passed, detail)
+
+            passed, detail = _check_frontend_projects_math(node_bin)
+            check("项目记录映射与错误翻译（node 执行前端纯函数）", passed, detail)
         else:
             check("TypeScript 类型检查", False, "未找到 node")
 
@@ -1136,6 +1253,88 @@ def task_verify(args: argparse.Namespace) -> int:
 
             traceback.print_exc()
             check("求解器物理校准", False, f"{type(exc).__name__}: {exc}")
+
+    if reachable:
+        info("\n=== 5/5 项目管理（持久化实体）===")
+        # 在这之前项目只活在前端内存里：新建即丢、无法引用。这组检查走真实 HTTP，
+        # 验证"项目是一个真正的后端实体"这条承诺：ID 由服务端生成、能被列出来、
+        # 能改名、删掉之后确实 404。
+        created_id: Optional[str] = None
+        try:
+            marker = f"verify-{uuid.uuid4().hex[:8]}"
+            created = _http_json("POST", f"{API_BASE}/api/projects", {
+                "title": f"契约检查 {marker}",
+                "description": "由 tools/tasks.py verify 创建，跑完会删掉",
+                "simulationType": "FEA",
+                "isPrivate": True,
+            })
+            created_id = created.get("id")
+
+            check(
+                "创建项目返回服务端 ID 与时间戳",
+                bool(created_id) and bool(created.get("createdAt"))
+                and str(created.get("createdAt", "")).endswith("+00:00"),
+                f"id={created_id} createdAt={created.get('createdAt')}",
+            )
+
+            listing = _http_json("GET", f"{API_BASE}/api/projects")
+            ids = [item.get("id") for item in listing] if isinstance(listing, list) else []
+            check(
+                "新项目出现在列表最前",
+                bool(ids) and ids[0] == created_id,
+                f"{len(ids)} 个项目，第一个={ids[0] if ids else None}",
+            )
+
+            fetched = _http_json("GET", f"{API_BASE}/api/projects/{created_id}")
+            check(
+                "按 ID 取回同一项目",
+                fetched.get("id") == created_id
+                and fetched.get("title") == f"契约检查 {marker}",
+                f"title={fetched.get('title')}",
+            )
+
+            renamed = _http_json(
+                "PATCH", f"{API_BASE}/api/projects/{created_id}", {"title": "改名后"}
+            )
+            check(
+                "PATCH 只改给定字段",
+                renamed.get("title") == "改名后"
+                and renamed.get("description") == "由 tools/tasks.py verify 创建，跑完会删掉",
+                f"title={renamed.get('title')}",
+            )
+
+            check(
+                "服务端拒绝客户端自选 ID",
+                _http_status("POST", f"{API_BASE}/api/projects",
+                             {"id": "my-own-id", "title": "x"}) == 422,
+                "请求体里带 id 应为 422（否则客户端能覆盖别人的记录）",
+            )
+            check(
+                "空标题被拒绝",
+                _http_status("POST", f"{API_BASE}/api/projects", {"title": "   "}) == 422,
+                "空标题应为 422",
+            )
+
+            _http_json("DELETE", f"{API_BASE}/api/projects/{created_id}")
+            deleted_status = _http_status("GET", f"{API_BASE}/api/projects/{created_id}")
+            check(
+                "删除后确实不存在（404 而不是静默成功）",
+                deleted_status == 404,
+                f"GET 已删除项目 -> HTTP {deleted_status}",
+            )
+            created_id = None
+        except Exception as exc:
+            import traceback
+
+            traceback.print_exc()
+            check("项目管理 CRUD", False, f"{type(exc).__name__}: {exc}")
+        finally:
+            # 检查用的项目不要留在用户的数据库里
+            if created_id:
+                try:
+                    _http_json("DELETE", f"{API_BASE}/api/projects/{created_id}")
+                except Exception:  # noqa: BLE001 - 清理失败不该影响验证结论
+                    pass
 
     failed = [name for name, passed, _ in checks if not passed]
     print()

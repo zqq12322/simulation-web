@@ -1,15 +1,30 @@
 import React, { useState } from 'react';
-import { X, Globe, Lock, Wind, Layers, Thermometer, Box } from 'lucide-react';
+import { X, Globe, Lock, Wind, Layers, Thermometer, Box, AlertTriangle, RefreshCw } from 'lucide-react';
 
 interface NewProjectModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onCreate: (title: string, description: string, type: string, isPrivate: boolean) => void;
+  /**
+   * 创建项目。现在会真的写到后端数据库，因此是**异步**的：
+   * 失败时（后端没起来、名字不合法）必须让弹窗留在原地并说明原因，
+   * 而不是关掉弹窗、让用户以为建好了。
+   */
+  onCreate: (title: string, description: string, type: string, isPrivate: boolean) => void | Promise<void>;
+  /** 正在提交中（禁用按钮，避免重复提交） */
+  isSubmitting?: boolean;
+  /** 提交失败的原因 */
+  error?: string | null;
 }
 
 type SimulationType = 'CFD' | 'FEA' | 'Thermal' | 'General';
 
-const NewProjectModal: React.FC<NewProjectModalProps> = ({ isOpen, onClose, onCreate }) => {
+const NewProjectModal: React.FC<NewProjectModalProps> = ({
+  isOpen,
+  onClose,
+  onCreate,
+  isSubmitting = false,
+  error = null,
+}) => {
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [isPrivate, setIsPrivate] = useState(true);
@@ -19,14 +34,19 @@ const NewProjectModal: React.FC<NewProjectModalProps> = ({ isOpen, onClose, onCr
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (title.trim()) {
-      onCreate(title, description, selectedType, isPrivate);
-      // Reset for the next time the modal is opened
-      setTitle('');
-      setDescription('');
-      setSelectedType('General');
-      setIsPrivate(true);
-    }
+    if (isSubmitting) return;      // 防止双击建出两个项目
+    if (!title.trim()) return;     // 空标题后端会 422，这里先挡住
+    // 不在成功后立刻清空表单：创建可能失败，失败时用户不该丢掉已经输入的内容。
+    // 清空交给父组件的 onClose。
+    onCreate(title, description, selectedType, isPrivate);
+  };
+
+  const handleClose = () => {
+    setTitle('');
+    setDescription('');
+    setSelectedType('General');
+    setIsPrivate(true);
+    onClose();
   };
 
   const simulationTypes = [
@@ -160,25 +180,35 @@ const NewProjectModal: React.FC<NewProjectModalProps> = ({ isOpen, onClose, onCr
             </div>
 
             {/* Footer */}
-            <div className="p-6 border-t border-border bg-[#1a202e] flex justify-between items-center">
+            <div className="p-6 border-t border-border bg-[#1a202e]">
+              {/* 创建失败时弹窗留在原地并说明原因，而不是关掉让用户以为建好了 */}
+              {error && (
+                <div className="mb-4 flex items-start gap-2 bg-red-500/10 border border-red-500/40 rounded-md px-3 py-2">
+                  <AlertTriangle size={14} className="text-red-400 mt-0.5 shrink-0" />
+                  <span className="text-xs text-red-200">{error}</span>
+                </div>
+              )}
+              <div className="flex justify-between items-center">
               <div className="text-xs text-text-secondary">
                 Creating in <span className="text-white font-medium">Personal Workspace</span>
               </div>
               <div className="flex gap-3">
                 <button 
                   type="button" 
-                  onClick={onClose}
+                  onClick={handleClose}
                   className="px-5 py-2.5 rounded-md text-text-secondary hover:text-white hover:bg-white/5 transition-colors font-medium"
                 >
                   Cancel
                 </button>
                 <button 
                   type="submit"
-                  disabled={!title.trim()}
-                  className="px-8 py-2.5 rounded-md bg-gradient-to-r from-accent-blue to-accent-purple text-white font-semibold shadow-lg shadow-accent-blue/20 hover:shadow-accent-blue/40 disabled:opacity-50 disabled:cursor-not-allowed transition-all transform active:scale-95"
+                  disabled={!title.trim() || isSubmitting}
+                  className="px-8 py-2.5 rounded-md bg-gradient-to-r from-accent-blue to-accent-purple text-white font-semibold shadow-lg shadow-accent-blue/20 hover:shadow-accent-blue/40 disabled:opacity-50 disabled:cursor-not-allowed transition-all transform active:scale-95 flex items-center gap-2"
                 >
-                  Create Project
+                  {isSubmitting && <RefreshCw size={14} className="animate-spin" />}
+                  {isSubmitting ? 'Creating…' : 'Create Project'}
                 </button>
+              </div>
               </div>
             </div>
 
