@@ -9,7 +9,8 @@ import os
 import gmsh
 
 # Import local modules
-from geometry import UPLOAD_DIR, FaceInfo
+from config import resolve_upload_path
+from geometry import FaceInfo
 from materials import MATERIALS_DB
 from constraints import BoundaryCondition
 
@@ -102,7 +103,11 @@ async def solve_simulation(request: SolverRequest):
         # However, to make it robust, we can ensure mesh exists.
         pass
 
-    file_path = os.path.join(UPLOAD_DIR, request.geometry_filename)
+    try:
+        file_path = str(resolve_upload_path(request.geometry_filename))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"文件名不合法：{exc}")
+
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Geometry file not found")
     
@@ -355,6 +360,8 @@ async def solve_simulation(request: SolverRequest):
             reaction_forces=reaction_forces
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()

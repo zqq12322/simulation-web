@@ -1,10 +1,14 @@
-fastapi
-uvicorn[standard]
-pydantic
-numpy
-scipy
-scikit-fem
-gmsh
-supabase
-openai
-python-dotenv
+# 直接依赖（版本已锁定，保证任何机器上装出来的行为一致）
+# 完整依赖树见 requirements.lock.txt，可用：
+#   pip install -r requirements.txt        # 常规安装
+#   pip install -r requirements.lock.txt   # 完全复现当前环境
+fastapi==0.135.1
+uvicorn[standard]==0.42.0
+pydantic==2.12.5
+numpy==2.4.3
+scipy==1.17.1
+scikit-fem==12.0.1
+gmsh==4.15.1
+supabase==2.28.3
+openai==2.29.0
+python-dotenv==1.2.2

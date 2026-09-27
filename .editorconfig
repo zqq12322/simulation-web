@@ -1,0 +1,24 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.py]
+indent_size = 4
+
+# Windows PowerShell 5.1 需要 UTF-8 BOM 才能正确解析脚本里的中文，
+# 否则会出现 "Unexpected token '}'" 之类的解析错误。
+[*.ps1]
+charset = utf-8-bom
+indent_size = 4
+
+[*.md]
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab

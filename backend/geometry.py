@@ -7,12 +7,19 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 from supabase_client import supabase
 
+# 集中配置：路径与限制（UPLOAD_DIR 为绝对路径，不再依赖工作目录）
+from config import (
+    UPLOAD_DIR,
+    MAX_UPLOAD_BYTES,
+    GMSH_TERMINAL,
+    ensure_upload_dir,
+    resolve_upload_path,
+    validate_mesh_size,
+)
+
 router = APIRouter()
 
-# Directory to store uploaded geometry files locally (as a fallback or cache)
-UPLOAD_DIR = "uploads"
-if not os.path.exists(UPLOAD_DIR):
-    os.makedirs(UPLOAD_DIR)
+ensure_upload_dir()
 
 class FaceInfo(BaseModel):
     id: int
@@ -171,7 +178,7 @@ async def generate_cube_geometry():
         gmsh.model.occ.synchronize()
         
         filename = "default_cube.step"
-        file_path = os.path.join(UPLOAD_DIR, filename)
+        file_path = str(resolve_upload_path(filename))
         
         gmsh.write(file_path)
         
@@ -190,12 +197,25 @@ async def upload_geometry(file: UploadFile = File(...)):
     Upload a geometry file (STL, STEP, etc.) to the server and Supabase Storage.
     """
     try:
-        # 1. Save locally for Gmsh processing
-        file_path = os.path.join(UPLOAD_DIR, file.filename)
+        # 1. 先校验文件名（防路径穿越/扩展名白名单）与大小，再落盘供 Gmsh 处理
+        try:
+            file_path = str(resolve_upload_path(file.filename))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"文件名不合法：{exc}")
+
         file_content = await file.read()
-        
+
         if len(file_content) == 0:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+        if len(file_content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"文件过大：{len(file_content)} 字节，上限 {MAX_UPLOAD_BYTES} 字节"
+                    "（可用环境变量 MAX_UPLOAD_BYTES 调整）"
+                ),
+            )
             
         with open(file_path, "wb") as buffer:
             buffer.write(file_content)
@@ -217,7 +237,7 @@ async def upload_geometry(file: UploadFile = File(...)):
                 gmsh.model.mesh.generate(2)
                 
                 render_filename = file.filename + ".stl"
-                render_path = os.path.join(UPLOAD_DIR, render_filename)
+                render_path = str(resolve_upload_path(render_filename))
                 gmsh.write(render_path)
             except Exception as e:
                 print(f"Warning: Failed to convert to STL for web view: {e}")
@@ -247,6 +267,8 @@ async def upload_geometry(file: UploadFile = File(...)):
             "supabase_url": supabase_url,
             "message": "File uploaded successfully"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
 
@@ -262,7 +284,11 @@ async def get_geometry_metadata(filename: str):
     Extract geometry metadata (faces, etc.) without generating a full mesh.
     Useful for visualization and boundary condition setup.
     """
-    file_path = os.path.join(UPLOAD_DIR, filename)
+    try:
+        file_path = str(resolve_upload_path(filename))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"文件名不合法：{exc}")
+
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Geometry file not found")
 
@@ -288,6 +314,8 @@ async def get_geometry_metadata(filename: str):
             message=f"Identified {len(faces_metadata)} faces, {len(edges_metadata)} edges, {len(vertices_metadata)} vertices"
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         if gmsh.isInitialized():
             gmsh.finalize()
@@ -299,7 +327,17 @@ async def generate_mesh(filename: str, mesh_size: float = 0.5):
     Generate a 3D tetrahedral mesh from the uploaded geometry using Gmsh.
     Also extracts B-Rep face metadata for STEP/IGES files.
     """
-    file_path = os.path.join(UPLOAD_DIR, filename)
+    # 校验文件名与网格尺寸，避免非法输入进入 Gmsh
+    try:
+        file_path = str(resolve_upload_path(filename))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"文件名不合法：{exc}")
+
+    try:
+        mesh_size = validate_mesh_size(mesh_size)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Geometry file not found")
 
@@ -307,7 +345,7 @@ async def generate_mesh(filename: str, mesh_size: float = 0.5):
         # Initialize Gmsh
         if not gmsh.isInitialized():
             gmsh.initialize()
-        gmsh.option.setNumber("General.Terminal", 1)
+        gmsh.option.setNumber("General.Terminal", GMSH_TERMINAL)
         gmsh.model.add("Model")
 
         # Merge the geometry file
@@ -380,6 +418,8 @@ async def generate_mesh(filename: str, mesh_size: float = 0.5):
             message=f"Generated {len(nodes)} nodes, {len(elements)} elements, and identified {len(faces_metadata)} faces"
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         if gmsh.isInitialized():
             gmsh.finalize()

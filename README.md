@@ -31,9 +31,12 @@
 │   ├── constraints.py          # 边界条件数据模型 + 设置校验
 │   ├── ai_assistant.py         # DeepSeek 助手：chat / diagnose / configure
 │   ├── supabase_client.py      # 可选云存储
+│   ├── config.py               # ★ 集中配置：绝对路径、上传/网格限制、CORS
 │   ├── generate_step.py        # 生成测试件（方块挖通孔）
 │   ├── generate_stl.py
-│   ├── requirements.txt
+│   ├── tests/                  # unittest 回归测试（含物理校准，无需启动服务器）
+│   ├── requirements.txt        # 直接依赖（版本已锁定）
+│   ├── requirements.lock.txt   # 完整依赖树（用于完全复现环境）
 │   ├── .env.example            # 复制为 .env 后填写密钥
 │   ├── uploads/                # 上传的几何与网格缓存（*.msh）
 │   └── venv/                   # Python 虚拟环境（唯一在用的那个）
@@ -52,7 +55,12 @@
 ├── scripts/                    # 一键脚本
 │   ├── setup.ps1               # 首次环境安装
 │   ├── dev.ps1                 # 同时启动前后端
-│   └── verify.ps1              # 类型检查 + 构建 + API 冒烟测试
+│   ├── test.ps1                # 后端回归测试（不需要启动服务器）
+│   └── verify.ps1              # 端到端：类型检查 + 真实 HTTP + 解析解校准
+├── .github/workflows/ci.yml    # CI：push / PR 自动跑测试与构建
+├── CONTRIBUTING.md             # 协作指南（改代码前先读）
+├── .gitattributes              # 统一换行符，避免协作时出现整文件 diff
+├── .editorconfig               # 编辑器一致性（含 .ps1 需 UTF-8 BOM 的说明）
 ├── vercel.json                 # 部署配置
 └── .gitignore
 ```
@@ -111,6 +119,7 @@ npm run dev
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/` | 健康检查 |
+| GET | `/api/health` | 健康检查（含上传目录绝对路径，供 CI/容器探针使用） |
 | GET | `/api/materials` | 材料列表 |
 | GET | `/api/materials/{id}` | 单个材料 |
 | POST | `/api/materials` | 新增自定义材料（内存，重启丢失） |
@@ -129,6 +138,8 @@ npm run dev
 已验证通过：
 
 - `tsc --noEmit` 无错误；`vite build` 成功；
+- **`scripts/test.ps1`：45 个后端回归用例全部通过**（约 0.3 秒，无需启动服务器）；
+- **`scripts/verify.ps1`：11 项端到端检查全部通过**；
 - 全流程跑通：上传 → 网格 → 求解 → 云图；
 - 求解器物理正确性抽查：10×10×10 立方体轴向拉伸，加载面中心位移 `4.17e-10` vs 解析解 `FL/AE = 5e-10`（比值 0.835，全约束端略刚于自由杆，符合预期）；支反力合计与施加载荷精确抵消。
 
@@ -152,9 +163,9 @@ npm run dev
 
 ## 6. 安全提醒
 
-- **DeepSeek API Key 曾硬编码在源码中（已泄露），请到平台轮换。** 现在从 `backend/.env` 读取（该文件已被 `.gitignore` 忽略）。
-- 后端 CORS 为 `allow_origins=["*"]`，生产环境需收紧。
-- `/uploads` 直接拼接用户传入的文件名，存在路径穿越风险，需要做文件名白名单校验。
+- **DeepSeek API Key 曾硬编码在源码中（已泄露），请到平台轮换。** 现在从 `backend/.env` 读取（该文件已被 `.gitignore` 忽略），并且 `backend/tests/test_validation.py` 里有一道自动化闸门会扫描源码中的 `sk-` 字面量，防止它再回来。
+- 后端 CORS 默认 `*`，但已可用 `CORS_ALLOW_ORIGINS` 环境变量收紧 —— **生产环境务必设置**。
+- **路径穿越风险已修复**：所有用户可控的文件名都经过 `config.resolve_upload_path()` 校验（拒绝路径分隔符、`..`、盘符；扩展名白名单；解析后必须落在 `uploads/` 内），上传另有 50 MB 上限（`MAX_UPLOAD_BYTES` 可调）。对应测试见 `backend/tests/test_config.py`。
 
 ## 7. 文档索引
 
@@ -163,7 +174,8 @@ npm run dev
 | `docs/01-开发流程与长期计划.md` | 如何用 DeepSeek Harness 迭代这个项目 + 分阶段路线图 |
 | `docs/02-学习路线.md` | 补哪些领域的知识、学到什么程度、对应本项目哪块代码 |
 | `docs/03-修复记录.md` | 本次修复的 28 项问题的根因与验证方式（可直接用于项目报告） |
-| `scripts/setup.ps1` / `dev.ps1` / `verify.ps1` | 一键安装 / 启动 / 回归验证（含解析解校准） |
+| `CONTRIBUTING.md` | 协作指南：环境、验证命令、红线、提交规范、如何新增功能、常见问题 |
+| `scripts/setup.ps1` / `dev.ps1` / `test.ps1` / `verify.ps1` | 一键安装 / 启动 / 单元回归 / 端到端验证 |
 
 ## 8. 整理记录
 
@@ -178,12 +190,29 @@ npm run dev
 | `backend/uploads/*.msh` | 脱离 git 跟踪（`.gitignore` 新增 `backend/uploads/*.msh`） | 这些是 `POST /api/generate-mesh` **每次都会重建的可再生缓存**，属二进制、单文件可达 200KB。继续跟踪会持续产生无意义 diff 并让仓库膨胀。**仅从索引移除，磁盘文件保留** |
 | `backend/__pycache__/` | 清理 Python 3.10 的残留字节码 | 项目已迁移到 Python 3.12，旧标签的 `.pyc` 永远不会被加载，纯磁盘噪音 |
 
+### 阶段 1 · 工程化地基（本轮新增）
+
+让项目「可协作、能长期推进」的最低要求：别人能一键装好、改完能验证、不再被历史坑绊倒。
+
+| 项 | 落地内容 | 解决的问题 |
+|---|---|---|
+| 集中配置 | 新增 `backend/config.py`：`UPLOAD_DIR` 改为**基于 `__file__` 的绝对路径**；CORS、上传上限、网格尺寸范围全部可用环境变量覆盖 | 此前 `UPLOAD_DIR = "uploads"` 是相对路径，**必须 `cd backend` 才能启动**，否则几何文件会写到别处 |
+| 输入校验 | `resolve_upload_path()`：拒绝 `/` `\` `..` 与盘符、扩展名白名单、解析后必须落在 `uploads/` 内；上传加 50 MB 上限；`validate_mesh_size()` 限制尺寸范围 | 路径穿越风险；非法参数直接送进 Gmsh |
+| 错误码修正 | 三个几何端点 + 求解端点补 `except HTTPException: raise` | 此前 `raise HTTPException(400)` 会被外层 `except Exception` 吞掉并**改写成 500**，前端拿不到真实原因 |
+| 回归测试 | 新增 `backend/tests/`（**45 个用例，0.33 秒**）：配置安全边界、几何解析值（圆柱面 2πrh）、**求解器物理校准（FL/AE + 支反力守恒）**、材料与校验规则、密钥卫生 | 以前「改完只能靠肉眼看结果对不对」 |
+| 一键测试 | 新增 `scripts/test.ps1`（**不需要启动服务器**，CI 可直接复用） | 降低验证门槛 |
+| 依赖锁定 | `requirements.txt` 锁定直接依赖版本；新增 `requirements.lock.txt`（72 个包的完整依赖树） | 换机器装出来的行为不一致 |
+| 换行符统一 | 新增 `.gitattributes`（`* text=auto eol=lf` + 二进制声明） | Windows/Linux 协作时的「整文件改动」噪音 diff |
+| 编辑器一致性 | 新增 `.editorconfig`（含 `.ps1` **必须 UTF-8 BOM** 的说明） | 中文 PowerShell 脚本存成无 BOM 就解析失败（本项目踩过） |
+| 协作指南 | 新增 `CONTRIBUTING.md`：验证命令、红线、提交规范、新增功能/测试模板、常见问题 | 新人不知道「改完要跑什么、什么不能提交」 |
+| CI | 新增 `.github/workflows/ci.yml`：push/PR 自动跑后端测试 + 前端类型检查与构建 | 靠人记得跑测试不可靠 |
+
 ### 仍未执行（需你决定）
 
 | 项 | 建议 |
 |---|---|
-| `frontend/index.html` 的 Tailwind CDN → 构建期编译 | 放到 `docs/01` 的阶段 1 或 3。CDN 运行时 + 无 purge 会让生产包偏大、首屏偏慢、离线不可用；但它需要引入 PostCSS/Tailwind 管线，且 `primary/secondary/accent/text/border` 等自定义类名散落在十几个组件中，需逐个核对样式不丢失——超出「最小范围」 |
-| `backend/requirements.txt` 版本锁定 | 属阶段 1 的独立任务（`pip freeze` + 回归算例入 CI） |
+| `frontend/index.html` 的 Tailwind CDN → 构建期编译 | 放到阶段 3。CDN 运行时 + 无 purge 会让生产包偏大、首屏偏慢、离线不可用；但需引入 PostCSS/Tailwind 管线，且 `primary/secondary/accent/text/border` 等自定义类名散落在十几个组件中，要逐个核对样式不丢失 |
+| 把 CI 接到远程仓库 | `ci.yml` 已就绪但**尚未在 GitHub 上真实执行过**（本地无法运行 Actions）；推上去后需确认「Gmsh 系统库」那一步是否足够 |
+| `backend/uploads/零件1.STEP.stl` 等转换产物 | 与 `.msh` 同属可再生缓存，可扩为 `backend/uploads/*.STEP.stl`；需你确认（`test_part.stl` 是刻意保留的样例，性质不同） |
 
-> 提交建议：当前工作区**还包含你自己未提交的改动**（如 `ImportModal.tsx`、`BoundaryConditionSelector.tsx`，
-> 并非本次整理所产生）。建议先 `git diff` 审阅，再分两个提交：① 你原有的改动 ② 本次修复 + 整理 + 文档，便于回溯。
+> 提交历史：`e784271`（你原有的改动）与 `117accb`（修复+整理+文档）已分别提交，便于回溯。
