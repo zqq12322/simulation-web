@@ -70,8 +70,8 @@ make dev                # 或 python3 tools/tasks.py dev
 
 | 命令（跨平台） | Windows 等价 | 验证什么 | 需要服务在跑吗 | 何时用 |
 |---|---|---|---|---|
-| `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**249** 个用例，约 8 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
-| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准 + 认证与隔离（**56** 项） | 需要 | 提交前跑一次 |
+| `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**276** 个用例，约 9 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
+| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准 + 认证/隔离/项目配置（**65** 项） | 需要 | 提交前跑一次 |
 | `make build` | — | 前端类型检查 + 生产构建 | 不需要 | 改前端后 |
 | CI（`.github/workflows/ci.yml`） | — | 上面几项的自动化版本 | 不需要 | push / PR 时自动跑 |
 
@@ -151,6 +151,7 @@ frontend/
     ├── authApi.ts       # 令牌存取 / 请求头 / 401 与网络错误的区分
     ├── deformation.ts   # 变形放大系数
     ├── modalModes.ts    # 模态阶次列表 / 频率格式化 / 振型取场
+    ├── projectSetup.ts  # 项目配置组装 / 稳定签名 / 恢复校验 / 保存状态文案
     └── projectsApi.ts   # 项目记录的接口↔界面映射、属主判定、错误翻译
 tools/
 └── tasks.py           # ★ 跨平台任务入口（setup/dev/test/verify/build/clean/doctor）
@@ -245,6 +246,7 @@ class YourTest(unittest.TestCase):
 | 接口返回 401 但口令明明是对的 | 先看是不是令牌过期（默认 30 天，`SIMCLOUD_TOKEN_TTL_DAYS` 可调）；前端在启动时会调 `/api/auth/me` 校验，失效就回登录页。另外注意"连不上后端"与 401 是两回事，前端会分别提示 |
 | 用 `curl` 调接口一律返回 401 | **除 `/`、`/api/health`、`/api/auth/*` 外，所有端点都要求登录**（八个计算类 router 用路由级依赖统一保护）。先 `curl -X POST .../api/auth/login -d '{"username":..,"password":..}'` 拿 token，再加 `-H "Authorization: Bearer $TOKEN"` |
 | `git status` 显示文件被改了，`git diff` 却是空的 | 索引的 stat 缓存过期（常见于用脚本改过文件、或换行符被规范化过）。`git add <这些文件>` 刷新即可——内容其实没变，不会产生改动 |
+| 关掉页面再打开项目，配置没了 | 不应该发生（配置会自动保存到后端）。先看标题栏的保存状态：若是"保存失败"就点重试。数据存在 `backend/data/simcloud.db` 的 `projects.setup` 列；`GET /api/projects/{id}/setup` 可核对 |
 
 ## 10. 下一步该做什么
 
