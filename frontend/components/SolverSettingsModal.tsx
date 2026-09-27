@@ -271,7 +271,9 @@ const SolverSettingsModal: React.FC<SolverSettingsModalProps> = ({
             </div>
 
             <p className="text-xs text-gray-500 leading-relaxed border-t border-[#333844] pt-4">
-              后端目前只实现了 Static Structural（线性静力）求解器，其他分析类型仅保存设置。
+              后端已实现 <span className="text-gray-300 font-medium">Static Structural</span>（线弹性静力）
+              与 <span className="text-gray-300 font-medium">Heat Transfer</span>（稳态热传导；
+              至少需要一个「温度」边界条件，未指定的面按绝热处理）；其余分析类型目前仅保存设置。
             </p>
           </div>
 

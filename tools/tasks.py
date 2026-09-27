@@ -652,6 +652,45 @@ def task_verify(args: argparse.Namespace) -> int:
                 and abs(thermal["max_temperature"] - 373.15) < 1e-6,
                 f"T∈[{thermal['min_temperature']:.2f}, {thermal['max_temperature']:.2f}] K",
             )
+
+            # 前端契约：热分析走 /api/jobs/thermal，温度由 °C 换算成 K 再提交，
+            # 长度单位用前端默认的 mm。这一步专门验证「UI 实际发出的请求」能不能跑通。
+            frontend_thermal = {
+                "geometry_filename": "default_cube.step",
+                "material_id": "structural_steel",
+                "length_unit": "mm",
+                "faces": cube["faces"],
+                "boundary_conditions": [
+                    {"id": "cold", "name": "temperature - face cold", "type": "temperature",
+                     "applicationType": "face", "entityIndex": cube_minus["id"],
+                     "color": "#aa66cc", "temperature": 25 + 273.15},
+                    {"id": "hot", "name": "temperature - face hot", "type": "temperature",
+                     "applicationType": "face", "entityIndex": cube_plus["id"],
+                     "color": "#aa66cc", "temperature": 125 + 273.15},
+                ],
+            }
+            submitted_thermal = _http_json(
+                "POST", f"{API_BASE}/api/jobs/thermal", frontend_thermal
+            )
+            thermal_job: dict = {}
+            for _ in range(120):
+                time.sleep(0.5)
+                thermal_job = _http_json(
+                    "GET", f"{API_BASE}/api/jobs/{submitted_thermal['job_id']}"
+                )
+                if thermal_job.get("status") in ("succeeded", "failed"):
+                    break
+            thermal_result = thermal_job.get("result") or {}
+
+            # mm ⇒ L = 0.01 m；ΔT = 100 K ⇒ q = 50 * 100 / 0.01 = 5e5 W/m²
+            expected_frontend_flux = 50.0 * 100.0 / 0.01
+            check(
+                "热分析前端契约（°C→K + mm + 异步）",
+                thermal_job.get("status") == "succeeded"
+                and abs(thermal_result.get("max_heat_flux", 0.0) - expected_frontend_flux)
+                < expected_frontend_flux * 1e-3,
+                f"q={thermal_result.get('max_heat_flux')} expect={expected_frontend_flux}",
+            )
         except Exception as exc:
             check("求解器物理校准", False, f"{type(exc).__name__}: {exc}")
 

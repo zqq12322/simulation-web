@@ -527,9 +527,14 @@ const ModelViewer: React.FC<ModelViewerProps> = ({
       }
       geometry.setAttribute('position', new THREE.BufferAttribute(flatNodes, 3));
       
-      if (meshData.stresses && meshData.stresses.length > 0) {
-          const flatStresses = new Float32Array(meshData.stresses);
-          geometry.setAttribute('stress', new THREE.BufferAttribute(flatStresses, 1));
+      // 结果标量场：结构分析是 Von Mises 应力，热分析是温度。
+      // Workbench 会把要着色的场统一放进 meshData.scalarField，
+      // 这里回退到 stresses 以兼容既有数据。
+      const scalarField: number[] | undefined =
+          meshData.scalarField ?? meshData.stresses;
+      if (scalarField && scalarField.length > 0) {
+          const flatScalars = new Float32Array(scalarField);
+          geometry.setAttribute('stress', new THREE.BufferAttribute(flatScalars, 1));
       }
 
       // To prevent Z-fighting and rendering internal faces of tetrahedrons,
@@ -614,10 +619,11 @@ const ModelViewer: React.FC<ModelViewerProps> = ({
 
   // Update uniforms when result data changes
   useEffect(() => {
-    if (meshSettings?.status === 'solved' && meshData && meshData.stresses) {
-        // Find min/max stress
-        const minS = Math.min(...meshData.stresses);
-        const maxS = Math.max(...meshData.stresses);
+    const scalarField: number[] | undefined = meshData?.scalarField ?? meshData?.stresses;
+    if (meshSettings?.status === 'solved' && scalarField && scalarField.length > 0) {
+        // 用结果场的极值确定色标范围（应力或温度）
+        const minS = Math.min(...scalarField);
+        const maxS = Math.max(...scalarField);
         resultMaterial.uniforms.minVal.value = minS;
         resultMaterial.uniforms.maxVal.value = maxS;
         
@@ -857,6 +863,8 @@ interface Scene3DProps {
   faces?: any[];
   edges?: any[];
   vertices?: any[];
+  /** 结果类型：结构显示 Von Mises 应力(Pa)，热分析显示温度(°C)。默认结构。 */
+  resultKind?: 'structural' | 'thermal';
 }
 
 const Scene3D: React.FC<Scene3DProps> = (props) => {
@@ -873,9 +881,10 @@ const Scene3D: React.FC<Scene3DProps> = (props) => {
   }, [meshSettings]);
 
   const { minStress, maxStress } = useMemo(() => {
-    if (!meshData || !meshData.stresses || meshData.stresses.length === 0) return { minStress: 0, maxStress: 100 };
-    const min = Math.min(...meshData.stresses);
-    const max = Math.max(...meshData.stresses);
+    const scalarField: number[] | undefined = meshData?.scalarField ?? meshData?.stresses;
+    if (!scalarField || scalarField.length === 0) return { minStress: 0, maxStress: 100 };
+    const min = Math.min(...scalarField);
+    const max = Math.max(...scalarField);
     return { minStress: min, maxStress: max };
   }, [meshData]);
 
@@ -1130,9 +1139,13 @@ const Scene3D: React.FC<Scene3DProps> = (props) => {
             zIndex: 1000,
             width: '120px'
         }}>
-            <h4 style={{margin: 0, fontSize: '12px', fontWeight: '600', color: '#333'}}>Von Mises 应力</h4>
-            {/* 后端返回的应力与材料 E 同单位（Pa）；此前这里标的是 MPa，属于单位不一致 */}
-            <span style={{fontSize: '10px', color: '#666'}}>(Pa)</span>
+            <h4 style={{margin: 0, fontSize: '12px', fontWeight: '600', color: '#333'}}>
+              {props.resultKind === 'thermal' ? '温度' : 'Von Mises 应力'}
+            </h4>
+            {/* 结构：后端与材料 E 同单位 ⇒ Pa；热分析：Workbench 已把 K 换成 °C */}
+            <span style={{fontSize: '10px', color: '#666'}}>
+              {props.resultKind === 'thermal' ? '(°C)' : '(Pa)'}
+            </span>
             <div style={{display: 'flex', flexDirection: 'row', height: '180px', gap: '10px', marginTop: '5px'}}>
                 <div style={{
                     width: '16px', 
@@ -1152,8 +1165,10 @@ const Scene3D: React.FC<Scene3DProps> = (props) => {
             </div>
         </div>
 
-        {/* Reaction Forces Display */}
-        {meshData?.reaction_forces && Object.keys(meshData.reaction_forces).length > 0 && (
+        {/* Reaction Forces Display（仅结构分析有意义；热分析没有支反力） */}
+        {props.resultKind !== 'thermal'
+          && meshData?.reaction_forces
+          && Object.keys(meshData.reaction_forces).length > 0 && (
           <div style={{
             position: 'absolute',
             left: '160px',

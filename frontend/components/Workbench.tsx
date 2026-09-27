@@ -421,6 +421,16 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
       return;
     }
 
+    const isThermal = solverSettings.solverType === 'thermal';
+
+    if (isThermal && !boundaryConditions.some(bc => bc.type === 'temperature')) {
+      alert(
+        "热传导分析至少需要一个【温度】边界条件。\n" +
+        "未指定的面按绝热处理——如果所有面都绝热，温度场不唯一，问题无解。"
+      );
+      return;
+    }
+
     setIsSolving(true);
       
       // Update status to solving
@@ -434,29 +444,54 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
             if (bc.type === 'force' && typeof bc.force === 'object') {
                 return { ...bc, force: bc.force };
             }
+            if (isThermal && bc.type === 'temperature') {
+                // 前端 UI 用摄氏度，后端 API 用开尔文（见 thermal.py 的单位约定）
+                return {
+                    ...bc,
+                    temperature: (typeof bc.temperature === 'number' ? bc.temperature : 25) + 273.15,
+                };
+            }
             return bc;
         });
 
         // 异步任务接口：提交后轮询（同网格划分的理由）
-        const { data: job } = await axios.post(`${API_BASE_URL}/api/jobs/solve`, {
-            geometry_filename: modelName,
-            material_id: selectedMaterial?.id || 'structural_steel', // Default if not selected
-            boundary_conditions: validBCs,
-            faces: facesData, // Pass B-Rep face metadata to solver
-            // 几何坐标的长度单位。默认 mm：CAD 零件基本都是毫米，
-            // 后端会换算成米再求解，结果始终是 SI（位移 m、应力 Pa）。
-            length_unit: solverSettings?.lengthUnit || 'mm'
-        });
+        const { data: job } = await axios.post(
+            `${API_BASE_URL}/api/jobs/${isThermal ? 'thermal' : 'solve'}`,
+            {
+                geometry_filename: modelName,
+                material_id: selectedMaterial?.id || 'structural_steel', // Default if not selected
+                boundary_conditions: validBCs,
+                faces: facesData, // Pass B-Rep face metadata to solver
+                // 几何坐标的长度单位。默认 mm：CAD 零件基本都是毫米，
+                // 后端会换算成米再求解，结果与输入单位无关（SI）。
+                length_unit: solverSettings?.lengthUnit || 'mm'
+            });
         const solveResult = await pollJob(job.job_id, setSolveJobStatus);
 
         console.log('Solver completed:', solveResult);
-        
-        // Merge solver results into meshData (or keep separate)
-        // We need to pass stress/displacement to Scene3D
-        setMeshData(prev => ({
-            ...prev,
-            ...solveResult // displacements, stresses, max_stress, etc.
-        }));
+
+        if (isThermal) {
+            // 热分析：把温度(K)换算成 °C 作为着色场，图例就能标对单位；
+            // 色标只依赖相对大小，因此偏移量不影响配色。
+            const temperaturesK: number[] = Array.isArray(solveResult?.temperatures)
+                ? solveResult.temperatures
+                : [];
+            setMeshData(prev => ({
+                ...prev,
+                ...solveResult,
+                temperatures_k: temperaturesK,
+                scalarField: temperaturesK.map(t => t - 273.15),
+                resultKind: 'thermal',
+            }));
+        } else {
+            // Merge solver results into meshData (or keep separate)
+            // We need to pass stress/displacement to Scene3D
+            setMeshData(prev => ({
+                ...prev,
+                ...solveResult, // displacements, stresses, max_stress, etc.
+                resultKind: 'structural',
+            }));
+        }
 
         // 展示被忽略/降级的边界条件（若有）
         setSolverWarnings(Array.isArray(solveResult?.warnings) ? solveResult.warnings : []);
@@ -835,6 +870,7 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
             faces={facesData}
             edges={edgesData}
             vertices={verticesData}
+            resultKind={meshData?.resultKind === 'thermal' ? 'thermal' : 'structural'}
           />
 
           {/* Bottom Overlay Info */}
