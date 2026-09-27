@@ -3,6 +3,7 @@ import os
 import numpy as np
 import gmsh
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from supabase_client import supabase
@@ -441,6 +442,55 @@ async def upload_geometry(file: UploadFile = File(...)):
 async def get_geometry_metadata(filename: str):
     """提取 B-Rep 元数据（同步接口）。"""
     return await run_in_worker(get_geometry_metadata_impl, filename=filename)
+
+
+#: 下载时的 Content-Type。写死一张表而不是用 `mimetypes.guess_type`：
+#: `.step`/`.iges` 在各系统上经常猜不出来（返回 None），而前端/浏览器需要
+#: 一个明确的类型来决定怎么处理。
+MEDIA_TYPES = {
+    ".stl": "model/stl",
+    ".step": "application/step",
+    ".stp": "application/step",
+    ".iges": "model/iges",
+    ".igs": "model/iges",
+    ".msh": "application/octet-stream",
+    ".gltf": "model/gltf+json",
+    ".glb": "model/gltf-binary",
+}
+
+
+@router.get("/geometry/{filename}/download")
+async def download_geometry(filename: str):
+    """
+    下载几何/预览文件（**需要登录**）。
+
+    为什么有这个端点，而不是继续用静态目录
+    --------------------------------------
+    原先 `uploads/` 是 `StaticFiles` 直接挂载的：**知道文件名就能下载**，
+    不需要登录。当时没法简单加鉴权，因为 three.js 的 `STLLoader`/`GLTFLoader`
+    不会带 `Authorization` 头。
+
+    但这是一个真实的数据泄露：`uploads/` 里既有用户上传的 CAD 原件
+    （`.step`/`.iges`），也有派生的预览 `.stl`。项目数据本身是按属主隔离的，
+    **几何文件却可以被任何知道文件名的人拿走**——两条承诺互相矛盾。
+
+    现在改成：前端用带认证头的方式取文件（拿到 `blob:` URL 再交给 three.js），
+    静态目录不再对外服务。文件名仍走 `resolve_upload_path`（防路径穿越 +
+    扩展名白名单），不存在则 404。
+    """
+    try:
+        path = resolve_upload_path(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"文件名不合法：{exc}")
+
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail=f"文件不存在：{filename}")
+
+    return FileResponse(
+        path=str(path),
+        media_type=MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream"),
+        filename=path.name,
+    )
 
 
 @router.post("/generate-mesh", response_model=MeshInfo)

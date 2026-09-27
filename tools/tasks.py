@@ -480,6 +480,86 @@ def _bearer(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _http_download(url: str, headers: Optional[dict] = None) -> dict:
+    """
+    取一个文件并返回状态码、字节数与 Content-Type（**不解析正文**）。
+
+    用于验证"下载端点真的返回了文件"，而不是只确认它返回了 200。
+    """
+    request_headers = {"Accept": "*/*"}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, headers=request_headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            body = response.read()
+            return {
+                "status": int(response.status),
+                "bytes": len(body),
+                "content_type": response.headers.get("Content-Type", ""),
+            }
+    except urllib.error.HTTPError as error:
+        return {
+            "status": int(error.code),
+            "bytes": 0,
+            "content_type": error.headers.get("Content-Type", "") if error.headers else "",
+        }
+
+
+#: 一个极小的合法 STL（一个三角形），用于验证上传→下载的往返
+_PROBE_STL = (
+    b"solid probe\n"
+    b"facet normal 0 0 1\n"
+    b"  outer loop\n"
+    b"    vertex 0 0 0\n"
+    b"    vertex 1 0 0\n"
+    b"    vertex 0 1 0\n"
+    b"  endloop\n"
+    b"endfacet\n"
+    b"endsolid probe\n"
+)
+
+
+def _upload_probe_stl(headers: dict) -> str:
+    """
+    上传一个临时 STL 并返回它的文件名。
+
+    为什么要真的上传：预览 STL 只在上传时生成，开发机的 uploads/ 里不一定有
+    现成的文件；而且"上传→下载"这条往返本身就值得验证。
+    """
+    filename = f"verify_probe_{uuid.uuid4().hex[:8]}.stl"
+    boundary = "----verify" + uuid.uuid4().hex
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8") + _PROBE_STL + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    request = urllib.request.Request(
+        f"{API_BASE}/api/upload-geometry",
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+            **headers,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return payload.get("filename") or filename
+
+
+def _remove_uploaded_file(filename: str) -> None:
+    """删掉 verify 临时上传的文件（uploads/ 是共享目录，不能留垃圾）。"""
+    try:
+        candidate = (BACKEND / "uploads" / filename)
+        if candidate.is_file():
+            candidate.unlink()
+    except Exception:  # noqa: BLE001 - 清理失败不该影响验证结论
+        pass
+
+
 def _project_db_path() -> Path:
     """开发数据库路径（与 `backend/config.py` 的 `SIMCLOUD_DB` 规则一致）。"""
     override = os.environ.get("SIMCLOUD_DB")
@@ -1270,6 +1350,158 @@ def _check_frontend_project_setup_math(node: str) -> tuple[bool, str]:
     return ok, ("组装 / 稳定签名 / 恢复校验 / 状态文案 均符合断言" if ok else detail)
 
 
+#: 几何取用逻辑（带认证的 blob 加载）断言。
+#: 这一段最值得机器验证的地方：**加载器不会带 Authorization 头**，
+#: 所以"URL 拼得对不对、令牌有没有带上、各种失败怎么报"必须逐条钉住。
+_MODEL_SOURCE_SELFTEST = r"""
+import { ModelLoadError, describeModelError, fetchModelBlobUrl,
+         geometryDownloadUrl, isSafeFilename,
+         renderFilenameFor } from './modelSource.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+// 1) URL 与文件名规则
+check('下载地址', geometryDownloadUrl('http://x:8000', 'a.stl')
+      === 'http://x:8000/api/geometry/a.stl/download',
+      geometryDownloadUrl('http://x:8000', 'a.stl'));
+check('末尾斜杠不产生双斜杠', geometryDownloadUrl('http://x:8000/', 'a.stl')
+      === 'http://x:8000/api/geometry/a.stl/download');
+check('文件名被 URL 编码', geometryDownloadUrl('http://x', '零件 1.stl')
+      === 'http://x/api/geometry/%E9%9B%B6%E4%BB%B6%201.stl/download',
+      geometryDownloadUrl('http://x', '零件 1.stl'));
+
+// 预览文件名规则必须与后端一致（backend/geometry.py 里是「原名 + .stl」）。
+// 不一致只会表现为"重新打开项目时视口是空的"，极难排查。
+check('STEP 预览名', renderFilenameFor('part.step') === 'part.step.stl');
+check('STP 预览名', renderFilenameFor('part.STP') === 'part.STP.stl');
+check('IGES 预览名', renderFilenameFor('part.iges') === 'part.iges.stl');
+check('STL 保持原样', renderFilenameFor('part.stl') === 'part.stl');
+check('中文名保持原样', renderFilenameFor('零件1.STEP') === '零件1.STEP.stl');
+
+check('安全文件名', isSafeFilename('part.stl') && isSafeFilename('零件1.STEP.stl'));
+check('拒绝路径穿越', !isSafeFilename('../a.stl')
+      && !isSafeFilename('dir/a.stl') && !isSafeFilename('a\\b.stl'));
+check('拒绝盘符与空名', !isSafeFilename('C:a.stl') && !isSafeFilename('')
+      && !isSafeFilename('.'));
+check('拒绝不在白名单的扩展名', !isSafeFilename('a.exe') && !isSafeFilename('a.sh'));
+
+// 2) 错误文案：401 与 404 必须分开
+check('401 提示重新登录', describeModelError(401, 'a.stl').includes('登录'));
+check('404 说明文件不在', describeModelError(404, 'a.stl').includes('不存在'));
+check('400 说明文件名不合法', describeModelError(400, 'a.stl').includes('不合法'));
+check('网络层失败提到后端', describeModelError(null, 'a.stl').includes('后端'));
+
+// 3) 带认证取回 —— 用注入的假 fetch / 假 URL，不需要浏览器
+const makeFetch = (status, ok) => {
+  const calls = [];
+  const impl = async (url, init) => {
+    calls.push({ url, init });
+    return { ok, status, blob: async () => new Blob(['fake']) };
+  };
+  impl.calls = calls;
+  return impl;
+};
+const created = [];
+const revoked = [];
+const fakeUrl = (blob) => { const u = `blob:fake-${created.length}`; created.push(u); return u; };
+const fakeRevoke = (u) => revoked.push(u);
+
+// 成功路径：URL 正确、带上 Bearer、返回可 revoke 的 blob URL
+let impl = makeFetch(200, true);
+let result = await fetchModelBlobUrl('http://api', 'part.stl', {
+  headers: { Authorization: 'Bearer tok-1' }, fetchImpl: impl, createObjectURL: fakeUrl,
+  revokeObjectURL: fakeRevoke,
+});
+check('请求了正确的下载地址',
+      impl.calls.length === 1
+      && impl.calls[0].url === 'http://api/api/geometry/part.stl/download',
+      impl.calls[0] && impl.calls[0].url);
+check('请求带上了 Bearer 令牌',
+      impl.calls[0].init.headers.Authorization === 'Bearer tok-1',
+      JSON.stringify(impl.calls[0].init.headers));
+check('成功时返回 blob URL', result.url === 'blob:fake-0', result.url);
+result.revoke();
+check('revoke 真的释放了', revoked.length === 1 && revoked[0] === 'blob:fake-0');
+
+// 没有令牌时不发 "Bearer undefined"
+impl = makeFetch(200, true);
+await fetchModelBlobUrl('http://api', 'part.stl', {
+  headers: {}, fetchImpl: impl, createObjectURL: fakeUrl,
+  revokeObjectURL: fakeRevoke,
+});
+check('无令牌时不带 Authorization',
+      impl.calls[0].init.headers.Authorization === undefined,
+      JSON.stringify(impl.calls[0].init.headers));
+
+// 失败路径：状态码要能透出来（上层据此决定"重新登录"还是"提示文件没了"）
+const expectError = async (status, headers) => {
+  const failing = makeFetch(status, false);
+  try {
+    await fetchModelBlobUrl('http://api', 'part.stl', {
+      headers, fetchImpl: failing, createObjectURL: fakeUrl,
+      revokeObjectURL: fakeRevoke,
+    });
+    return null;
+  } catch (error) {
+    return error;
+  }
+};
+const unauthorized = await expectError(401, { Authorization: 'Bearer tok' });
+check('401 抛 ModelLoadError 且带状态码',
+      unauthorized instanceof ModelLoadError && unauthorized.status === 401,
+      String(unauthorized));
+const missing = await expectError(404, { Authorization: 'Bearer tok' });
+check('404 抛 ModelLoadError 且带状态码',
+      missing instanceof ModelLoadError && missing.status === 404);
+check('404 文案可直接显示', missing.message.includes('不存在'), missing.message);
+
+// 非法文件名在**发请求之前**就被挡住
+impl = makeFetch(200, true);
+const blocked = await (async () => {
+  try {
+    await fetchModelBlobUrl('http://api', '../secret.stl', {
+      headers: { Authorization: 'Bearer t' }, fetchImpl: impl, createObjectURL: fakeUrl,
+    });
+    return null;
+  } catch (error) { return error; }
+})();
+check('非法文件名被本地挡住（不发请求）',
+      blocked instanceof ModelLoadError && blocked.status === 400
+      && impl.calls.length === 0,
+      `status=${blocked && blocked.status} calls=${impl.calls.length}`);
+
+// 网络层失败（fetch 直接抛）与 HTTP 状态码区分开
+const throwing = async () => { throw new Error('ECONNREFUSED'); };
+const offline = await (async () => {
+  try {
+    await fetchModelBlobUrl('http://api', 'part.stl', {
+      headers: { Authorization: 'Bearer t' }, fetchImpl: throwing, createObjectURL: fakeUrl,
+    });
+    return null;
+  } catch (error) { return error; }
+})();
+check('网络失败 status 为 null 且文案提到后端',
+      offline instanceof ModelLoadError && offline.status === null
+      && offline.message.includes('后端'),
+      offline && offline.message);
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+def _check_frontend_model_source_math(node: str) -> tuple[bool, str]:
+    """用 node 执行 `frontend/utils/modelSource.ts` 里的纯逻辑并断言其行为。"""
+    ok, detail = _run_node_module_selftest(node, _MODEL_SOURCE_SELFTEST)
+    return ok, ("下载地址 / 预览名规则 / 失败路径 均符合断言" if ok else detail)
+
+
 def _check_modal_display_chain(node: str, payload: dict) -> tuple[bool, str]:
     """
     把后端真实返回的模态结果喂给前端的取场逻辑。
@@ -1341,6 +1573,9 @@ def task_verify(args: argparse.Namespace) -> int:
 
             passed, detail = _check_frontend_project_setup_math(node_bin)
             check("项目配置自动保存（node 执行前端纯函数）", passed, detail)
+
+            passed, detail = _check_frontend_model_source_math(node_bin)
+            check("几何取用与鉴权（node 执行前端纯逻辑）", passed, detail)
         else:
             check("TypeScript 类型检查", False, "未找到 node")
 
@@ -1408,6 +1643,57 @@ def task_verify(args: argparse.Namespace) -> int:
                 bool(alice.get("token")) and bool(alice.get("user", {}).get("id"))
                 and "passwordHash" not in json.dumps(alice),
                 f"alice id={alice.get('user', {}).get('id')}",
+            )
+
+            # 几何文件：从公开静态目录改成**需登录的下载端点**。
+            # uploads/ 里既有 CAD 原件也有预览 STL，"知道文件名就能下载"
+            # 与"项目按属主隔离"是互相矛盾的。
+            #
+            # 这里**先真的上传一个文件再下载**：既验证了"上传→下载"的往返，
+            # 又不依赖开发机 uploads/ 里恰好有什么（预览 STL 只在上传时生成）。
+            uploaded_name = _upload_probe_stl(api_headers)
+            try:
+                check(
+                    "几何下载需要登录（401）",
+                    _http_status(
+                        "GET", f"{API_BASE}/api/geometry/{uploaded_name}/download"
+                    ) == 401,
+                    f"GET /api/geometry/{uploaded_name}/download（无令牌）",
+                )
+                downloaded = _http_download(
+                    f"{API_BASE}/api/geometry/{uploaded_name}/download",
+                    headers=api_headers,
+                )
+                check(
+                    "带令牌能取到几何文件（含正确的 Content-Type）",
+                    downloaded["status"] == 200 and downloaded["bytes"] > 50
+                    and "stl" in str(downloaded.get("content_type", "")).lower(),
+                    f"HTTP {downloaded['status']}，{downloaded['bytes']} 字节，"
+                    f"Content-Type={downloaded.get('content_type')}",
+                )
+                check(
+                    "公开的 /uploads/ 已关闭（不再能直接下载）",
+                    _http_status("GET", f"{API_BASE}/uploads/{uploaded_name}") == 404,
+                    "静态目录已移除：知道文件名也拿不到文件",
+                )
+            finally:
+                _remove_uploaded_file(uploaded_name)
+
+            check(
+                "非法文件名被拒（400）",
+                _http_status(
+                    "GET", f"{API_BASE}/api/geometry/..%2Fetc%2Fpasswd.step/download",
+                    headers=api_headers,
+                ) in (400, 404),
+                "路径穿越在下载端点同样被挡",
+            )
+            check(
+                "不存在的文件是 404",
+                _http_status(
+                    "GET", f"{API_BASE}/api/geometry/nope.step/download",
+                    headers=api_headers,
+                ) == 404,
+                "是「文件不在」而不是「参数错」",
             )
 
             me = _http_json("GET", f"{API_BASE}/api/auth/me",

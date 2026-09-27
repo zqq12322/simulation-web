@@ -48,6 +48,11 @@ import {
   describePermissionNotice,
   describeRole,
 } from '../utils/projectsApi';
+import {
+  ModelLoadError,
+  fetchModelBlobUrl,
+  renderFilenameFor,
+} from '../utils/modelSource';
 
 interface WorkbenchProps {
   project: Project;
@@ -58,6 +63,10 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   const aiAssistantRef = React.useRef<AIAssistantPanelRef>(null);
   const [showImportModal, setShowImportModal] = useState(true); // Show immediately on mount
   const [modelUrl, setModelUrl] = useState<string | null>(null);
+  /** 预览加载失败的说明（视口空白时必须让用户知道为什么） */
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  /** 当前 blob URL，换模型/卸载时 revoke，避免内存泄漏 */
+  const modelBlobUrlRef = React.useRef<{ url: string; revoke: () => void } | null>(null);
   const [modelName, setModelName] = useState<string | null>(null);
   
   // API Base URL - use environment variable for Vercel deployment, fallback to localhost
@@ -214,6 +223,18 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
               ]);
             }
           }
+        }
+
+        // 恢复几何预览。
+        //
+        // 上一轮只恢复了 `modelName`（仿真配置里的名字），**没有取回模型本身**，
+        // 于是重新打开项目时视口是空的——"配置都在、就是看不见模型"。
+        // `meshData`（节点/单元）没有持久化，所以视口里能显示的只有几何预览；
+        // 这里补上它。
+        if (restored.geometryFilename) {
+          await loadModelPreview(restored.geometryFilename);
+        } else {
+          setModelUrl(null);
         }
 
         // 记下"刚加载时的样子"：之后只有真正改动才会触发自动保存
@@ -460,22 +481,65 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     fetchMetadata();
   }, [modelName, API_BASE_URL]);
 
+  /**
+   * 取回几何预览并交给 three.js。
+   *
+   * 不再用公开的 `/uploads/xxx.stl`（知道文件名就能下载，不需要登录）；
+   * 改为带认证头 fetch 到 blob URL（见 utils/modelSource.ts）。
+   *
+   * 每个 blob URL 都要 revoke：否则每换一次模型就留下一块无法回收的内存
+   * （大模型的 STL 有几 MB，切几次就很可观）。
+   */
+  const loadModelPreview = React.useCallback(async (
+    geometryFilename: string,
+    renderFilename?: string | null,
+  ): Promise<boolean> => {
+    // 优先用后端**告诉我们的**预览文件名（上传响应里的 render_filename），
+    // 它才是权威来源；只有在恢复已保存的项目时（配置里只存了几何名）
+    // 才按后端的规则推导。
+    const target = renderFilename || renderFilenameFor(geometryFilename);
+    try {
+      // 认证头由这里提供（modelSource 刻意不自己去读令牌存储）
+      const result = await fetchModelBlobUrl(API_BASE_URL, target, {
+        headers: currentAuthHeaders(),
+      });
+      modelBlobUrlRef.current?.revoke();
+      modelBlobUrlRef.current = result;
+      setModelUrl(result.url);
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('加载几何预览失败:', error);
+      if (error instanceof ModelLoadError && error.status === 401) {
+        notifySessionExpired(message);
+        return false;
+      }
+      // 预览失败不该让整个工作台不可用（配置、网格、求解都还能做），
+      // 但必须说出来——否则用户只会看到一个空视口
+      setModelUrl(null);
+      setPreviewError(message);
+      return false;
+    }
+  }, [API_BASE_URL]);
+
   const handleImport = (file: File, renderFilename?: string) => {
-    // Force a re-render by appending a timestamp to prevent browser caching
-    const timestamp = new Date().getTime();
-    const targetFile = renderFilename || file.name;
-    const url = `${API_BASE_URL}/uploads/${targetFile}?t=${timestamp}`;
-    console.log("Setting model URL to:", url);
-    setModelUrl(url);
     setModelName(file.name); // Keep original name for backend processing
     setFacesData([]); // Clear previous faces
     setEdgesData([]); // Clear previous edges
     setVerticesData([]); // Clear previous vertices
     setLoadedGeometry(null); // Force clearing of previous geometry
+    setPreviewError(null);
     setShowImportModal(false);
     // Show Solver Settings immediately after import
     setShowSolverSettingsModal(true);
+    void loadModelPreview(file.name, renderFilename);
   };
+
+  // 卸载时释放 blob URL（否则每打开一个项目都会留下一块无法回收的内存）
+  React.useEffect(() => () => {
+    modelBlobUrlRef.current?.revoke();
+    modelBlobUrlRef.current = null;
+  }, []);
 
   const handleMaterialSelect = (material: Material) => {
     setSelectedMaterial(material);
@@ -1136,6 +1200,29 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
 
         {/* 3D Viewport Area */}
         <main className="flex-1 relative bg-[#050505]">
+
+          {/* 预览加载失败：不说明原因的话，用户只会看到一个空视口 */}
+          {previewError && (
+            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 max-w-2xl w-[90%] bg-red-500/15 border border-red-500/50 backdrop-blur rounded-md p-3 shadow-lg">
+              <div className="flex items-start gap-2">
+                <i className="fas fa-triangle-exclamation text-red-400 mt-0.5"></i>
+                <div className="flex-1 text-xs text-red-100">
+                  <div className="font-semibold text-red-300">几何预览加载失败</div>
+                  <div className="mt-1">{previewError}</div>
+                  <div className="mt-1 text-red-200/70">
+                    仿真配置、网格划分与求解不受影响；重新导入几何即可恢复预览。
+                  </div>
+                </div>
+                <button
+                  onClick={() => setPreviewError(null)}
+                  className="text-red-300/70 hover:text-red-100 shrink-0"
+                  title="关闭"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* 权限提示：只读/仅编辑时必须在**进来就**说清楚，
               而不是等用户配了半小时才在保存时被拒绝 */}
