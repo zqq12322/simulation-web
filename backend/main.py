@@ -9,6 +9,10 @@ from ai_assistant import router as ai_router
 
 # 集中配置：上传目录为绝对路径，CORS 来源可用环境变量覆盖
 from config import CORS_ALLOW_ORIGINS, UPLOAD_DIR, ensure_upload_dir
+from logging_config import configure_logging, get_logger
+
+configure_logging()
+logger = get_logger(__name__)
 
 app = FastAPI(
     title="SimCloud AI 仿真后端",

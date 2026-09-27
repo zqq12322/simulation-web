@@ -10,25 +10,66 @@ import gmsh
 
 # Import local modules
 from config import resolve_upload_path
+from logging_config import get_logger
 from geometry import FaceInfo
 from materials import MATERIALS_DB
 from constraints import BoundaryCondition
 
 router = APIRouter()
+logger = get_logger(__name__)
 
 
-def load_tet_mesh_from_msh(msh_path: str) -> MeshTet:
+def _parse_force(force) -> tuple:
+    """把前端传来的力（dict / Vector3 / list）统一成 ``(fx, fy, fz)``。"""
+    if isinstance(force, dict):
+        return (
+            float(force.get('x', 0.0) or 0.0),
+            float(force.get('y', 0.0) or 0.0),
+            float(force.get('z', 0.0) or 0.0),
+        )
+    if hasattr(force, 'x'):
+        return (float(force.x), float(force.y), float(force.z))
+    if isinstance(force, (list, tuple)) and len(force) == 3:
+        return (float(force[0]), float(force[1]), float(force[2]))
+    return (0.0, 0.0, 0.0)
+
+
+def _parse_pressure(bc) -> float:
+    """取压力值：优先 ``pressure`` 字段，兼容历史写法 ``value``。"""
+    for candidate in (getattr(bc, "pressure", None), getattr(bc, "value", None)):
+        if candidate is None:
+            continue
+        if isinstance(candidate, (int, float)):
+            return float(candidate)
+        if isinstance(candidate, dict) and "value" in candidate:
+            return float(candidate["value"])
+    return 0.0
+
+
+def load_tet_mesh_from_msh(msh_path: str):
     """
     Build a scikit-fem tetrahedral mesh directly with Gmsh.
 
     ``Mesh.load`` would delegate to meshio, which is not part of the backend
     dependencies. Gmsh is already required for meshing, so we read the mesh back
     with it instead of adding another dependency.
+
+    Returns
+    -------
+    mesh
+        The ``MeshTet`` volume mesh.
+    face_triangles
+        ``{entity_tag: ndarray(n_triangles, 3)}`` — 每个几何面所包含的**边界三角形**
+        及其在 scikit-fem 网格中的节点索引。有了它就能精确定位一个面上的节点，
+    不必再用「点到平面距离」去猜；同时可以算出每个节点的**归属面积**，
+    从而施加真实的面载荷（traction）而不是把合力平均分给节点。
     """
     if not gmsh.isInitialized():
         gmsh.initialize()
     gmsh.option.setNumber("General.Terminal", 0)
     gmsh.clear()
+
+    face_triangles: Dict[int, np.ndarray] = {}
 
     try:
         gmsh.open(msh_path)
@@ -49,6 +90,21 @@ def load_tet_mesh_from_msh(msh_path: str) -> MeshTet:
                 continue
             conn = np.asarray(enodes, dtype=np.int64).reshape(-1, 4)
             cells.append(tag_to_index[conn])
+
+        # 逐面取出边界三角形（MSH 4.1 会保留几何实体标签，因此 tag 与前端
+        # 从元数据接口拿到的 face.id 一致）
+        for _, face_tag in gmsh.model.getEntities(dim=2):
+            try:
+                ftypes, _, fnodes = gmsh.model.mesh.getElements(dim=2, tag=face_tag)
+            except Exception:
+                continue
+            triangles = []
+            for ftype, fconn in zip(ftypes, fnodes):
+                if ftype != 2:  # 只要 3 节点三角形
+                    continue
+                triangles.append(np.asarray(fconn, dtype=np.int64).reshape(-1, 3))
+            if triangles:
+                face_triangles[int(face_tag)] = tag_to_index[np.vstack(triangles)]
     finally:
         if gmsh.isInitialized():
             gmsh.finalize()
@@ -71,7 +127,60 @@ def load_tet_mesh_from_msh(msh_path: str) -> MeshTet:
     if np.any(flip):
         t[[1, 2], flip] = t[[2, 1], flip]
 
-    return MeshTet(points, t)
+    return MeshTet(points, t), face_triangles
+
+
+def nodal_tributary_areas(points: np.ndarray, triangles: np.ndarray) -> np.ndarray:
+    """
+    计算一组三角形上每个节点的**归属面积**（lumped / tributary area）。
+
+    对线性三角形，每个节点分得所在三角形面积的 1/3。所有节点归属面积之和
+    精确等于这组三角形的总面积——这正是施加均匀面载荷时需要的权重：
+    ``f_node = traction * A_node`` 的和就等于 ``traction * A_total``。
+    """
+    areas = np.zeros(points.shape[1], dtype=np.float64)
+    if triangles.size == 0:
+        return areas
+
+    tri_pts = points[:, triangles]          # (3, n_tri, 3)
+    p0, p1, p2 = tri_pts[:, :, 0], tri_pts[:, :, 1], tri_pts[:, :, 2]
+    cross = np.cross((p1 - p0).T, (p2 - p0).T)
+    tri_area = 0.5 * np.linalg.norm(cross, axis=1)
+
+    share = tri_area / 3.0
+    for corner in range(3):
+        np.add.at(areas, triangles[:, corner], share)
+
+    return areas
+
+
+def surface_normal_from_triangles(points: np.ndarray, triangles: np.ndarray,
+                                  reference_point: np.ndarray) -> np.ndarray | None:
+    """
+    由三角形算出面的面积加权法向，并统一指向 ``reference_point`` 的外侧。
+
+    ``reference_point`` 通常取模型形心。平面面得到的是精确法向；曲面面各三角形
+    法向会互相抵消，此时返回 ``None``（调用方应给出警告而不是瞎猜）。
+    """
+    if triangles.size == 0:
+        return None
+
+    tri_pts = points[:, triangles]
+    p0, p1, p2 = tri_pts[:, :, 0], tri_pts[:, :, 1], tri_pts[:, :, 2]
+    normals = np.cross((p1 - p0).T, (p2 - p0).T)   # 未归一化，模长 = 2*面积
+    accumulated = normals.sum(axis=0)
+
+    length = float(np.linalg.norm(accumulated))
+    if length < 1e-12:
+        return None
+
+    normal = accumulated / length
+
+    face_centre = points[:, np.unique(triangles)].mean(axis=1)
+    if float(np.dot(normal, face_centre - reference_point)) < 0.0:
+        normal = -normal
+
+    return normal
 
 
 class SolverRequest(BaseModel):
@@ -88,6 +197,8 @@ class SolverResult(BaseModel):
     displacements: List[List[float]] # [dx, dy, dz] per node
     stresses: List[float] # Von Mises stress per node
     reaction_forces: Dict[str, List[float]] # { "node_index": [fx, fy, fz] }
+    #: 被忽略或降级处理的边界条件说明（前端应展示给用户，避免"静默错误结果"）
+    warnings: List[str] = []
 
 @router.post("/solve", response_model=SolverResult)
 async def solve_simulation(request: SolverRequest):
@@ -126,7 +237,7 @@ async def solve_simulation(request: SolverRequest):
         # Check if MSH exists
         if not os.path.exists(msh_path):
             # If not found, generate it now (fallback)
-            print(f"Mesh file {msh_path} not found, generating...")
+            logger.info("网格文件不存在，正在现场生成：%s", msh_path)
             if not gmsh.isInitialized():
                 gmsh.initialize()
             gmsh.clear()
@@ -138,11 +249,14 @@ async def solve_simulation(request: SolverRequest):
             gmsh.write(msh_path)
             gmsh.finalize()
         else:
-            print(f"Using cached mesh file: {msh_path}")
-        
-        # Load mesh into scikit-fem
-        mesh = load_tet_mesh_from_msh(msh_path)
-        print(f"Mesh loaded: {mesh}")
+            logger.info("使用已缓存的网格：%s", msh_path)
+
+        # Load mesh into scikit-fem（同时取回「面 → 边界三角形」映射）
+        mesh, face_triangles = load_tet_mesh_from_msh(msh_path)
+        logger.info(
+            "网格已载入：%d 个单元 / %d 个节点；可精确定位的面 %d 个",
+            mesh.t.shape[1], mesh.p.shape[1], len(face_triangles),
+        )
 
         # 3. Define Element and Basis
         # Linear Tetrahedral Element (Vector H1)
@@ -156,115 +270,156 @@ async def solve_simulation(request: SolverRequest):
         # K = stiffness matrix
         K = asm(linear_elasticity(lam, mu), basis_vec)
         
-        # 5. Apply Boundary Conditions
+        # 5. 施加边界条件
+        #
+        # 定位节点有两条路径：
+        #   A. 精确路径：Gmsh 在 .msh 里保留了「几何面 → 边界三角形」的对应关系，
+        #      直接取该面的节点，并按**归属面积**加权（见 nodal_tributary_areas）。
+        #      这是施加真实面载荷（压力/分布力）的正确做法：节点力之和 = 载荷 × 面积。
+        #   B. 退化路径：拿不到三角形时（例如网格由老版本生成），沿用几何搜索
+        #      （点到平面距离 / 包围盒），并按节点数平均分配合力。
         f = np.zeros(basis_vec.N)
         fixed_dofs = []
-        
-        # Helper to find nodes by coordinates (Heuristic)
-        # 0: Min X, 1: Max X, 2: Min Y, 3: Max Y, 4: Min Z, 5: Max Z
-        
+        solver_warnings: List[str] = []
+
+        supported_types = {"fixed", "force", "pressure"}
+        model_centroid = mesh.p.mean(axis=1)
+
         for bc in request.boundary_conditions:
-            # Simple Heuristic Mapping
-            
-            # Find nodes on the boundary
             x, y, z = mesh.p
-            
-            target_nodes_indices = []
-            
-            # Check for applicationType: "vertex", "edge", or "face" (default)
-            app_type = getattr(bc, 'applicationType', 'face') # Default to face if not present
-            
-            if app_type == 'vertex':
-                # For vertex, entityIndex is the vertex index (node index)
-                # Frontend sends 0-based index. 
+
+            target_face = next((face for face in request.faces if face.id == bc.entityIndex), None)
+            triangles = (
+                face_triangles.get(int(bc.entityIndex))
+                if getattr(bc, "applicationType", "face") == "face"
+                else None
+            )
+
+            target_nodes_indices = np.array([], dtype=np.int64)
+            nodal_areas = None
+
+            if bc.type not in supported_types:
+                message = (
+                    f"边界条件「{bc.name}」的类型 '{bc.type}' 暂未被求解器支持，已忽略"
+                    "（当前支持：固定约束 / 力载荷 / 压力）"
+                )
+                logger.warning(message)
+                solver_warnings.append(message)
+                continue
+
+            # ---- 定位作用对象 -------------------------------------------------
+            if getattr(bc, "applicationType", "face") == "vertex":
                 if 0 <= bc.entityIndex < mesh.p.shape[1]:
-                    target_nodes_indices = [bc.entityIndex]
+                    target_nodes_indices = np.array([bc.entityIndex], dtype=np.int64)
                 else:
-                    print(f"Warning: Vertex index {bc.entityIndex} out of bounds.")
-                    
-            elif app_type == 'face':
-                # Check if we have face metadata for this index
-                target_face = next((f for f in request.faces if f.id == bc.entityIndex), None)
-                
-                if target_face:
-                    # Robust Geometric Search (Plane Proximity)
-                    if target_face.normal:
-                        nx, ny, nz = target_face.normal
-                        cx, cy, cz = target_face.center
-                        
-                        dx = x - cx
-                        dy = y - cy
-                        dz = z - cz
-                        
-                        dist_to_plane = np.abs(dx*nx + dy*ny + dz*nz)
-                        # Increased tolerance for better robustness
-                        plane_tol = 1e-2 
-                        
-                        mask = dist_to_plane < plane_tol
-                        target_nodes_indices = np.where(mask)[0]
-                        print(f"Face {bc.entityIndex} (Normal search): Found {len(target_nodes_indices)} nodes")
-                    else:
-                        # If no normal (curved surface), use distance to center + bounding box check?
-                        # Or use Gmsh Physical Groups if we had them.
-                        # For now, fallback to distance to center (very rough)
-                        # or better, use the bounding box of the face if available?
-                        # Let's try a distance threshold to center for small faces
-                        # This is weak but better than nothing
-                        pass
-                
-                # Fallback to Box Heuristic if no nodes found (or for STL legacy support)
+                    message = f"顶点索引 {bc.entityIndex} 超出范围，已忽略该边界条件"
+                    logger.warning(message)
+                    solver_warnings.append(message)
+                    continue
+
+            elif triangles is not None and triangles.size > 0:
+                # 精确路径
+                target_nodes_indices = np.unique(triangles)
+                nodal_areas = nodal_tributary_areas(mesh.p, triangles)[target_nodes_indices]
+                logger.debug(
+                    "面 %s：由边界三角形定位到 %d 个节点，总面积 %.6g",
+                    bc.entityIndex, len(target_nodes_indices), float(nodal_areas.sum()),
+                )
+
+            else:
+                # 退化路径：几何搜索（保留旧行为，供 STL / 旧网格使用）
+                if target_face and target_face.normal:
+                    nx, ny, nz = target_face.normal
+                    cx, cy, cz = target_face.center
+                    dist_to_plane = np.abs(
+                        (x - cx) * nx + (y - cy) * ny + (z - cz) * nz
+                    )
+                    target_nodes_indices = np.where(dist_to_plane < 1e-2)[0]
+
                 if len(target_nodes_indices) == 0:
-                    print(f"Face {bc.entityIndex}: Normal search failed or no normal. Using Box Heuristic.")
                     bbox_dims = [x.max() - x.min(), y.max() - y.min(), z.max() - z.min()]
                     max_dim = max(bbox_dims) if bbox_dims else 1.0
-                    tol = max_dim * 0.1 # Increased tolerance to 10%
-                    if tol < 1e-3: tol = 1e-3
-                    
-                    idx = bc.entityIndex % 6 
+                    tol = max(max_dim * 0.1, 1e-3)
+
+                    idx = bc.entityIndex % 6
                     if idx == 0: mask = x < x.min() + tol
                     elif idx == 1: mask = x > x.max() - tol
                     elif idx == 2: mask = y < y.min() + tol
                     elif idx == 3: mask = y > y.max() - tol
                     elif idx == 4: mask = z < z.min() + tol
-                    elif idx == 5: mask = z > z.max() - tol
-                    
+                    else: mask = z > z.max() - tol
+
                     target_nodes_indices = np.where(mask)[0]
-                    print(f"Face {bc.entityIndex} (Box Heuristic): Found {len(target_nodes_indices)} nodes")
-            
-            # Apply BC to found nodes
+                    logger.debug(
+                        "面 %s：精确映射不可用，回退到包围盒启发式，命中 %d 个节点",
+                        bc.entityIndex, len(target_nodes_indices),
+                    )
+
+            if len(target_nodes_indices) == 0:
+                message = f"边界条件「{bc.name}」没有选中任何节点，已忽略"
+                logger.warning(message)
+                solver_warnings.append(message)
+                continue
+
+            # ---- 施加 ---------------------------------------------------------
             if bc.type == "fixed":
                 for node_idx in target_nodes_indices:
-                     # Constrain all 3 components (u, v, w)
-                     fixed_dofs.append(basis_vec.nodal_dofs[0][node_idx]) # u
-                     fixed_dofs.append(basis_vec.nodal_dofs[1][node_idx]) # v
-                     fixed_dofs.append(basis_vec.nodal_dofs[2][node_idx]) # w
-                
+                    fixed_dofs.append(basis_vec.nodal_dofs[0][node_idx])
+                    fixed_dofs.append(basis_vec.nodal_dofs[1][node_idx])
+                    fixed_dofs.append(basis_vec.nodal_dofs[2][node_idx])
+
             elif bc.type == "force":
-                num_nodes_on_face = len(target_nodes_indices)
-                
-                if num_nodes_on_face > 0:
-                    # Force vector from frontend
-                    fx, fy, fz = 0.0, 0.0, 0.0
-                    
-                    if isinstance(bc.force, dict):
-                        fx = float(bc.force.get('x', 0.0))
-                        fy = float(bc.force.get('y', 0.0))
-                        fz = float(bc.force.get('z', 0.0))
-                    elif hasattr(bc.force, 'x'): 
-                        fx = float(bc.force.x)
-                        fy = float(bc.force.y)
-                        fz = float(bc.force.z)
-                    elif isinstance(bc.force, list) and len(bc.force) == 3:
-                        fx, fy, fz = float(bc.force[0]), float(bc.force[1]), float(bc.force[2])
-                    
-                    # Distributed load (force per node)
-                    # Ideally should integrate over area, but for point clouds:
-                    force_per_node = np.array([fx, fy, fz]) / num_nodes_on_face
-                    
-                    for node_idx in target_nodes_indices:
-                        f[basis_vec.nodal_dofs[0][node_idx]] += force_per_node[0]
-                        f[basis_vec.nodal_dofs[1][node_idx]] += force_per_node[1]
-                        f[basis_vec.nodal_dofs[2][node_idx]] += force_per_node[2]
+                fx, fy, fz = _parse_force(bc.force)
+                total = np.array([fx, fy, fz], dtype=np.float64)
+
+                # 按归属面积分配：每个节点得到 traction * A_node，
+                # 于是 Σf = traction * ΣA = 输入的总力，但分布是物理的。
+                if nodal_areas is not None and nodal_areas.sum() > 0:
+                    weights = nodal_areas
+                else:
+                    weights = np.full(len(target_nodes_indices), 1.0)
+
+                weights = weights / weights.sum()
+                for weight, node_idx in zip(weights, target_nodes_indices):
+                    f[basis_vec.nodal_dofs[0][node_idx]] += total[0] * weight
+                    f[basis_vec.nodal_dofs[1][node_idx]] += total[1] * weight
+                    f[basis_vec.nodal_dofs[2][node_idx]] += total[2] * weight
+
+            elif bc.type == "pressure":
+                pressure = _parse_pressure(bc)
+                normal = np.asarray(target_face.normal, dtype=np.float64) if (
+                    target_face and target_face.normal
+                ) else None
+
+                if normal is None and triangles is not None:
+                    normal = surface_normal_from_triangles(
+                        mesh.p, triangles, model_centroid
+                    )
+
+                if normal is None:
+                    message = (
+                        f"压力边界条件「{bc.name}」无法确定面法向（可能是曲面），已忽略"
+                    )
+                    logger.warning(message)
+                    solver_warnings.append(message)
+                    continue
+
+                if nodal_areas is None:
+                    nodal_areas = np.full(len(target_nodes_indices), 1.0 / len(target_nodes_indices))
+
+                # 前端的约定：正压力指向实体内部 ⇒ traction = -p * n_outward
+                traction = -pressure * normal
+                for area, node_idx in zip(nodal_areas, target_nodes_indices):
+                    nodal_force = traction * area
+                    f[basis_vec.nodal_dofs[0][node_idx]] += nodal_force[0]
+                    f[basis_vec.nodal_dofs[1][node_idx]] += nodal_force[1]
+                    f[basis_vec.nodal_dofs[2][node_idx]] += nodal_force[2]
+
+                logger.debug(
+                    "压力 %.6g 作用于面 %s（%d 个节点，总面积 %.6g）",
+                    pressure, bc.entityIndex, len(target_nodes_indices),
+                    float(nodal_areas.sum()),
+                )
 
         # 6. Solve
         D = np.unique(fixed_dofs)
@@ -273,7 +428,8 @@ async def solve_simulation(request: SolverRequest):
         if len(D) == 0:
              # Fallback: Fix 3 corners to prevent rigid body motion if no constraints
              # This is just to ensure solver doesn't crash, result will be meaningless rigid body
-             print("Warning: No fixed constraints found. Applying fallback constraints.")
+             logger.warning("未检测到任何固定约束，已自动约束 3 个远端点以避免矩阵奇异——结果无物理意义，请添加固定约束")
+             solver_warnings.append("缺少固定约束：已自动添加临时约束，结果不可用于判断")
              # Find 3 nodes that are far apart
              # 0, max_x_idx, max_y_idx
              p = mesh.p
@@ -319,11 +475,17 @@ async def solve_simulation(request: SolverRequest):
         # can no longer be handed to Basis.project, so the values are evaluated
         # directly; both bases share ElementTetP1 and therefore the same
         # quadrature points.)
+        #
+        # 注意 s_dev 的写法：``eye(w, n)`` 已经是「把 w 放到对角线上」，
+        # 因此偏应力只需 ``s - (1/3)*eye(trace(s), 3)``。
+        # 曾经写成 ``trace(s) * eye(trace(s), 3)``——等于把迹又乘了一遍，
+        # 对角项变成 tr²，导致 Von Mises 应力被放大了好几个数量级
+        # （静水压力越大错得越多）。参见 tests 里的解析解回归测试。
         u_interp = basis_vec.interpolate(u)
         strain_qp = sym_grad(u_interp)
         stress_qp = C(strain_qp)
         # Deviatoric stress: s_dev = s - 1/3 * tr(s) * I
-        stress_dev_qp = stress_qp - (1.0 / 3.0) * trace(stress_qp) * eye(trace(stress_qp), 3)
+        stress_dev_qp = stress_qp - (1.0 / 3.0) * eye(trace(stress_qp), 3)
         # Von Mises: sqrt(3/2 * s_dev : s_dev), shape (n_qp, n_elements)
         von_mises_qp = np.sqrt(1.5 * ddot(stress_dev_qp, stress_dev_qp))
 
@@ -350,6 +512,9 @@ async def solve_simulation(request: SolverRequest):
         stresses = [0.0 if np.isnan(s) else s for s in stresses]
         max_stress = max(stresses) if stresses else 0.0
 
+        if solver_warnings:
+            logger.warning("本次求解有 %d 条警告，请检查边界条件", len(solver_warnings))
+
         return SolverResult(
             status="solved",
             message="Simulation completed successfully.",
@@ -357,7 +522,8 @@ async def solve_simulation(request: SolverRequest):
             max_stress=max_stress,
             displacements=displacements,
             stresses=stresses,
-            reaction_forces=reaction_forces
+            reaction_forces=reaction_forces,
+            warnings=solver_warnings,
         )
 
     except HTTPException:

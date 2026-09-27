@@ -7,6 +7,11 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 from supabase_client import supabase
 
+# 集中日志（不再使用 print）
+from logging_config import get_logger
+
+logger = get_logger(__name__)
+
 # 集中配置：路径与限制（UPLOAD_DIR 为绝对路径，不再依赖工作目录）
 from config import (
     UPLOAD_DIR,
@@ -240,7 +245,7 @@ async def upload_geometry(file: UploadFile = File(...)):
                 render_path = str(resolve_upload_path(render_filename))
                 gmsh.write(render_path)
             except Exception as e:
-                print(f"Warning: Failed to convert to STL for web view: {e}")
+                logger.warning("STEP/IGES 转 STL 预览失败（不影响网格与求解）：%s", e)
 
         # 2. Upload to Supabase Storage (if configured)
         supabase_url = None
@@ -256,9 +261,9 @@ async def upload_geometry(file: UploadFile = File(...)):
                 
                 # Get public URL
                 supabase_url = supabase.storage.from_("geometries").get_public_url(file.filename)
-                print(f"Successfully uploaded to Supabase: {supabase_url}")
+                logger.info("已上传到 Supabase：%s", supabase_url)
             except Exception as e:
-                print(f"Supabase upload failed, but local copy succeeded: {e}")
+                logger.warning("Supabase 上传失败，本地副本已保留：%s", e)
 
         return {
             "filename": file.filename,
@@ -367,7 +372,7 @@ async def generate_mesh(filename: str, mesh_size: float = 0.5):
         # Save mesh to file for consistent reuse in solver
         msh_path = file_path + ".msh"
         gmsh.write(msh_path)
-        print(f"Mesh saved to {msh_path}")
+        logger.info("网格已保存：%s", msh_path)
 
         # Retrieve nodes
         nodeTags, nodeCoords, _ = gmsh.model.mesh.getNodes()
@@ -404,7 +409,7 @@ async def generate_mesh(filename: str, mesh_size: float = 0.5):
                         elements.append([n1, n2, n3, n4])
         
         if len(elements) == 0:
-             print("Warning: No 3D elements generated. Mesh might be surface only or failed.")
+             logger.warning("未生成任何三维单元，网格可能只有面或划分失败")
         
         gmsh.finalize()
 
@@ -423,5 +428,5 @@ async def generate_mesh(filename: str, mesh_size: float = 0.5):
     except Exception as e:
         if gmsh.isInitialized():
             gmsh.finalize()
-        print(f"Meshing failed: {e}")
+        logger.exception("网格划分失败")
         raise HTTPException(status_code=500, detail=f"Meshing failed: {str(e)}")

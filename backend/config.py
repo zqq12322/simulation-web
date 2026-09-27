@@ -46,6 +46,9 @@ CORS_ALLOW_ORIGINS: Final[list] = [
 #: Gmsh 控制台输出（1=输出进度，0=静默）
 GMSH_TERMINAL: Final[int] = int(os.getenv("GMSH_TERMINAL", "1"))
 
+#: 日志级别（DEBUG / INFO / WARNING / ERROR）。排查问题时设成 DEBUG。
+LOG_LEVEL: Final[str] = os.getenv("LOG_LEVEL", "INFO").upper()
+
 
 def ensure_upload_dir() -> Path:
     """确保上传目录存在并返回该目录。"""

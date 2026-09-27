@@ -19,17 +19,33 @@
 import asyncio
 import unittest
 
+import numpy as np
+
 from constraints import BoundaryCondition
 from geometry import generate_mesh
-from solver import SolverRequest, solve_simulation
+from solver import (
+    SolverRequest,
+    nodal_tributary_areas,
+    solve_simulation,
+)
 
 # --- 算例参数（与 backend/uploads/default_cube.step 一致） -----------------
 CUBE = "default_cube.step"
 CUBE_EDGE = 10.0            # 立方体边长（单位与几何一致）
 FACE_AREA = CUBE_EDGE ** 2  # 加载面面积 = 100
 APPLIED_FORCE = 1000.0      # 轴向拉力 N
+PRESSURE = 1.0e7            # 均布压力 Pa（= 10 MPa）
 YOUNGS_MODULUS = 2.0e11     # 结构钢 E（见 materials.py）
 LOADED_FACE_CENTRE = (5.0, 0.0, 0.0)
+
+_MESH_CACHE = {}
+
+
+def _cube_mesh():
+    """立方体网格只生成一次，多个测试类共用（gmsh 初始化有开销）。"""
+    if "cube" not in _MESH_CACHE:
+        _MESH_CACHE["cube"] = asyncio.run(generate_mesh(CUBE, 1.5))
+    return _MESH_CACHE["cube"]
 
 
 def _face_with_normal(faces, axis, sign):
@@ -41,11 +57,20 @@ def _face_with_normal(faces, axis, sign):
     raise AssertionError(f"未找到法向约为 {'+' if sign > 0 else '-'}{'XYZ'[axis]} 的面")
 
 
+def _node_nearest(nodes, target):
+    best_index, best_distance = -1, float("inf")
+    for index, node in enumerate(nodes):
+        distance = sum((node[i] - target[i]) ** 2 for i in range(3))
+        if distance < best_distance:
+            best_distance, best_index = distance, index
+    return best_index
+
+
 class CubeAxialTensionRegressionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # 1) 生成网格（会写入 backend/uploads/default_cube.step.msh，已被 gitignore）
-        cls.mesh = asyncio.run(generate_mesh(CUBE, 1.5))
+        cls.mesh = _cube_mesh()
 
         fixed_face = _face_with_normal(cls.mesh.faces, 0, -1)
         loaded_face = _face_with_normal(cls.mesh.faces, 0, +1)
@@ -79,12 +104,7 @@ class CubeAxialTensionRegressionTest(unittest.TestCase):
         cls.result = asyncio.run(solve_simulation(request))
 
         # 3) 找最接近加载面中心的节点，用于取轴向位移
-        best_index, best_distance = -1, float("inf")
-        for index, node in enumerate(cls.mesh.nodes):
-            distance = sum((node[i] - LOADED_FACE_CENTRE[i]) ** 2 for i in range(3))
-            if distance < best_distance:
-                best_distance, best_index = distance, index
-        cls.centre_node = best_index
+        cls.centre_node = _node_nearest(cls.mesh.nodes, LOADED_FACE_CENTRE)
         cls.axial_displacement = cls.result.displacements[cls.centre_node][0]
 
     def test_solver_reports_success(self):
@@ -127,6 +147,276 @@ class CubeAxialTensionRegressionTest(unittest.TestCase):
             self.assertNotEqual(value, float("inf"))
         self.assertGreaterEqual(self.result.max_stress, 0.0)
         self.assertGreater(self.result.max_displacement, 0.0)
+
+
+class CubeUniformPressureRegressionTest(unittest.TestCase):
+    """
+    均布压力算例。
+
+    这是修复「pressure 类型被求解器完全忽略」的回归测试：此前前端/AI 助手
+    可以添加压力边界条件，但求解器既不报错也不施加任何载荷，结果恒为零载荷，
+    用户完全察觉不到。现在压力按 ``traction = -p * n`` 施加到面的每个节点上，
+    节点力之和精确等于 ``p * 面积``。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        mesh = _cube_mesh()
+        cls.mesh = mesh
+
+        fixed_face = _face_with_normal(mesh.faces, 0, -1)
+        loaded_face = _face_with_normal(mesh.faces, 0, +1)
+
+        bcs = [
+            BoundaryCondition(
+                id="bc_fixed",
+                name="固定端",
+                type="fixed",
+                applicationType="face",
+                entityIndex=fixed_face.id,
+            ),
+            BoundaryCondition(
+                id="bc_pressure",
+                name="均布压力",
+                type="pressure",
+                applicationType="face",
+                entityIndex=loaded_face.id,
+                pressure=PRESSURE,
+            ),
+        ]
+
+        request = SolverRequest(
+            geometry_filename=CUBE,
+            material_id="structural_steel",
+            boundary_conditions=bcs,
+            faces=mesh.faces,
+        )
+        cls.result = asyncio.run(solve_simulation(request))
+
+        cls.centre_node = _node_nearest(mesh.nodes, LOADED_FACE_CENTRE)
+        cls.axial_displacement = cls.result.displacements[cls.centre_node][0]
+
+    def test_pressure_actually_loads_the_model(self):
+        """回归：pressure 曾经被完全忽略，位移恒为 0。"""
+        self.assertEqual(self.result.status, "solved")
+        self.assertGreater(
+            self.result.max_displacement, 0.0,
+            "压力没有产生任何位移——pressure 边界条件可能又被忽略了",
+        )
+
+    def test_total_force_equals_pressure_times_face_area(self):
+        """
+        合力校验：节点力之和必须等于 ``p * A``。
+
+        +X 面的外法向是 +X，正压力指向实体内部，因此施加的合力沿 -X；
+        固定端支反力合力应为 +p*A。
+        """
+        total_fx = sum(force[0] for force in self.result.reaction_forces.values())
+        expected = PRESSURE * FACE_AREA
+        self.assertAlmostEqual(
+            total_fx, expected, delta=expected * 1e-3,
+            msg=f"支反力合力 {total_fx:.6g}，期望 {expected:.6g}（= p × A）",
+        )
+
+    def test_displacement_matches_analytic_compression(self):
+        """压缩量级应接近解析解 ``pL/E``，且方向为 -X。"""
+        analytic = PRESSURE * CUBE_EDGE / YOUNGS_MODULUS
+        self.assertLess(self.axial_displacement, 0.0, "受压时应向 -X 位移")
+        ratio = abs(self.axial_displacement) / analytic
+        self.assertGreater(ratio, 0.5, f"比值 {ratio:.3f} 偏小")
+        self.assertLess(ratio, 1.05, f"比值 {ratio:.3f} 偏大")
+
+    def test_axial_stress_is_close_to_applied_pressure(self):
+        """远离夹持端的应力应接近施加的压力量级。"""
+        # 取模型中部节点，避开固定端与加载端的应力集中
+        middle = _node_nearest(self.mesh.nodes, (0.0, 0.0, 0.0))
+        von_mises = self.result.stresses[middle]
+        self.assertGreater(von_mises, PRESSURE * 0.1)
+        self.assertLess(von_mises, PRESSURE * 10.0)
+
+
+class VonMisesAnalyticTest(unittest.TestCase):
+    """
+    用**解析已知的应变场**直接检验应力后处理。
+
+    构造位移场 ``u_x = eps * x``（其余分量为零），则应变张量为 ``diag(eps, 0, 0)``，
+    对应的 Von Mises 应力有闭式解 ``2 * mu * eps``。
+
+    这道测试是补上的：此前只断言了「应力有限、无 NaN」，于是漏掉了
+    ``s_dev`` 把迹乘了两次（tr² 而非 tr）的严重错误——静水应力越大，
+    Von Mises 被放大得越离谱（受压工况下差了 7 个数量级），
+    而位移与支反力却完全正确，单看那些指标根本发现不了。
+    """
+
+    EPS = 1.0e-4
+    E = YOUNGS_MODULUS
+    NU = 0.3
+
+    @classmethod
+    def setUpClass(cls):
+        from skfem import Basis, ElementTetP1, ElementVectorH1
+        from skfem.helpers import ddot, eye, sym_grad, trace
+        from skfem.models.elasticity import lame_parameters, linear_stress
+
+        import config
+        from solver import load_tet_mesh_from_msh
+
+        _cube_mesh()  # 确保 .msh 已生成
+        mesh, _ = load_tet_mesh_from_msh(str(config.UPLOAD_DIR / (CUBE + ".msh")))
+
+        lam, mu = lame_parameters(cls.E, cls.NU)
+        constitutive = linear_stress(lam, mu)
+
+        basis_vec = Basis(mesh, ElementVectorH1(ElementTetP1()))
+        basis_scalar = Basis(mesh, ElementTetP1())
+
+        # 精确的线性位移场 u_x = eps*x
+        u = np.zeros(basis_vec.N)
+        u[basis_vec.nodal_dofs[0]] = cls.EPS * mesh.p[0]
+
+        strain = sym_grad(basis_vec.interpolate(u))
+        stress = constitutive(strain)
+        stress_dev = stress - (1.0 / 3.0) * eye(trace(stress), 3)
+        cls.von_mises_qp = np.sqrt(1.5 * ddot(stress_dev, stress_dev))
+        cls.nodal_values = basis_scalar.project(cls.von_mises_qp)
+        cls.analytic = 2.0 * mu * cls.EPS
+
+    def test_quadrature_values_match_analytic(self):
+        mean = float(self.von_mises_qp.mean())
+        self.assertAlmostEqual(
+            mean, self.analytic, delta=self.analytic * 1e-6,
+            msg=f"积分点 Von Mises 均值 {mean:.6g}，解析解 {self.analytic:.6g}",
+        )
+
+    def test_projected_nodal_values_match_analytic(self):
+        mean = float(self.nodal_values.mean())
+        self.assertAlmostEqual(
+            mean, self.analytic, delta=self.analytic * 1e-6,
+            msg=f"投影后节点均值 {mean:.6g}，解析解 {self.analytic:.6g}",
+        )
+
+    def test_stress_is_not_inflated(self):
+        """
+        反向断言：应力不得被放大。
+
+        错误版本会把对角项写成 tr²，在此算例下 Von Mises 会大出约 1e7 倍。
+        """
+        self.assertLess(
+            float(self.nodal_values.max()), self.analytic * 1.01,
+            "Von Mises 明显偏大——检查 s_dev 是否把迹乘了两次",
+        )
+
+
+class TributaryAreaTest(unittest.TestCase):
+    """面载荷权重的基础校验：节点归属面积之和 = 面总面积。"""
+
+    def test_nodal_areas_sum_to_surface_area(self):
+        import numpy as np
+
+        from solver import load_tet_mesh_from_msh
+
+        mesh, face_triangles = load_tet_mesh_from_msh(
+            str(__import__("config").UPLOAD_DIR / (CUBE + ".msh"))
+        )
+        self.assertTrue(face_triangles, "应当能从 .msh 里取到面 → 三角形映射")
+
+        for tag, triangles in face_triangles.items():
+            with self.subTest(face=tag):
+                areas = nodal_tributary_areas(mesh.p, triangles)
+                # 用三角形自身面积求和作为独立口径
+                tri_pts = mesh.p[:, triangles]
+                p0, p1, p2 = tri_pts[:, :, 0], tri_pts[:, :, 1], tri_pts[:, :, 2]
+                cross = np.cross((p1 - p0).T, (p2 - p0).T)
+                expected = 0.5 * np.linalg.norm(cross, axis=1).sum()
+                self.assertAlmostEqual(areas.sum(), expected, places=9)
+
+    def test_cube_face_area_is_exact(self):
+        from solver import load_tet_mesh_from_msh
+
+        mesh, face_triangles = load_tet_mesh_from_msh(
+            str(__import__("config").UPLOAD_DIR / (CUBE + ".msh"))
+        )
+        # 立方体每个面的面积都应是 100
+        for tag, triangles in face_triangles.items():
+            with self.subTest(face=tag):
+                areas = nodal_tributary_areas(mesh.p, triangles)
+                self.assertAlmostEqual(areas.sum(), FACE_AREA, places=6)
+
+
+class BoundaryConditionContractTest(unittest.TestCase):
+    """
+    前端契约测试。
+
+    ``BoundaryCondition`` 开启了 ``extra="forbid"``：如果前端新增/改名了字段而
+    后端模型没跟上，会直接 422，而不是静默丢字段算出错误结果。这里用前端
+    ``types.ts`` 里声明的字段集构造 5 种边界条件，确保它们都能通过校验。
+    """
+
+    #: 与 frontend/types.ts 中各接口字段一致
+    FRONTEND_SHAPES = [
+        {"type": "fixed", "color": "#ff4444"},
+        {"type": "displacement", "color": "#ffbb33",
+         "displacement": {"x": 0.0, "y": 0.0, "z": 0.0},
+         "fixedX": True, "fixedY": True, "fixedZ": True},
+        {"type": "force", "color": "#33b5e5", "force": {"x": 0.0, "y": -100.0, "z": 0.0}},
+        {"type": "pressure", "color": "#99cc00", "pressure": 1.0},
+        {"type": "temperature", "color": "#aa66cc", "temperature": 25.0},
+    ]
+
+    def test_frontend_payloads_validate(self):
+        for index, shape in enumerate(self.FRONTEND_SHAPES):
+            payload = {
+                "id": f"bc_{index}",
+                "name": f"BC {index}",
+                "applicationType": "face",
+                "entityIndex": index + 1,
+                **shape,
+            }
+            with self.subTest(type=shape["type"]):
+                bc = BoundaryCondition(**payload)
+                self.assertEqual(bc.type, shape["type"])
+
+    def test_unknown_field_is_rejected_loudly(self):
+        """未知字段必须报错，而不是被静默丢弃（历史上的 pressure 就是这么丢的）。"""
+        with self.assertRaises(Exception):
+            BoundaryCondition(
+                id="bc", name="bc", type="fixed",
+                applicationType="face", entityIndex=1,
+                pressure_typo=123.0,
+            )
+
+
+class SolverWarningSurfaceTest(unittest.TestCase):
+    """不支持的边界条件必须回报给用户，而不是静默忽略。"""
+
+    def test_temperature_bc_produces_warning(self):
+        mesh = _cube_mesh()
+        fixed_face = _face_with_normal(mesh.faces, 0, -1)
+        loaded_face = _face_with_normal(mesh.faces, 0, +1)
+
+        bcs = [
+            BoundaryCondition(id="fix", name="固定端", type="fixed",
+                              applicationType="face", entityIndex=fixed_face.id),
+            BoundaryCondition(id="load", name="拉力", type="force",
+                              applicationType="face", entityIndex=loaded_face.id,
+                              force={"x": APPLIED_FORCE, "y": 0.0, "z": 0.0}),
+            BoundaryCondition(id="temp", name="温度", type="temperature",
+                              applicationType="face", entityIndex=loaded_face.id,
+                              temperature=100.0),
+        ]
+        request = SolverRequest(
+            geometry_filename=CUBE,
+            material_id="structural_steel",
+            boundary_conditions=bcs,
+            faces=mesh.faces,
+        )
+        result = asyncio.run(solve_simulation(request))
+
+        self.assertTrue(result.warnings, "不支持的 BC 类型必须产生警告")
+        self.assertTrue(
+            any("temperature" in w for w in result.warnings),
+            f"警告里应点名 temperature：{result.warnings}",
+        )
 
 
 class SolverInputValidationTest(unittest.TestCase):

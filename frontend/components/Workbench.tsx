@@ -70,6 +70,9 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   const [solverSettings, setSolverSettings] = useState<SolverSettings | null>(null);
   const [showSolverSettingsModal, setShowSolverSettingsModal] = useState(false);
   const [isSolving, setIsSolving] = useState(false);
+  // 后端在求解时可能忽略/降级某些边界条件；必须展示出来，
+  // 否则用户会以为"求解成功"就等于结果可信。
+  const [solverWarnings, setSolverWarnings] = useState<string[]>([]);
   
   // Simulation tree state
   const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({
@@ -419,6 +422,9 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
             ...response.data // displacements, stresses, max_stress, etc.
         }));
 
+        // 展示被忽略/降级的边界条件（若有）
+        setSolverWarnings(Array.isArray(response.data?.warnings) ? response.data.warnings : []);
+
         // Update status to solved
         setSolverSettings(prev => prev ? { ...prev, status: 'solved' } : null);
         
@@ -722,6 +728,32 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
         {/* 3D Viewport Area */}
         <main className="flex-1 relative bg-[#050505]">
           
+          {/* 求解警告：被忽略/降级的边界条件必须让用户看见 */}
+          {solverWarnings.length > 0 && (
+            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 max-w-2xl w-[90%] bg-yellow-500/15 border border-yellow-500/50 backdrop-blur rounded-md p-3 shadow-lg">
+              <div className="flex items-start gap-2">
+                <i className="fas fa-triangle-exclamation text-yellow-400 mt-0.5"></i>
+                <div className="flex-1 text-xs text-yellow-100 space-y-1">
+                  <div className="font-semibold text-yellow-300">
+                    求解时有 {solverWarnings.length} 项边界条件未被完整应用，结果可能不符合预期：
+                  </div>
+                  <ul className="list-disc list-inside space-y-0.5">
+                    {solverWarnings.map((warning, index) => (
+                      <li key={index}>{warning}</li>
+                    ))}
+                  </ul>
+                </div>
+                <button
+                  onClick={() => setSolverWarnings([])}
+                  className="text-yellow-300/70 hover:text-yellow-100 shrink-0"
+                  title="关闭"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Toolbar inside viewport */}
           <div className="absolute top-4 left-4 z-10 flex gap-2">
              <div className="bg-secondary/90 backdrop-blur border border-border rounded-md flex p-1 shadow-lg">

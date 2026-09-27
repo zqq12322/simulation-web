@@ -1131,7 +1131,8 @@ const Scene3D: React.FC<Scene3DProps> = (props) => {
             width: '120px'
         }}>
             <h4 style={{margin: 0, fontSize: '12px', fontWeight: '600', color: '#333'}}>Von Mises 应力</h4>
-            <span style={{fontSize: '10px', color: '#666'}}>(MPa)</span>
+            {/* 后端返回的应力与材料 E 同单位（Pa）；此前这里标的是 MPa，属于单位不一致 */}
+            <span style={{fontSize: '10px', color: '#666'}}>(Pa)</span>
             <div style={{display: 'flex', flexDirection: 'row', height: '180px', gap: '10px', marginTop: '5px'}}>
                 <div style={{
                     width: '16px', 
