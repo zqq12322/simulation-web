@@ -1,0 +1,68 @@
+name: 功能建议
+description: 建议一个新功能（新的分析类型、边界条件、后处理、界面能力）
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **先看一眼 [`docs/01-开发流程与长期计划.md`](../blob/main/docs/01-开发流程与长期计划.md) 的阶段路线图**——
+        你的想法很可能已经在计划里了，直接对号入座比新开一条更有效。
+        然后读 [`docs/04-如何扩展求解器.md`](../blob/main/docs/04-如何扩展求解器.md) 了解落地方式。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你要解决的实际问题
+      description: |
+        请描述**问题**而不是**方案**。"我想做带孔平板应力集中分析"
+        比"加一个 stress_concentration 端点"更有用。
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 属于哪一块
+      options:
+        - 物理能力（新分析类型：模态/屈曲/接触/非线性/多物理场…）
+        - 边界条件与载荷（新的约束或载荷类型，如对流、重力、轴承）
+        - 网格与几何（网格质量、自适应加密、参数化建模）
+        - 结果后处理（剖切、等值面、动画、导出 VTK/CSV/PNG、PDF 报告）
+        - 工程与协作（测试、CI、部署、文档）
+        - 界面与交互
+        - AI 助手（含"工具调用"式操作软件）
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 怎么算"做完了"？（验收判据）
+      description: |
+        **这一项是本项目最看重的**：仿真功能必须能说清"用什么算例证明它是对的"。
+        请给出至少一个有解析解、守恒律或权威参考的算例。
+      placeholder: |
+        算例：悬臂梁一阶弯曲频率
+        参考：Euler-Bernoulli 解 f₁ = (β₁L)²/(2π)·√(EI/(ρAL⁴))，β₁L = 1.8751
+        判据：有限元结果与解析解相对误差 < 5%
+        备注：线性四面体在弯曲问题上有剪切锁死，可能需要用梁的理论解配合足够密的网格，
+              或改用二次单元——请在实现时确认容差是否可达。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 备选方案与取舍
+      description: 有没有更简单的做法？引入新依赖（如 scipy/新求解器）是否可接受？
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我确认这不是路线图里已经列出的条目（或我说明了它与现有条目的区别）
+          required: true
+        - label: 如果这需要新的第三方依赖，我在上面说明了理由
+          required: false

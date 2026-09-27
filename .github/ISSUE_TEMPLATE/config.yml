@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 先读「开发流程与长期计划」
+    url: https://github.com/zqq12322/simulation-web/blob/main/docs/01-开发流程与长期计划.md
+    about: 阶段划分、里程碑与「现在就能动手的下一步」都在这里，你的想法很可能已在计划中。
+  - name: 不知道从哪下手改代码
+    url: https://github.com/zqq12322/simulation-web/blob/main/docs/04-如何扩展求解器.md
+    about: 数据流、分步做法、验证判据表与已知陷阱。
+  - name: 修复记录（哪些坑踩过、怎么修的）
+    url: https://github.com/zqq12322/simulation-web/blob/main/docs/03-修复记录.md
+    about: 改代码前扫一眼，能避开一半的坑。

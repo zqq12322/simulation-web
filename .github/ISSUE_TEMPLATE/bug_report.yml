@@ -1,0 +1,92 @@
+name: 缺陷报告
+description: 报告一个缺陷（结果不对、崩溃、界面与预期不符）
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。这是一个**数值仿真**项目，因此最有价值的信息是
+        "**你认为正确的结果是多少，依据是什么**"——而不是"结果看起来不对"。
+        请尽量把下面的信息填全，缺得越多越难复现。
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: 缺陷类别
+      description: 本项目按"阻塞运行 → 结果错误 → 体验问题"三级排序，请选最接近的
+      options:
+        - 结果错误（数值与解析解/理论不符）—— 最高优先级
+        - 静默错误（不报错，但结果不可信：边界条件被忽略等）
+        - 阻塞运行（服务起不来、端点 500、构建失败）
+        - 界面问题（操作不了、显示错、单位/量级不对）
+        - 文档与代码不一致
+    validations:
+      required: true
+
+  - type: dropdown
+    id: analysis
+    attributes:
+      label: 涉及的分析类型
+      multiple: true
+      options:
+        - Static Structural（线弹性静力）
+        - Heat Transfer（稳态热传导）
+        - Frequency / Modal（模态分析）
+        - 几何导入 / 网格划分
+        - AI 助手
+        - 尚未支持的类型
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 现象
+      description: 你做了什么、期望什么、实际得到什么
+      placeholder: |
+        1. 导入 backend/uploads/default_cube.step（10×10×10）
+        2. 材料选 Structural Steel，长度单位 mm
+        3. 一端固定、另一端施加 1000 N 轴向拉力
+        4. 期望最大轴向位移约 5e-7 m（FL/AE），实际得到 5e-4 m
+    validations:
+      required: true
+
+  - type: textarea
+    id: reference-value
+    attributes:
+      label: 参考值 / 解析解（如果适用）
+      description: |
+        这类信息能让修复速度提高一个数量级。比如：解析公式、手算结果、
+        守恒律（力平衡、能量守恒）、与商业软件或文献的对照。
+      placeholder: |
+        解析解：u = FL/(AE) = 1000 × 0.01 / (1e-4 × 2e11) = 5e-7 m
+        守恒律：支反力合力应等于 -1000 N
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境
+      render: text
+      placeholder: |
+        操作系统：Windows 11 / Ubuntu 24.04
+        Python：3.12.x     Node：24.x
+        运行方式：tools/tasks.py dev（或 Docker）
+        提交版本：git log -1 --oneline 的输出
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志与真实输出
+      description: |
+        后端日志（`.dev-backend.log`）、`python tools/tasks.py verify` 的输出、
+        或端点的真实 JSON 响应片段。**请不要粘贴 `backend/.env` 的内容或任何密钥。**
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已经确认这不是因为没生成网格 / 没加边界条件 / 长度单位选错
+          required: false
+        - label: 我没有在报告里粘贴任何密钥或 `backend/.env` 的内容
+          required: true

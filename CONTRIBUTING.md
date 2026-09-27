@@ -70,8 +70,8 @@ make dev                # 或 python3 tools/tasks.py dev
 
 | 命令（跨平台） | Windows 等价 | 验证什么 | 需要服务在跑吗 | 何时用 |
 |---|---|---|---|---|
-| `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**75** 个用例，约 0.8 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
-| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准（**11** 项） | 需要 | 提交前跑一次 |
+| `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**156** 个用例，约 3.6 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
+| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准（**24** 项） | 需要 | 提交前跑一次 |
 | `make build` | — | 前端类型检查 + 生产构建 | 不需要 | 改前端后 |
 | CI（`.github/workflows/ci.yml`） | — | 上面几项的自动化版本 | 不需要 | push / PR 时自动跑 |
 
@@ -80,6 +80,28 @@ make dev                # 或 python3 tools/tasks.py dev
 校验结果——这套仿真的价值全在"结果是对的"，破坏它比写出 bug 更糟。
 （历史上正因为只断言"应力有限"，漏掉了一个把应力放大 1e7 倍的错误，
 详见 `docs/03-修复记录.md` 第五节。）
+
+### 4.1 提 PR 时请用模板
+
+`.github/PULL_REQUEST_TEMPLATE.md` 会自动出现。它会要求你填**解析解对照表**——
+这不是形式主义：本项目 4 个致命缺陷（`meshio` 缺失、NumPy 2 的 `np.cross` 轴序、
+Von Mises 放大 1e7 倍、云图不显示变形）**没有一个**是静态检查能发现的。
+
+### 4.2 写测试时的两个硬约束
+
+1. **不要让后台任务留在工作线程里跑。**
+   gmsh 的状态是进程级全局的，本项目约定所有 gmsh 操作都在单线程工作器里串行
+   （见 `backend/jobs.py`）。如果某个测试在中途断言失败、把任务留在工作线程继续跑，
+   而下一个测试又在主线程调用 `gmsh.open`，两边并发访问同一份 gmsh 全局状态，
+   结果是 `OSError: access violation reading 0x0` —— 一个与真实失败原因毫无关系的崩溃。
+   **正确写法**：先轮询到任务终态再断言；并在 `tearDown` 里排空队列
+   （见 `backend/tests/test_modal.py` 的 `_drain_job_queue`）。
+
+2. **不要为了让测试通过而放宽阈值**，也不要断言"结果有限 / 不是 NaN"当作验证。
+   要给出与解析解、守恒律或精确不变量的**量化**对照。
+   如果你发现自己写的断言失败了，先怀疑断言：本项目已经出现三次
+   "测试写错了、代码是对的"（把 `λ+2μ` 误当 `E`、把频率缩放误当"应完全相同"、
+   跨尺寸比较绝对幅度）——三次都在 `docs/03-修复记录.md` 里有记录。
 
 **要加新功能（边界条件/分析类型）之前，先读 [`docs/04-如何扩展求解器.md`](docs/04-如何扩展求解器.md)** ——
 里面有数据流、分步做法、验证判据表和已知陷阱。
@@ -100,6 +122,12 @@ backend/
 ├── main.py            # FastAPI 应用装配、CORS、静态 uploads/、健康检查
 ├── geometry.py        # 上传 / STEP 转 STL / B-Rep 元数据 / 网格生成
 ├── solver.py          # 线弹性静力求解（scikit-fem）
+├── thermal.py         # 稳态热传导（∇·(k∇T)=0）
+├── modal.py           # 模态分析（K φ = λ M φ，一致质量矩阵）
+├── fe_utils.py        # 共享 FE 基础设施：读网格、归属面积、面→节点定位、矢量解析
+├── jobs.py            # 后台任务：单线程工作器 + /api/jobs/*
+├── gmsh_session.py    # Gmsh 会话（主线程初始化一次，进程内复用）
+├── material_store.py  # 材料持久化（SQLite）
 ├── materials.py       # 材料库
 ├── constraints.py     # 边界条件模型与设置校验
 ├── ai_assistant.py    # DeepSeek 助手
@@ -109,7 +137,9 @@ frontend/
 ├── index.tsx          # React 入口（注意不是 src/main.tsx）
 ├── App.tsx            # 落地页 → 仪表盘 → 工作台
 ├── types.ts           # 全局类型契约
-└── components/        # 11 个组件，Workbench 是总调度、Scene3D 是 3D 视口
+├── components/        # 11 个组件，Workbench 是总调度、Scene3D 是 3D 视口
+│   └── resultShader.ts  # 结果云图 GLSL（彩虹映射 + 变形显示）
+└── utils/deformation.ts # 变形放大系数（纯函数，verify 会用 node 直接跑它）
 tools/
 └── tasks.py           # ★ 跨平台任务入口（setup/dev/test/verify/build/clean/doctor）
 Dockerfile             # 后端镜像（含 Gmsh 系统库）
@@ -190,12 +220,22 @@ class YourTest(unittest.TestCase):
 | 端口 3000/8000 被占用 | `dev` 任务会提示并跳过；先关掉旧的进程 |
 | 求解返回 `status: solved` 但应力全是 0 | 检查是否真的加了载荷；`POST /api/validate-setup` 会指出缺失项 |
 | 求解返回里 `warnings` 非空 | 有边界条件被忽略/降级（如 `temperature`、未选中节点），前端会弹黄色横幅 |
-| 网格生成很慢或超时 | 调大 `mesh_size`；长任务异步化仍是待办（见 `docs/01`） |
+| 网格生成很慢或超时 | 调大 `mesh_size`。网格/求解都已异步化（`/api/jobs/*`），前端会轮询 |
 | 换了工作目录后 `uploads/` 找不到 | 已修复：`UPLOAD_DIR` 现在是基于 `config.py` 的绝对路径 |
+| 测试报 `OSError: access violation reading 0x0` | 有后台任务还在工作线程里跑 gmsh，主线程又并发调用了 gmsh。这不是"gmsh 装坏了"：先轮询到任务终态再断言，并在 `tearDown` 里排空队列（见 §4.2 第 1 条） |
+| 模态分析里"加了载荷但频率没变" | **这是正确的**：线性模态分析的固有频率与载荷幅值无关，载荷类边界条件会被忽略并给出警告 |
+| 模态分析报 `num_modes` 超范围 | 允许 1–30。约束过多导致可求自由度不足时也会报 400 |
 
 ## 10. 下一步该做什么
 
 见 [`docs/01-开发流程与长期计划.md`](docs/01-开发流程与长期计划.md) 的阶段划分，
 以及 [README.md](README.md) 第 8 节的整理记录与待办。
-当前最值得投入的方向：**真实面力积分**、**用 Physical Groups 精确绑定边界条件**、
-**长任务异步化**。
+
+「阶段 2 · 让仿真结果可信」的物理项已全部完成（真实面力、精确绑面、单位制、
+材料持久化、强制位移、稳态热传导、**模态分析**），剩下的阶段 2 项目是
+**网格质量与收敛性**。再往后最值得投入的是：
+
+1. **模态分析的前端接线**（选振型、按位移着色）——后端已就绪，界面上还没有入口；
+2. **项目持久化 + 登录**（阶段 3 的最大一块，现在项目管理还是前端 mock）；
+3. **结果后处理**：剖切面、等值面、变形动画、CSV/VTK/PNG 导出；
+4. **网格质量直方图与 h 收敛性检查**（阶段 2 收尾）。
