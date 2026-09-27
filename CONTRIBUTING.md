@@ -9,13 +9,25 @@
 
 | 工具 | 版本 | 说明 |
 |---|---|---|
-| Python | **3.12** | 后端（gmsh / scikit-fem 均有 3.12 的预编译 wheel） |
+| Python | **3.9+**（推荐 3.12） | 后端 + 任务脚本（`tools/tasks.py` 只用标准库） |
 | Node.js | **20+** | 前端（开发机实测 24.x） |
-| PowerShell | 5.1 或 7+ | 脚本均可直接运行 |
+| Docker（可选） | 任意近期版本 | 想跳过本机环境配置时用 |
+| PowerShell（仅 Windows 需要） | 5.1 或 7+ | `scripts\*.ps1` 是薄封装 |
+
+> **跨平台**：安装/启动/测试/验证的**唯一实现**是 `tools/tasks.py`（纯标准库 Python），
+> Windows / Linux / macOS 通用。`scripts\*.ps1` 只是 Windows 上的转发封装，
+> 不再各自实现一套逻辑，避免两份实现逐渐漂移。
 
 ## 2. 首次安装
 
-```powershell
+```bash
+# Linux / macOS（有 make）
+make setup
+
+# 任意平台（没有 make 也行）
+python3 tools/tasks.py setup      # Windows 上用 py -3 或 venv 里的 python
+
+# Windows 习惯的写法（等价，转发到同一个实现）
 powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 ```
 
@@ -25,25 +37,49 @@ powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 **然后必须做一件事**：打开 `backend/.env` 填入自己的 `DEEPSEEK_API_KEY`
 （AI 助手需要；不填只影响 AI 功能，不影响几何/网格/求解）。
 
+先体检一下环境可以用：
+
+```bash
+python3 tools/tasks.py doctor     # 检查 python / node / git / venv / .env / 服务状态
+```
+
+### 2.1 完全不想配本机环境（Docker）
+
+```bash
+docker compose up --build
+# 前端 http://localhost:3000   后端 http://localhost:8000/docs
+```
+
+镜像里已经装好 Gmsh 需要的系统库（`libglu1-mesa` 等），这是手工配环境最容易翻车的一步。
+
+> ⚠️ 注意：`Dockerfile` / `docker-compose.yml` **尚未在真实 Docker 上验证过**
+> （开发机没有装 Docker）。语法已用 YAML 解析器校验通过，但首次 `docker build`
+> 若报缺库，请补充 `Dockerfile` 里的 `apt-get install` 清单。
+
 ## 3. 日常开发
 
-```powershell
-# 启动前后端（前端 :3000，后端 :8000，API 文档 :8000/docs）
-powershell -ExecutionPolicy Bypass -File scripts\dev.ps1
+```bash
+make dev                # 或 python3 tools/tasks.py dev
+# 前端 http://localhost:3000   后端 http://localhost:8000   文档 /docs
+# Ctrl+C 同时停掉前后端
 ```
+
+（Windows 也可以用 `powershell -ExecutionPolicy Bypass -File scripts\dev.ps1`。）
 
 ## 4. 四个验证命令，别搞混
 
-| 命令 | 验证什么 | 需要服务在跑吗 | 何时用 |
-|---|---|---|---|
-| `scripts\test.ps1` | 后端单元 + 物理回归（45 个用例，约 0.3 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
-| `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP 调用 + 解析解校准 | 需要 | 提交前跑一次 |
-| `frontend` 下 `npm run build` | 前端能否构建 | 不需要 | 改前端后 |
-| CI（`.github/workflows/ci.yml`） | 上面几项的自动化版本 | 不需要 | push / PR 时自动跑 |
+| 命令（跨平台） | Windows 等价 | 验证什么 | 需要服务在跑吗 | 何时用 |
+|---|---|---|---|---|
+| `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**57** 个用例，约 0.5 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
+| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准（**11** 项） | 需要 | 提交前跑一次 |
+| `make build` | — | 前端类型检查 + 生产构建 | 不需要 | 改前端后 |
+| CI（`.github/workflows/ci.yml`） | — | 上面几项的自动化版本 | 不需要 | push / PR 时自动跑 |
 
-**红线：改动 `backend/solver.py` 或 `backend/geometry.py` 后，必须让
-`scripts\test.ps1` 通过。** 其中的求解器回归测试会用解析解 `FL/AE` 与
-支反力守恒来校验结果——这套仿真的价值全在"结果是对的"，破坏它比写出 bug 更糟。
+**红线：改动 `backend/solver.py` 或 `backend/geometry.py` 后，必须让测试通过。**
+其中的回归测试用解析解 `FL/AE`、**解析应力场 `Von Mises = 2με`** 与支反力守恒来
+校验结果——这套仿真的价值全在"结果是对的"，破坏它比写出 bug 更糟。
+（历史上正因为只断言"应力有限"，漏掉了一个把应力放大 1e7 倍的错误，
+详见 `docs/03-修复记录.md` 第五节。）
 
 ## 5. 代码结构导航
 
@@ -63,7 +99,15 @@ frontend/
 ├── App.tsx            # 落地页 → 仪表盘 → 工作台
 ├── types.ts           # 全局类型契约
 └── components/        # 11 个组件，Workbench 是总调度、Scene3D 是 3D 视口
+tools/
+└── tasks.py           # ★ 跨平台任务入口（setup/dev/test/verify/build/clean/doctor）
+Dockerfile             # 后端镜像（含 Gmsh 系统库）
+docker-compose.yml     # 前后端一键起
+Makefile               # make setup / dev / test / verify / build / clean
+scripts/               # Windows 薄封装，转发到 tools/tasks.py
 ```
+
+> 新增开发任务时**请改 `tools/tasks.py`**，不要在 `scripts/*.ps1` 里另写一套实现。
 
 ## 6. 红线（会被 review 打回的做法）
 
@@ -128,9 +172,13 @@ class YourTest(unittest.TestCase):
 | 现象 | 原因与处理 |
 |---|---|
 | `.ps1` 脚本报 `Unexpected token '}'` | 脚本被存成了**无 BOM 的 UTF-8**，Windows PowerShell 5.1 会按 ANSI 解析中文。用编辑器另存为 "UTF-8 with BOM"（`.editorconfig` 已声明） |
+| Windows 上跑 `python tools/tasks.py ...` 毫无输出、也不报错 | 你的 `python` 是 Microsoft Store 的**应用执行别名**（`WindowsApps\python.exe`）。用 `py -3` 或后端 venv 里的 `python.exe`；`scripts\*.ps1` 已内置优先级处理 |
+| `tools/tasks.py verify` 在最后一行抛 `UnicodeEncodeError` | 已在 `_configure_streams()` 里把输出流设为 `errors="replace"`；若仍遇到，说明有新加的字符，请同时避免使用 emoji |
+| `docker compose up` 报缺 `libGL`/`libXrender` 之类的库 | `Dockerfile` 的 apt 清单需要补库；该镜像**尚未在真实 Docker 上验证过** |
 | `python -c` 之类命令被拒绝执行 | 沙箱策略拦截，不是命令写错；按提示申请权限或换等价写法 |
-| 端口 3000/8000 被占用 | `scripts\dev.ps1` 会提示并跳过；先关掉旧的窗口 |
+| 端口 3000/8000 被占用 | `dev` 任务会提示并跳过；先关掉旧的进程 |
 | 求解返回 `status: solved` 但应力全是 0 | 检查是否真的加了载荷；`POST /api/validate-setup` 会指出缺失项 |
+| 求解返回里 `warnings` 非空 | 有边界条件被忽略/降级（如 `temperature`、未选中节点），前端会弹黄色横幅 |
 | 网格生成很慢或超时 | 调大 `mesh_size`；长任务异步化仍是待办（见 `docs/01`） |
 | 换了工作目录后 `uploads/` 找不到 | 已修复：`UPLOAD_DIR` 现在是基于 `config.py` 的绝对路径 |
 

@@ -1,0 +1,27 @@
+# 构建上下文瘦身：这些都不该进镜像
+**/node_modules
+**/venv
+**/.venv
+**/.venv2
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
+# 可再生缓存与构建产物
+backend/uploads/*.msh
+frontend/dist
+
+# 文档与元数据
+.git
+.gitattributes
+.github
+docs
+*.md
+
+# 密钥与本地配置（务必不要打进镜像）
+**/.env
+**/.env.local
+
+# 日志与临时文件
+*.log
+.DS_Store

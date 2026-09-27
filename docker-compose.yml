@@ -1,0 +1,50 @@
+# ============================================================
+#  SimCloud AI — 一键起后端 + 前端（开发用）
+#
+#      docker compose up --build
+#      前端 http://localhost:3000   后端 http://localhost:8000/docs
+#
+#  说明：
+#   - 前端用 node 镜像跑 dev server，源码用卷挂载，改代码即时生效；
+#   - VITE_API_URL 必须是**浏览器**能访问到的地址，所以是 localhost:8000，
+#     而不是容器名 backend:8000；
+#   - 未配置 Supabase 时会自动回退为本地 uploads/（见 supabase_client.py）。
+# ============================================================
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: simcloud-backend:local
+    ports:
+      - "8000:8000"
+    environment:
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      # 生产环境务必把 CORS 收紧成具体来源
+      CORS_ALLOW_ORIGINS: "${CORS_ALLOW_ORIGINS:-*}"
+      MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-52428800}"
+      # Gmsh 在容器里不需要控制台进度输出
+      GMSH_TERMINAL: "0"
+    volumes:
+      - uploads:/app/uploads
+    # 需要 AI 助手时取消注释（backend/.env 里放 DEEPSEEK_API_KEY）
+    # env_file:
+    #   - backend/.env
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: "http://localhost:8000"
+    volumes:
+      - ./frontend:/app
+      # 让容器内的 node_modules 不被宿主目录覆盖
+      - /app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  uploads:

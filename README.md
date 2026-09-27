@@ -52,11 +52,14 @@
 │   ├── 01-开发流程与长期计划.md
 │   ├── 02-学习路线.md
 │   └── 03-修复记录.md
-├── scripts/                    # 一键脚本
-│   ├── setup.ps1               # 首次环境安装
-│   ├── dev.ps1                 # 同时启动前后端
-│   ├── test.ps1                # 后端回归测试（不需要启动服务器）
-│   └── verify.ps1              # 端到端：类型检查 + 真实 HTTP + 解析解校准
+├── tools/
+│   └── tasks.py                # ★ 跨平台任务入口：setup / dev / test / verify / build / clean / doctor
+├── scripts/                    # Windows 薄封装（转发到 tools/tasks.py，不另写实现）
+│   ├── _python.ps1             # 解释器探测（避开 Microsoft Store 的 python 别名）
+│   ├── setup.ps1 / dev.ps1 / test.ps1 / verify.ps1
+├── Dockerfile                  # 后端镜像（含 Gmsh 所需系统库）
+├── docker-compose.yml          # 一键起前后端（开发用）
+├── Makefile                    # make setup / dev / test / verify / build / clean
 ├── .github/workflows/ci.yml    # CI：push / PR 自动跑测试与构建
 ├── CONTRIBUTING.md             # 协作指南（改代码前先读）
 ├── .gitattributes              # 统一换行符，避免协作时出现整文件 diff
@@ -82,28 +85,43 @@
 
 ## 3. 快速开始
 
-**环境要求**：Python 3.12、Node.js 20+（开发机已装 24.x）
+**环境要求**：Python 3.9+（推荐 3.12）、Node.js 20+。Windows / Linux / macOS 通用。
+
+```bash
+# 首次安装（创建 venv、装依赖、生成 .env）
+make setup              # 或 python3 tools/tasks.py setup
+
+# 启动前后端（Ctrl+C 一起停）
+make dev                # 或 python3 tools/tasks.py dev
+```
+
+Windows 也可以用原来的写法（薄封装，转发到同一个实现）：
 
 ```powershell
-# 首次安装（创建 venv、装依赖、生成 .env）
 powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
-
-# 启动前后端（开两个窗口，或直接跑 dev.ps1）
 powershell -ExecutionPolicy Bypass -File scripts\dev.ps1
 ```
 
 访问：**前端 http://localhost:3000** ｜ 后端 http://127.0.0.1:8000 （API 文档 http://127.0.0.1:8000/docs ）
 
-手动启动：
+**完全不想配本机环境**：
 
-```powershell
-# 后端（必须在 backend 目录下运行，uploads/ 是相对路径）
+```bash
+docker compose up --build
+```
+
+> ⚠️ `Dockerfile` / `docker-compose.yml` **尚未在真实 Docker 上验证过**（开发机未装 Docker）；
+> YAML 语法已校验，但首次 `docker build` 若报缺库，请补 `Dockerfile` 的 apt 清单。
+
+手动启动（不使用任务脚本时）：
+
+```bash
+# 后端
 cd backend
-.\venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000
+./venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000   # Windows: .\venv\Scripts\python.exe
 
 # 前端
-cd frontend
-npm run dev
+cd frontend && npm run dev
 ```
 
 ### 用一个例子跑通全流程
@@ -222,12 +240,26 @@ npm run dev
 | 协作指南 | 新增 `CONTRIBUTING.md`：验证命令、红线、提交规范、新增功能/测试模板、常见问题 | 新人不知道「改完要跑什么、什么不能提交」 |
 | CI | 新增 `.github/workflows/ci.yml`：push/PR 自动跑后端测试 + 前端类型检查与构建 | 靠人记得跑测试不可靠 |
 
+### 阶段 1 收尾 · 跨平台与容器（本轮新增）
+
+> 在此之前，安装/启动/测试/验证**只有 PowerShell 脚本**——Linux 与 macOS 的协作者拿到仓库后完全无从下手。这是当时最大的一条"可协作"阻塞。
+
+| 项 | 落地内容 | 意义 |
+|---|---|---|
+| 跨平台任务入口 | 新增 `tools/tasks.py`（**纯标准库**）：`setup` / `dev` / `test` / `verify` / `build` / `clean` / `doctor` | Windows / Linux / macOS 同一套命令 |
+| `Makefile` | `make setup/dev/test/verify/build/clean` | 开源项目里 contributor 最熟悉的入口 |
+| `scripts/*.ps1` 改为薄封装 | 只做解释器探测并转发到 `tasks.py` | **消除两份实现漂移的隐患**（原来 verify 的逻辑只存在于 PowerShell 里） |
+| 容器化 | `Dockerfile`（含 Gmsh 所需 `libglu1-mesa` 等系统库）+ `docker-compose.yml` + `.dockerignore` | 跳过本机环境配置；容器里 `UPLOAD_DIR` 因已是绝对路径而不受工作目录影响 |
+| CI 加固 | 保持 `python -m unittest` 直接可用，无需额外依赖 | 任务脚本用标准库，CI 不必多装东西 |
+
+
 ### 仍未执行（需你决定）
 
 | 项 | 建议 |
 |---|---|
 | `frontend/index.html` 的 Tailwind CDN → 构建期编译 | 放到阶段 3。CDN 运行时 + 无 purge 会让生产包偏大、首屏偏慢、离线不可用；但需引入 PostCSS/Tailwind 管线，且 `primary/secondary/accent/text/border` 等自定义类名散落在十几个组件中，要逐个核对样式不丢失 |
+| 用真实 Docker 验证一次 `docker build` / `docker compose up` | 开发机没有 Docker，**镜像未经实际构建**；首次构建若报缺库请补 `Dockerfile` 的 apt 清单 |
 | 把 CI 接到远程仓库 | `ci.yml` 已就绪但**尚未在 GitHub 上真实执行过**（本地无法运行 Actions）；推上去后需确认「Gmsh 系统库」那一步是否足够 |
 | `backend/uploads/零件1.STEP.stl` 等转换产物 | 与 `.msh` 同属可再生缓存，可扩为 `backend/uploads/*.STEP.stl`；需你确认（`test_part.stl` 是刻意保留的样例，性质不同） |
 
-> 提交历史：`e784271`（你原有的改动）与 `117accb`（修复+整理+文档）已分别提交，便于回溯。
+> 提交历史：`e784271`（你原有的改动）、`117accb`（修复+整理+文档）、`6a7df87`（阶段 1 地基）、`05aeffb`（物理正确性）已分别提交，便于回溯。
