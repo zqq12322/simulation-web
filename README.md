@@ -14,7 +14,7 @@
 | 前端 | React 19 + TypeScript + Vite 6 + three.js / @react-three/fiber + Tailwind（CDN） |
 | 后端 | Python 3.12 + FastAPI + Uvicorn |
 | 几何/网格 | Gmsh 4.15（内置 OpenCASCADE 内核），支持 STEP / IGES / STL |
-| 求解器 | scikit-fem 12（线性四面体单元，线弹性静力分析） |
+| 求解器 | scikit-fem 12：**线弹性静力** + **稳态热传导**（线性四面体单元） |
 | AI | DeepSeek（OpenAI 兼容接口） |
 | 存储 | 本地 `uploads/` 目录；Supabase Storage 可选（未配置时自动禁用） |
 | 部署 | Vercel（`vercel.json`：Python Serverless + 静态前端） |
@@ -33,6 +33,8 @@
 │   ├── supabase_client.py      # 可选云存储
 │   ├── config.py               # ★ 集中配置：绝对路径、上传/网格限制、CORS、单位制
 │   ├── jobs.py                 # ★ 后台任务：单线程工作器（gmsh 非线程安全）+ /api/jobs/*
+│   ├── fe_utils.py             # ★ 共享 FE 基础设施：读网格、归属面积、面→节点定位
+│   ├── thermal.py              # 稳态热传导求解（第二个分析类型）
 │   ├── gmsh_session.py         # Gmsh 会话（主线程初始化一次，进程内复用）
 │   ├── material_store.py       # 材料库持久化（SQLite）
 │   ├── generate_step.py        # 生成测试件（方块挖通孔）
@@ -150,8 +152,10 @@ cd frontend && npm run dev
 | GET | `/api/geometry/{filename}/metadata` | 提取 B-Rep 面/边/顶点（类型、面积、中心、法线） |
 | POST | `/api/generate-mesh` | 生成四面体网格，返回节点/单元/面/边/顶点 |
 | POST | `/api/solve` | 线弹性静力求解（同步；大模型请用 `/api/jobs/solve`） |
+| POST | `/api/thermal/solve` | **稳态热传导**求解（同步；大模型请用 `/api/jobs/thermal`） |
 | POST | `/api/jobs/generate-mesh` | **异步**划分网格：立即返回 `job_id`（202） |
-| POST | `/api/jobs/solve` | **异步**求解：立即返回 `job_id`（202） |
+| POST | `/api/jobs/solve` | **异步**结构求解：立即返回 `job_id`（202） |
+| POST | `/api/jobs/thermal` | **异步**热传导求解：立即返回 `job_id`（202） |
 | GET | `/api/jobs/{job_id}` | 查询任务状态与结果（`queued`/`running`/`succeeded`/`failed`） |
 | GET | `/api/jobs` | 列出最近的任务与队列状态 |
 | POST | `/api/validate-setup` | 求解前校验（材料、约束、载荷是否齐全） |
@@ -177,7 +181,8 @@ cd frontend && npm run dev
 | 边界条件选点 | 已从 `.msh` **精确映射**几何实体 → 边界三角形；仅在无映射时才回退到几何搜索 | 由旧版本生成的 `.msh` 可能缺少实体信息 |
 | `displacement` 边界条件 | ✅ 已实现（逐分量 `fixedX/Y/Z` + 非零值，走 skfem 非齐次 Dirichlet） | — |
 | `temperature` 边界条件 | 未被结构求解器实现（会出现在 `warnings` 中提示）；热分析属阶段 2/4 | 需要时需新增分析类型 |
-| 分析类型 | 仅线弹性静力 | 无模态/热/非线性 |
+| 分析类型 | ✅ 线弹性静力 + **稳态热传导**（`/api/thermal/solve`，有解析解校验） | 无模态 / 非线性 |
+| 前端分析类型接线 | 热传导后端已完成，**前端尚未接线**（Analysis Type 里选 Heat Transfer 目前仍走结构求解） | 下一轮补齐 |
 | 材料库 | ✅ 内置材料在代码里，自定义材料持久化到 SQLite（重启不丢） | 无编辑/删除界面（API 层已支持删除） |
 | ~~单位制~~ | ✅ 已支持 `m` / `mm`：前端可选，后端换算成米再求解，结果一律 SI（位移 m、应力 Pa） | 换单位后物理结果一致（应力 ×1000²、位移 ×1000） |
 | 几何拾取 | 面标签靠包围盒中心近似 | 复杂件上标签可能错位 |
@@ -250,7 +255,16 @@ cd frontend && npm run dev
 | 协作指南 | 新增 `CONTRIBUTING.md`：验证命令、红线、提交规范、新增功能/测试模板、常见问题 | 新人不知道「改完要跑什么、什么不能提交」 |
 | CI | 新增 `.github/workflows/ci.yml`：push/PR 自动跑后端测试 + 前端类型检查与构建 | 靠人记得跑测试不可靠 |
 
-### 阶段 3 · 长任务异步化（本轮新增）
+### 阶段 2 续 · 稳态热传导（本轮新增）
+
+| 项 | 落地内容 | 意义 |
+|---|---|---|
+| 第二个分析类型 | 新增 `backend/thermal.py` + `POST /api/thermal/solve` + `POST /api/jobs/thermal`：稳态热传导 `∇·(k∇T)=0`，面给定温度（Dirichlet），**未指定的面天然绝热**（弱形式的自然边界条件） | 证明这套架构能长出新的物理场，而不是只能改一处 |
+| 材料库扩展 | `Material` 增加 `thermalConductivity`（W/(m·K)），5 个内置材料都补了手册值（铜 401 > 铝 167 > 钢 50 > 钛 22 > ABS 0.2）；**SQLite 表新增列并带自动迁移**，老数据库打开时补列且旧数据不丢 | 顺带把"schema 演进"这件事做了一遍——长期项目一定会遇到 |
+| 共享 FE 基础设施 | 新增 `backend/fe_utils.py`：网格读取、归属面积、**面→节点定位**（结构与传热共用同一套规则，改一次两边生效） | 消除"两个求解器各写一套"的漂移风险 |
+| 验证 | 立方体两端定温（0/100 °C）、其余面绝热 ⇒ **温度沿轴向精确线性、热流 = kΔT/L**（解析解逐点校验，误差 < 1e-9 / < 1e-6）；单位一致性（mm 下热流 ×1000、温度不变）；缺温度边界 → 400；材料缺 k → 400；缺网格 → 409 | 线性单元能精确重现线性解（patch test），所以这里的容差可以卡到机器精度 |
+
+### 阶段 3 · 长任务异步化
 
 | 项 | 落地内容 | 意义 |
 |---|---|---|

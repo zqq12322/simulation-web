@@ -14,6 +14,9 @@ class Material(BaseModel):
     poissonsRatio: float
     color: str
     type: Literal['metal', 'plastic', 'concrete', 'wood', 'custom'] = 'metal'
+    #: 热导率 W/(m·K)，稳态热传导分析需要。历史数据可能没有该字段，
+    #: 因此允许为空——传热求解器会在缺失时给出明确错误而不是当成 0。
+    thermalConductivity: Optional[float] = None
     description: Optional[str] = None
 
 # Predefined materials database (in-memory for now)
@@ -25,6 +28,7 @@ MATERIALS_DB = [
         density=7850,
         youngsModulus=2.0e11,
         poissonsRatio=0.3,
+        thermalConductivity=50.0,  # W/(m*K)
         color="#808080",
         type="metal",
         description="Standard structural steel for general construction"
@@ -35,6 +39,7 @@ MATERIALS_DB = [
         density=2700,
         youngsModulus=6.9e10,
         poissonsRatio=0.33,
+        thermalConductivity=167.0,  # W/(m*K)
         color="#C0C0C0",
         type="metal",
         description="Lightweight aluminum alloy 6061-T6"
@@ -45,6 +50,7 @@ MATERIALS_DB = [
         density=8960,
         youngsModulus=1.2e11,
         poissonsRatio=0.34,
+        thermalConductivity=401.0,  # W/(m*K)
         color="#B87333",
         type="metal",
         description="Pure copper with high conductivity"
@@ -55,6 +61,7 @@ MATERIALS_DB = [
         density=4500,
         youngsModulus=1.1e11,
         poissonsRatio=0.32,
+        thermalConductivity=22.0,  # W/(m*K)
         color="#878681",
         type="metal",
         description="High strength-to-weight ratio titanium alloy"
@@ -65,6 +72,7 @@ MATERIALS_DB = [
         density=1040,
         youngsModulus=2.3e9,
         poissonsRatio=0.35,
+        thermalConductivity=0.2,  # W/(m*K)
         color="#FFFFE0",
         type="plastic",
         description="Common thermoplastic polymer"

@@ -623,6 +623,35 @@ def task_verify(args: argparse.Namespace) -> int:
                 len(job_result.get("nodes", [])) == len(mesh["nodes"]),
                 f"async={len(job_result.get('nodes', []))} sync={len(mesh['nodes'])}",
             )
+
+            # 稳态热传导：立方体两端定温、其余面绝热 ⇒ 温度精确线性、q = k·ΔT/L
+            thermal_body = {
+                "geometry_filename": "default_cube.step",
+                "material_id": "structural_steel",
+                "length_unit": "m",
+                "faces": cube["faces"],
+                "boundary_conditions": [
+                    {"id": "cold", "name": "冷端", "type": "temperature",
+                     "applicationType": "face", "entityIndex": cube_minus["id"],
+                     "temperature": 273.15},
+                    {"id": "hot", "name": "热端", "type": "temperature",
+                     "applicationType": "face", "entityIndex": cube_plus["id"],
+                     "temperature": 373.15},
+                ],
+            }
+            thermal = _http_json("POST", f"{API_BASE}/api/thermal/solve", thermal_body)
+            expected_flux = 50.0 * (373.15 - 273.15) / 10.0   # k=50, L=10 m
+            check(
+                "稳态热传导 vs 解析解 q=kΔT/L",
+                abs(thermal["max_heat_flux"] - expected_flux) < expected_flux * 1e-4,
+                f"q={thermal['max_heat_flux']:.6g} expect={expected_flux:.6g} W/m^2",
+            )
+            check(
+                "热传导温度边界精确",
+                abs(thermal["min_temperature"] - 273.15) < 1e-6
+                and abs(thermal["max_temperature"] - 373.15) < 1e-6,
+                f"T∈[{thermal['min_temperature']:.2f}, {thermal['max_temperature']:.2f}] K",
+            )
         except Exception as exc:
             check("求解器物理校准", False, f"{type(exc).__name__}: {exc}")
 

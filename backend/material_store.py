@@ -41,10 +41,17 @@ CREATE TABLE IF NOT EXISTS custom_materials (
     poissons_ratio REAL NOT NULL,
     color          TEXT NOT NULL,
     type           TEXT NOT NULL,
+    thermal_conductivity REAL,
     description    TEXT,
     created_at     TEXT NOT NULL
 );
 """
+
+#: 后加的列 → 列定义。SQLite 没有 "ADD COLUMN IF NOT EXISTS"，
+#: 所以启动时按 PRAGMA table_info 判断再补，老数据库也能平滑升级。
+_MIGRATIONS = {
+    "thermal_conductivity": "REAL",
+}
 
 
 class MaterialStore:
@@ -81,6 +88,22 @@ class MaterialStore:
     def _init_schema(self) -> None:
         with self._cursor() as connection:
             connection.executescript(_SCHEMA)
+        self._apply_migrations()
+
+    def _apply_migrations(self) -> None:
+        """给老数据库补上后加的列（幂等）。"""
+        with self._cursor() as connection:
+            existing = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(custom_materials)")
+            }
+            for column, definition in _MIGRATIONS.items():
+                if column in existing:
+                    continue
+                connection.execute(
+                    f"ALTER TABLE custom_materials ADD COLUMN {column} {definition}"
+                )
+                logger.info("材料库迁移：新增列 %s %s", column, definition)
 
     # ------------------------------------------------------------- 读
     def list_custom(self) -> List[dict]:
@@ -123,8 +146,8 @@ class MaterialStore:
                     """
                     INSERT INTO custom_materials
                         (id, name, density, youngs_modulus, poissons_ratio,
-                         color, type, description, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         color, type, thermal_conductivity, description, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         payload["id"],
@@ -134,6 +157,7 @@ class MaterialStore:
                         payload["poissonsRatio"],
                         payload["color"],
                         payload["type"],
+                        payload.get("thermalConductivity"),
                         payload.get("description"),
                         datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     ),
@@ -177,11 +201,17 @@ class MaterialStore:
             "poissonsRatio": float(data["poissonsRatio"]),
             "color": str(data["color"]),
             "type": str(data["type"]),
+            "thermalConductivity": (
+                float(data["thermalConductivity"])
+                if data.get("thermalConductivity") is not None
+                else None
+            ),
             "description": data.get("description"),
         }
 
     @staticmethod
     def _row_to_dict(row: sqlite3.Row) -> dict:
+        keys = row.keys()
         return {
             "id": row["id"],
             "name": row["name"],
@@ -190,6 +220,9 @@ class MaterialStore:
             "poissonsRatio": row["poissons_ratio"],
             "color": row["color"],
             "type": row["type"],
+            "thermalConductivity": (
+                row["thermal_conductivity"] if "thermal_conductivity" in keys else None
+            ),
             "description": row["description"],
         }
 

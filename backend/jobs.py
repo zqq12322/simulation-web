@@ -212,3 +212,17 @@ async def submit_solve_job(request: dict):
 
     job = submit("solve", functools.partial(solve_impl, request=solver_request))
     return {"job_id": job.id, "status": job.status, "poll": f"/api/jobs/{job.id}"}
+
+
+@router.post("/jobs/thermal", status_code=202)
+async def submit_thermal_job(request: dict):
+    """异步稳态热传导求解：立即返回 job_id，用 GET /api/jobs/{job_id} 轮询。"""
+    from thermal import ThermalRequest, solve_thermal_impl
+
+    try:
+        thermal_request = ThermalRequest(**request)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"请求体不合法：{exc}")
+
+    job = submit("thermal", functools.partial(solve_thermal_impl, request=thermal_request))
+    return {"job_id": job.id, "status": job.status, "poll": f"/api/jobs/{job.id}"}

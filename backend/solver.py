@@ -10,6 +10,12 @@ import gmsh
 
 # Import local modules
 from config import resolve_upload_path, validate_length_unit, length_scale_to_meter
+from fe_utils import (
+    compute_model_span,
+    load_tet_mesh_from_msh,   # 由 fe_utils 提供，这里再导出以兼容既有调用方式
+    nodal_tributary_areas,
+    resolve_target_nodes,
+)
 from gmsh_session import ensure_initialized as _ensure_gmsh, open_model_file, start_model
 from jobs import run_in_worker
 from logging_config import get_logger
@@ -51,112 +57,6 @@ def _parse_pressure(bc) -> float:
 def _parse_displacement(bc) -> tuple:
     """取强制位移值，统一成 ``(ux, uy, uz)``（dict / Vector3 / list 均可）。"""
     return _parse_force(getattr(bc, "displacement", None))
-
-
-def load_tet_mesh_from_msh(msh_path: str):
-    """
-    Build a scikit-fem tetrahedral mesh directly with Gmsh.
-
-    ``Mesh.load`` would delegate to meshio, which is not part of the backend
-    dependencies. Gmsh is already required for meshing, so we read the mesh back
-    with it instead of adding another dependency.
-
-    Returns
-    -------
-    mesh
-        The ``MeshTet`` volume mesh.
-    face_triangles
-        ``{entity_tag: ndarray(n_triangles, 3)}`` — 每个几何面所包含的**边界三角形**
-        及其在 scikit-fem 网格中的节点索引。有了它就能精确定位一个面上的节点，
-    不必再用「点到平面距离」去猜；同时可以算出每个节点的**归属面积**，
-    从而施加真实的面载荷（traction）而不是把合力平均分给节点。
-    """
-    # 会话级 gmsh：只 open（内部等价 clear + merge），不 initialize/finalize
-    # —— 信号处理只能在主线程设置，见 gmsh_session.py
-    open_model_file(msh_path)
-    gmsh.option.setNumber("General.Terminal", 0)
-
-    face_triangles: Dict[int, np.ndarray] = {}
-
-    try:
-        node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
-        nodes = np.asarray(node_coords, dtype=np.float64).reshape(-1, 3)
-        node_tags = np.asarray(node_tags, dtype=np.int64)
-
-        # Node tags are not guaranteed to start at 0, so map them explicitly.
-        tag_to_index = np.zeros(int(node_tags.max()) + 1, dtype=np.int64)
-        tag_to_index[node_tags] = np.arange(len(node_tags), dtype=np.int64)
-
-        element_types, _, element_nodes = gmsh.model.mesh.getElements(dim=3)
-
-        cells = []
-        for etype, enodes in zip(element_types, element_nodes):
-            if etype != 4:  # keep 4-node tetrahedra only
-                continue
-            conn = np.asarray(enodes, dtype=np.int64).reshape(-1, 4)
-            cells.append(tag_to_index[conn])
-
-        # 逐面取出边界三角形（MSH 4.1 会保留几何实体标签，因此 tag 与前端
-        # 从元数据接口拿到的 face.id 一致）
-        for _, face_tag in gmsh.model.getEntities(dim=2):
-            try:
-                ftypes, _, fnodes = gmsh.model.mesh.getElements(dim=2, tag=face_tag)
-            except Exception:
-                continue
-            triangles = []
-            for ftype, fconn in zip(ftypes, fnodes):
-                if ftype != 2:  # 只要 3 节点三角形
-                    continue
-                triangles.append(np.asarray(fconn, dtype=np.int64).reshape(-1, 3))
-            if triangles:
-                face_triangles[int(face_tag)] = tag_to_index[np.vstack(triangles)]
-    except Exception:
-        # 读取失败就把已解析的网格信息清空，由调用方处理异常
-        raise
-
-    if not cells:
-        raise ValueError("No 4-node tetrahedral elements found in the mesh file.")
-
-    t = np.vstack(cells).T.astype(np.int64)  # shape (4, n_elements)
-    points = nodes.T  # shape (3, n_nodes)
-
-    # scikit-fem expects a positive Jacobian per element; flip inverted ones.
-    # Note: NumPy >= 2.0 evaluates np.cross along the LAST axis, so the edge
-    # vectors are transposed to (n_elements, 3) before taking the cross product.
-    v0, v1, v2, v3 = (points[:, t[i]] for i in range(4))
-    e1 = (v1 - v0).T
-    e2 = (v2 - v0).T
-    e3 = (v3 - v0).T
-    det = np.einsum('ij,ij->i', np.cross(e1, e2), e3)
-    flip = det < 0
-    if np.any(flip):
-        t[[1, 2], flip] = t[[2, 1], flip]
-
-    return MeshTet(points, t), face_triangles
-
-
-def nodal_tributary_areas(points: np.ndarray, triangles: np.ndarray) -> np.ndarray:
-    """
-    计算一组三角形上每个节点的**归属面积**（lumped / tributary area）。
-
-    对线性三角形，每个节点分得所在三角形面积的 1/3。所有节点归属面积之和
-    精确等于这组三角形的总面积——这正是施加均匀面载荷时需要的权重：
-    ``f_node = traction * A_node`` 的和就等于 ``traction * A_total``。
-    """
-    areas = np.zeros(points.shape[1], dtype=np.float64)
-    if triangles.size == 0:
-        return areas
-
-    tri_pts = points[:, triangles]          # (3, n_tri, 3)
-    p0, p1, p2 = tri_pts[:, :, 0], tri_pts[:, :, 1], tri_pts[:, :, 2]
-    cross = np.cross((p1 - p0).T, (p2 - p0).T)
-    tri_area = 0.5 * np.linalg.norm(cross, axis=1)
-
-    share = tri_area / 3.0
-    for corner in range(3):
-        np.add.at(areas, triangles[:, corner], share)
-
-    return areas
 
 
 def surface_normal_from_triangles(points: np.ndarray, triangles: np.ndarray,
@@ -313,29 +213,16 @@ async def solve_impl(request: "SolverRequest"):
 
         supported_types = {"fixed", "displacement", "force", "pressure"}
         model_centroid = mesh.p.mean(axis=1)
-        # 容差一律用**相对模型尺度**表示：坐标已被换算成米，绝对容差
-        # （原先的 1e-2）在毫米模型上会大到把整个模型都选进来。
-        model_span = float(
-            max(
-                mesh.p[0].max() - mesh.p[0].min(),
-                mesh.p[1].max() - mesh.p[1].min(),
-                mesh.p[2].max() - mesh.p[2].min(),
-                1e-30,
-            )
-        )
+        # 容差一律用**相对模型尺度**表示（坐标已换算成米，绝对容差在毫米模型上会失效）
+        model_span = compute_model_span(mesh)
 
         for bc in request.boundary_conditions:
-            x, y, z = mesh.p
-
             target_face = next((face for face in request.faces if face.id == bc.entityIndex), None)
             triangles = (
                 face_triangles.get(int(bc.entityIndex))
                 if getattr(bc, "applicationType", "face") == "face"
                 else None
             )
-
-            target_nodes_indices = np.array([], dtype=np.int64)
-            nodal_areas = None
 
             if bc.type not in supported_types:
                 message = (
@@ -346,52 +233,20 @@ async def solve_impl(request: "SolverRequest"):
                 solver_warnings.append(message)
                 continue
 
-            # ---- 定位作用对象 -------------------------------------------------
-            if getattr(bc, "applicationType", "face") == "vertex":
-                if 0 <= bc.entityIndex < mesh.p.shape[1]:
-                    target_nodes_indices = np.array([bc.entityIndex], dtype=np.int64)
-                else:
-                    message = f"顶点索引 {bc.entityIndex} 超出范围，已忽略该边界条件"
-                    logger.warning(message)
-                    solver_warnings.append(message)
-                    continue
+            # ---- 定位作用对象（与传热求解器共用同一套规则，见 fe_utils） ----
+            target_nodes_indices, nodal_areas, locate_error = resolve_target_nodes(
+                bc, mesh, face_triangles, request.faces, length_scale, model_span
+            )
+            if locate_error:
+                logger.warning(locate_error)
+                solver_warnings.append(locate_error)
+                continue
 
-            elif triangles is not None and triangles.size > 0:
-                # 精确路径
-                target_nodes_indices = np.unique(triangles)
-                nodal_areas = nodal_tributary_areas(mesh.p, triangles)[target_nodes_indices]
-                logger.debug(
-                    "面 %s：由边界三角形定位到 %d 个节点，总面积 %.6g",
-                    bc.entityIndex, len(target_nodes_indices), float(nodal_areas.sum()),
-                )
-
-            else:
-                # 退化路径：几何搜索（保留旧行为，供 STL / 旧网格使用）
-                if target_face and target_face.normal:
-                    nx, ny, nz = target_face.normal
-                    # 面元数据来自原几何（输入单位），需与已换算的网格坐标对齐
-                    cx, cy, cz = (c * length_scale for c in target_face.center)
-                    dist_to_plane = np.abs(
-                        (x - cx) * nx + (y - cy) * ny + (z - cz) * nz
-                    )
-                    target_nodes_indices = np.where(dist_to_plane < model_span * 1e-3)[0]
-
-                if len(target_nodes_indices) == 0:
-                    tol = model_span * 0.1
-
-                    idx = bc.entityIndex % 6
-                    if idx == 0: mask = x < x.min() + tol
-                    elif idx == 1: mask = x > x.max() - tol
-                    elif idx == 2: mask = y < y.min() + tol
-                    elif idx == 3: mask = y > y.max() - tol
-                    elif idx == 4: mask = z < z.min() + tol
-                    else: mask = z > z.max() - tol
-
-                    target_nodes_indices = np.where(mask)[0]
-                    logger.debug(
-                        "面 %s：精确映射不可用，回退到包围盒启发式，命中 %d 个节点",
-                        bc.entityIndex, len(target_nodes_indices),
-                    )
+            if len(target_nodes_indices) == 0:
+                message = f"边界条件「{bc.name}」没有选中任何节点，已忽略"
+                logger.warning(message)
+                solver_warnings.append(message)
+                continue
 
             if len(target_nodes_indices) == 0:
                 message = f"边界条件「{bc.name}」没有选中任何节点，已忽略"
