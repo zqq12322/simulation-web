@@ -602,6 +602,82 @@ class DisplacementParsingTest(unittest.TestCase):
         self.assertEqual(_parse_displacement(bc), (7.0, 0.0, 0.0))
 
 
+class ConsistentTractionTest(unittest.TestCase):
+    """
+    面载荷分配方式的**精确性**证明。
+
+    文档里曾把"按三角形面积 1/3 分给顶点"写成"集中式、一阶精度、应改为
+    面基函数积分"。实际上对**线性三角形 + 常数面力**，``∫N_i dA = A/3`` 是解析
+    成立的，因此集中式分配与精确积分**逐节点完全相同**（实测相对差异 3.7e-16）。
+
+    这里把它固化成测试：如果哪天有人"优化"成别的分配方式，或者换了高阶单元
+    却忘了同步修改，这条断言会立刻失败。
+    """
+
+    TRACTION = np.array([1.0e7, 0.0, 0.0])   # 常数面力，沿 +X
+    FACE_X = 5.0
+
+    @classmethod
+    def setUpClass(cls):
+        from skfem import Basis, ElementTetP1, ElementVectorH1, FacetBasis, LinearForm, asm
+        from skfem.helpers import dot
+
+        import config
+        from solver import load_tet_mesh_from_msh, nodal_tributary_areas
+
+        _cube_mesh()
+        mesh, face_triangles = load_tet_mesh_from_msh(str(config.UPLOAD_DIR / (CUBE + ".msh")))
+        cls.mesh = mesh
+
+        # 取 +X 面（用三角形质心的 x 判断）
+        for _tag, triangles in face_triangles.items():
+            centroids = mesh.p[:, triangles].mean(axis=1)
+            if np.allclose(centroids[0], cls.FACE_X, atol=1e-9):
+                cls.triangles = triangles
+                break
+        else:
+            raise AssertionError("未找到 +X 面对应的三角形")
+
+        # 1) 当前实现：按归属面积分配
+        areas = nodal_tributary_areas(mesh.p, cls.triangles)
+        basis = Basis(mesh, ElementVectorH1(ElementTetP1()))
+        cls.total_area = float(areas.sum())
+        cls.lumped = np.zeros(basis.N)
+        for node_index in np.unique(cls.triangles):
+            force = cls.TRACTION * areas[node_index]
+            for component in range(3):
+                cls.lumped[basis.nodal_dofs[component][node_index]] += force[component]
+
+        # 2) 参考实现：在面基函数上组装 ∫ t·v dA
+        facets = mesh.boundary_facets()
+        facet_centroids = mesh.p[:, mesh.facets[:, facets]].mean(axis=1)
+        selected = facets[np.abs(facet_centroids[0] - cls.FACE_X) < 1e-9]
+        facet_basis = FacetBasis(mesh, ElementVectorH1(ElementTetP1()), facets=selected)
+
+        @LinearForm
+        def traction_form(v, _w):
+            return dot(cls.TRACTION, v)
+
+        cls.consistent = np.asarray(asm(traction_form, facet_basis)).flatten()
+
+    def test_face_area_is_exact(self):
+        self.assertAlmostEqual(self.total_area, FACE_AREA, places=10)
+
+    def test_lumped_equals_consistent_integration(self):
+        scale = float(np.abs(self.consistent).max())
+        difference = float(np.abs(self.lumped - self.consistent).max())
+        self.assertGreater(scale, 0.0)
+        self.assertLess(
+            difference / scale, 1e-12,
+            "集中式分配与精确面载荷积分不再一致——检查分配方式或单元类型",
+        )
+
+    def test_total_force_equals_traction_times_area(self):
+        expected = self.TRACTION[0] * self.total_area
+        self.assertAlmostEqual(float(self.lumped.sum()), expected, places=6)
+        self.assertAlmostEqual(float(self.consistent.sum()), expected, places=6)
+
+
 class LengthUnitTest(unittest.TestCase):
     """
     长度单位换算。

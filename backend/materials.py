@@ -2,6 +2,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Literal, Optional
 
+from material_store import get_store
+
 router = APIRouter()
 
 class Material(BaseModel):
@@ -71,23 +73,43 @@ MATERIALS_DB = [
 
 @router.get("/materials", response_model=List[Material])
 async def get_materials():
-    """Get all available materials"""
-    return MATERIALS_DB
+    """
+    全部可用材料 = **内置材料（代码里定义）** + **自定义材料（SQLite 持久化）**。
+
+    内置材料永远来自代码，因此即使数据库损坏也仍然可用。
+    """
+    custom = [Material(**item) for item in get_store().list_custom()]
+    return MATERIALS_DB + custom
 
 @router.get("/materials/{material_id}", response_model=Material)
 async def get_material(material_id: str):
-    """Get a specific material by ID"""
+    """按 ID 取材料（先查内置，再查持久化的自定义材料）"""
     material = next((m for m in MATERIALS_DB if m.id == material_id), None)
-    if material is None:
+    if material is not None:
+        return material
+
+    stored = get_store().get_custom(material_id)
+    if stored is None:
         raise HTTPException(status_code=404, detail="Material not found")
-    return material
+    return Material(**stored)
 
 @router.post("/materials", response_model=Material)
 async def create_material(material: Material):
-    """Create a custom material (session-based)"""
-    # Check if ID already exists
+    """
+    新建自定义材料并**持久化**（重启后仍在）。
+
+    此前材料只存在内存列表里，重启即丢；多人共用一台机器时也互相覆盖。
+    """
+    # 内置材料 ID 不允许被覆盖
     if any(m.id == material.id for m in MATERIALS_DB):
-        raise HTTPException(status_code=400, detail="Material ID already exists")
-    
-    MATERIALS_DB.append(material)
-    return material
+        raise HTTPException(
+            status_code=400,
+            detail=f"材料 ID 与内置材料冲突：{material.id}",
+        )
+
+    try:
+        saved = get_store().add(material)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return Material(**saved)

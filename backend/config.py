@@ -19,6 +19,14 @@ from typing import Final
 BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 UPLOAD_DIR: Final[Path] = BASE_DIR / "uploads"
 
+#: 持久化数据目录（SQLite 等）。整个目录已被 .gitignore 忽略。
+DATA_DIR: Final[Path] = BASE_DIR / "data"
+
+#: 材料库数据库路径；可用环境变量覆盖（测试会用临时库，避免污染开发数据）。
+DB_PATH: Final[Path] = Path(
+    os.getenv("SIMCLOUD_DB", str(DATA_DIR / "simcloud.db"))
+)
+
 # ----------------------------------------------------------------- 上传限制
 #: 单个几何文件大小上限（默认 50 MB）
 MAX_UPLOAD_BYTES: Final[int] = int(
@@ -67,6 +75,12 @@ def ensure_upload_dir() -> Path:
     """确保上传目录存在并返回该目录。"""
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     return UPLOAD_DIR
+
+
+def ensure_data_dir() -> Path:
+    """确保数据目录存在并返回该目录。"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return DATA_DIR
 
 
 def resolve_upload_path(filename: str) -> Path:
