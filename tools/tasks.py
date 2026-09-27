@@ -487,9 +487,40 @@ def _check_result_shader_contract() -> tuple[bool, str]:
     return (not problems), "；".join(problems) if problems else "位移属性与放大系数都参与了顶点计算"
 
 
+def _run_node_module_selftest(
+    node: str,
+    script: str,
+    env_extra: Optional[dict] = None,
+) -> tuple[bool, str]:
+    """
+    在 `frontend/utils/` 下用 node 执行一段断言脚本（脚本自己 import 前端的 `.ts`）。
+
+    node >= 23 支持类型擦除，可以 `import './xxx.ts'`，因此前端算法不必在 Python 里
+    重写一遍——重写一遍等于测试了一个"副本"，那种测试证明不了发布代码是对的。
+
+    约定：脚本成功时打印 `OK` 并以 0 退出；失败时把原因写进 stderr 并以 1 退出。
+    """
+    environment = dict(os.environ)
+    if env_extra:
+        environment.update(env_extra)
+
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        cwd=str(FRONTEND / "utils"),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+    )
+
+    if completed.returncode == 0 and "OK" in (completed.stdout or ""):
+        return True, "断言全部通过"
+    lines = (completed.stderr or completed.stdout or "").strip().splitlines()
+    return False, (lines[-1] if lines else f"exit={completed.returncode}")
+
+
 #: 用 node 直接执行前端纯函数模块并断言其行为。
-#: node >= 23 可以 import .ts（类型擦除），因此前端算法不必在 Python 里重写一遍
-#: —— 重写一遍就等于测试了一个"副本"，那种测试证明不了发布代码是对的。
 _DEFORMATION_SELFTEST = r"""
 import { computeDeformationScale, displacementMagnitudes, flattenDisplacements,
          hasDisplacementField, modelSpanOf,
@@ -550,19 +581,190 @@ console.log('OK');
 
 def _check_frontend_deformation_math(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/deformation.ts` 里的纯函数并断言其行为。"""
-    completed = subprocess.run(
-        [node, "--input-type=module", "-e", _DEFORMATION_SELFTEST],
-        cwd=str(FRONTEND / "utils"),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    ok, detail = _run_node_module_selftest(node, _DEFORMATION_SELFTEST)
+    return ok, ("放大系数 / 属性长度 / 退化输入 均符合断言" if ok else detail)
 
-    if completed.returncode == 0 and "OK" in (completed.stdout or ""):
-        return True, "放大系数 / 属性长度 / 退化输入 均符合断言"
-    detail = (completed.stderr or completed.stdout or "").strip().splitlines()
-    return False, (detail[-1] if detail else f"exit={completed.returncode}")
+
+#: 模态阶次列表 / 频率格式化 / 振型取场的断言（纯函数，喂构造数据）。
+_MODAL_MODES_SELFTEST = r"""
+import { MODE_LEGEND_TITLE, MODE_LEGEND_UNIT, UNKNOWN_FREQUENCY_LABEL,
+         buildModeList, clampModeIndex, formatFrequency, modeDisplayField,
+         modeHint } from './modalModes.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+// 1) 频率格式化：分档是为了让 0 Hz 的刚体模态与几十 kHz 的弹性模态在同一张
+//    列表里都可读。无效值必须显示为占位符，**不能冒充 0 Hz**。
+for (const [input, expected] of [
+  [0, '0 Hz'], [1e-9, '0 Hz'], [0.5, '0.50 Hz'], [999.994, '999.99 Hz'],
+  [1261.8862, '1.26 kHz'], [55747.3, '55.75 kHz'], [999999, '1000.00 kHz'],
+  [2.5e6, '2.500 MHz'],
+  [NaN, UNKNOWN_FREQUENCY_LABEL], [-1, UNKNOWN_FREQUENCY_LABEL],
+  [undefined, UNKNOWN_FREQUENCY_LABEL], [null, UNKNOWN_FREQUENCY_LABEL],
+]) {
+  const got = formatFrequency(input);
+  check(`formatFrequency(${input})`, got === expected, `${got} 应为 ${expected}`);
+}
+
+// 2) 阶次列表：order 从 1 起（给用户看），index 从 0 起（回传给父组件）
+const freqs = [0, 0, 0, 0, 0, 0, 55747.3, 62310.5];
+const modes = buildModeList(freqs, 6);
+check('模态列表长度', modes.length === 8, String(modes.length));
+check('阶次从 1 起', modes[0].order === 1 && modes[7].order === 8);
+check('下标从 0 起', modes[0].index === 0 && modes[7].index === 7);
+check('前 6 阶标记为刚体模态',
+      modes.slice(0, 6).every(m => m.isRigidBody) && !modes[6].isRigidBody);
+check('刚体模态显示为 0 Hz', modes[0].label === '0 Hz', modes[0].label);
+check('空输入返回空列表', buildModeList([]).length === 0
+      && buildModeList(null).length === 0 && buildModeList(undefined).length === 0);
+check('rigidBodyModes 超过频率个数时不越界',
+      buildModeList([1, 2], 99).every(m => m.isRigidBody));
+
+// 3) 序号夹取：没有模态时返回 -1（UI 据此不渲染面板）
+check('无模态时返回 -1', clampModeIndex(0, 0) === -1);
+check('越界夹到最后一阶', clampModeIndex(9, 3) === 2);
+check('负数夹到第一阶', clampModeIndex(-5, 3) === 0);
+check('NaN 回落到第一阶', clampModeIndex(NaN, 3) === 0);
+check('小数向下取整', clampModeIndex(1.9, 3) === 1);
+
+// 4) 振型取场。后端把振型归一化到"最大节点位移 = 1"，所以着色场是**相对量**。
+const shape = [[0, 0, 0], [3, 4, 0], [1, 0, 0]];
+const field = modeDisplayField([shape], 0, 3);
+check('振型取场非空', field !== null);
+check('位移场逐点等于输入', JSON.stringify(field.displacements) === JSON.stringify(shape));
+check('着色场为位移模长', field.scalarField[1] === 5, JSON.stringify(field.scalarField));
+check('最大位移从数据算出', field.maxDisplacement === 5, String(field.maxDisplacement));
+
+// 归一化后 maxDisplacement 应为 1；**放大 k 倍则最大位移也放大 k 倍**，
+// 这样 utils/deformation.ts 的放大系数会自动保持不变 → 画面上的变形量不变。
+const normalized = [[0, 0, 0], [1, 0, 0]];
+check('归一化振型的最大位移为 1',
+      modeDisplayField([normalized], 0, 2).maxDisplacement === 1);
+const scaled = [[0, 0, 0], [1000, 0, 0]];
+check('振型整体放大时最大位移同步放大',
+      modeDisplayField([scaled], 0, 2).maxDisplacement === 1000);
+
+// 数据对不上时必须返回 null —— 错位的云图比不显示更糟（用户会当真）
+check('节点数不匹配返回 null', modeDisplayField([shape], 0, 5) === null);
+check('没有振型返回 null', modeDisplayField(undefined, 0, 3) === null);
+check('节点数为 0 返回 null', modeDisplayField([shape], 0, 0) === null);
+check('越界下标夹到最后一阶而不是 null', modeDisplayField([shape, shape], 9, 3) !== null);
+
+// 5) 提示文案：刚体模态是**正确**结果，但必须解释清楚，否则用户以为求解器坏了
+const rigidHint = modeHint(modes[0], 6);
+check('刚体模态有解释', typeof rigidHint === 'string' && rigidHint.includes('刚体'), String(rigidHint));
+const elasticHint = modeHint(modes[6], 6);
+check('弹性模态提示前几阶是刚体',
+      typeof elasticHint === 'string' && elasticHint.includes('6'), String(elasticHint));
+check('没有刚体模态时不提示', modeHint(modes[6], 0) === null);
+check('没有选中阶次时不提示', modeHint(null, 6) === null);
+
+// 6) 图例必须标明振型是**无量纲相对量**，否则用户会把颜色读成真实位移（米）
+check('振型图例标题', MODE_LEGEND_TITLE.includes('振型'), MODE_LEGEND_TITLE);
+check('振型图例单位标明无量纲', MODE_LEGEND_UNIT.includes('无量纲'), MODE_LEGEND_UNIT);
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+#: 把**后端真实返回**的模态结果喂给前端的取场逻辑。
+#: 这一步专门用来挡字段名漂移：后端的 mode_shapes / frequencies 一旦改名，
+#: 界面只会"静默地不显示振型"，不会有任何报错。
+_MODAL_DISPLAY_CHAIN_SELFTEST = r"""
+import { readFileSync } from 'node:fs';
+import { buildModeList, formatFrequency, modeDisplayField,
+         UNKNOWN_FREQUENCY_LABEL } from './modalModes.ts';
+
+const payload = JSON.parse(readFileSync(process.env.SIMCLOUD_MODAL_PAYLOAD, 'utf8'));
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+const frequencies = payload.frequencies;
+const shapes = payload.mode_shapes;
+const nodeCount = payload.nodes;
+
+check('后端返回了 frequencies', Array.isArray(frequencies) && frequencies.length > 0);
+check('后端返回了 mode_shapes', Array.isArray(shapes) && shapes.length > 0);
+check('频率与振型数量一致', frequencies.length === shapes.length,
+      `${frequencies.length} vs ${shapes.length}`);
+check('每阶振型长度等于网格节点数',
+      shapes.every(s => s.length === nodeCount),
+      `nodes=${nodeCount}, 各阶长度=${shapes.map(s => s.length).join(',')}`);
+
+// Workbench 求解完默认显示第 1 阶（handleSelectMode/handleSolve 里的 index 0）
+const first = modeDisplayField(shapes, 0, nodeCount);
+check('默认阶次可取场（否则界面点了求解也看不到振型）', first !== null);
+if (first) {
+  check('振型已归一化 ⇒ 最大位移 = 1',
+        Math.abs(first.maxDisplacement - 1) < 1e-9, String(first.maxDisplacement));
+  check('着色场长度等于节点数', first.scalarField.length === nodeCount);
+  check('着色场非负', first.scalarField.every(v => v >= 0));
+}
+// 切到最后一阶也必须能取场
+check('最后一阶可取场',
+      modeDisplayField(shapes, shapes.length - 1, nodeCount) !== null);
+check('频率可正常格式化',
+      formatFrequency(frequencies[0]) !== UNKNOWN_FREQUENCY_LABEL,
+      formatFrequency(frequencies[0]));
+
+// 阶次列表（界面右侧面板渲染的就是它）
+const entries = buildModeList(frequencies, payload.rigid_body_modes || 0);
+check('阶次列表长度与频率数一致', entries.length === frequencies.length);
+check('刚体模态个数与后端一致',
+      entries.filter(e => e.isRigidBody).length === (payload.rigid_body_modes || 0),
+      `前端 ${entries.filter(e => e.isRigidBody).length} vs 后端 ${payload.rigid_body_modes}`);
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+def _check_frontend_modal_math(node: str) -> tuple[bool, str]:
+    """用 node 执行 `frontend/utils/modalModes.ts` 里的纯函数并断言其行为。"""
+    ok, detail = _run_node_module_selftest(node, _MODAL_MODES_SELFTEST)
+    return ok, ("阶次列表 / 频率格式化 / 振型取场 均符合断言" if ok else detail)
+
+
+def _check_modal_display_chain(node: str, payload: dict) -> tuple[bool, str]:
+    """
+    把后端真实返回的模态结果喂给前端的取场逻辑。
+
+    比"在前端造一份假数据"强的地方：后端字段一旦改名（`mode_shapes` → `modeShapes`），
+    界面只会**静默地不显示振型**，不报错、不影响任何数值——只有拿真实响应去跑
+    前端的解析逻辑才能发现。
+    """
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".json", delete=False, encoding="utf-8"
+    ) as handle:
+        json.dump(payload, handle)
+        path = handle.name
+
+    try:
+        ok, detail = _run_node_module_selftest(
+            node,
+            _MODAL_DISPLAY_CHAIN_SELFTEST,
+            {"SIMCLOUD_MODAL_PAYLOAD": path},
+        )
+    finally:
+        os.unlink(path)
+
+    return ok, (f"{payload.get('nodes', 0)} 节点 × {len(payload.get('frequencies') or [])} 阶，"
+                f"取场与归一化均通过" if ok else detail)
 
 
 def task_verify(args: argparse.Namespace) -> int:
@@ -574,12 +776,15 @@ def task_verify(args: argparse.Namespace) -> int:
         marker = _c("PASS", "green") if passed else _c("FAIL", "red")
         print(f"  [{marker}] {name:<42} {detail}")
 
+    # node 在后面的"前端契约"小节里还要用（把真实响应喂给前端的取场逻辑），
+    # 因此在这里统一探测一次。
+    node_bin = shutil.which("node")
+
     if not args.skip_frontend:
         info("=== 1/4 前端类型检查 ===")
-        node = shutil.which("node")
-        if node:
+        if node_bin:
             code = subprocess.run(
-                [node, "node_modules/typescript/bin/tsc", "--noEmit"],
+                [node_bin, "node_modules/typescript/bin/tsc", "--noEmit"],
                 cwd=str(FRONTEND),
             ).returncode
             check("TypeScript 类型检查", code == 0, f"exit={code}")
@@ -590,8 +795,11 @@ def task_verify(args: argparse.Namespace) -> int:
             passed, detail = _check_result_shader_contract()
             check("结果云图显示变形（着色器契约）", passed, detail)
 
-            passed, detail = _check_frontend_deformation_math(node)
+            passed, detail = _check_frontend_deformation_math(node_bin)
             check("变形放大系数（node 执行前端纯函数）", passed, detail)
+
+            passed, detail = _check_frontend_modal_math(node_bin)
+            check("模态阶次与频率显示（node 执行前端纯函数）", passed, detail)
         else:
             check("TypeScript 类型检查", False, "未找到 node")
 
@@ -890,7 +1098,43 @@ def task_verify(args: argparse.Namespace) -> int:
                 f"f1={mm_freqs[0]:.6g} Hz, 比值={ratios[:2]}"
                 if ratios else f"mm={modal_mm.get('status')} m={modal_m.get('status')}",
             )
+
+            # 模态前端契约：把**后端真实返回**的模态结果喂给界面实际使用的
+            # 取场逻辑（frontend/utils/modalModes.ts）。这一步挡的是"字段名漂移"
+            # ——后端把 mode_shapes 改名后，界面只会静默地不显示振型。
+            if node_bin:
+                passed, detail = _check_modal_display_chain(
+                    node_bin,
+                    {
+                        "mode_shapes": (modal_mm.get("result") or {}).get("mode_shapes"),
+                        "frequencies": mm_freqs,
+                        "rigid_body_modes": (
+                            modal_mm.get("result") or {}
+                        ).get("rigid_body_modes", 0),
+                        "nodes": len(cube["nodes"]),
+                    },
+                )
+                check("模态分析前端契约（真实响应对接取场逻辑）", passed, detail)
+
+                # 自由-自由那条结果里前 6 阶是刚体模态，正好用来验证界面
+                # "前 N 阶标记为刚体"的渲染输入是否正确
+                passed, detail = _check_modal_display_chain(
+                    node_bin,
+                    {
+                        "mode_shapes": free_free_result.get("mode_shapes"),
+                        "frequencies": free_free_result.get("frequencies") or [],
+                        "rigid_body_modes": free_free_result.get("rigid_body_modes", 0),
+                        "nodes": len(cube["nodes"]),
+                    },
+                )
+                check("模态前端契约（自由-自由 ⇒ 6 阶刚体）", passed, detail)
         except Exception as exc:
+            # 这个兜底捕获会把一整段物理校准变成"一项失败"，因此必须把栈打出来：
+            # 只报一句异常摘要的话，排查时根本看不出是哪一行炸的
+            # （本轮就吃过这个亏：TypeError 的摘要完全指不出位置）。
+            import traceback
+
+            traceback.print_exc()
             check("求解器物理校准", False, f"{type(exc).__name__}: {exc}")
 
     failed = [name for name, passed, _ in checks if not passed]

@@ -32,6 +32,7 @@ import MeshSettingsModal from './MeshSettingsModal';
 import SolverSettingsModal from './SolverSettingsModal';
 import AIAssistantPanel, { AIAssistantPanelRef } from './AIAssistantPanel';
 import { Project, Material, AnyBoundaryCondition, MeshSettings, SolverSettings } from '../types';
+import { formatFrequency, modeDisplayField } from '../utils/modalModes';
 
 interface WorkbenchProps {
   project: Project;
@@ -76,6 +77,10 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   // 后台任务进度文案（网格/求解各一份）
   const [meshJobStatus, setMeshJobStatus] = useState<string>('');
   const [solveJobStatus, setSolveJobStatus] = useState<string>('');
+
+  // 模态分析：当前显示的阶次（0 起）。模态结果里每个振型都是一个位移场，
+  // 切换阶次只是换掉要显示的位移场，见 handleSelectMode。
+  const [selectedMode, setSelectedMode] = useState<number>(0);
 
   /**
    * 轮询后台任务直到结束。
@@ -401,6 +406,31 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     setShowSolverSettingsModal(false); // Make sure modal closes
   };
 
+  /**
+   * 切换要显示的模态阶次。
+   *
+   * 模态结果里每阶振型都是一个位移场（后端已按最大位移归一化），
+   * 所以"看第 N 阶"就是把这个位移场换进 meshData——着色与变形显示的管线
+   * 与结构分析完全相同，只有图例的语义不同（相对量而不是米）。
+   */
+  const handleSelectMode = (index: number) => {
+    setSelectedMode(index);
+    setMeshData((prev: any) => {
+      if (!prev) return prev;
+      const field = modeDisplayField(prev.mode_shapes, index, prev.nodes?.length || 0);
+      if (!field) {
+        console.warn('振型数据与网格不匹配，无法切换阶次', {
+          requested: index,
+          modes: prev.mode_shapes?.length,
+          nodes: prev.nodes?.length,
+        });
+        return prev;
+      }
+      // max_displacement 必须一起更新：变形放大系数按它计算
+      return { ...prev, ...field, max_displacement: field.maxDisplacement };
+    });
+  };
+
   const handleSolve = async () => {
     if (!modelName) {
       alert("请先导入几何模型。");
@@ -416,13 +446,28 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
       setShowMeshSettingsModal(true);
       return;
     }
-    if (boundaryConditions.length === 0) {
-      alert("请至少添加一个边界条件（左侧 Boundary conditions → + ）。");
+
+    const analysisType = solverSettings.solverType;
+    const isThermal = analysisType === 'thermal';
+    const isModal = analysisType === 'modal';
+
+    // 未实现的分析类型必须**明确拒绝**，而不是悄悄按结构分析去算。
+    // 此前 CFD 会被当成结构静力求解——界面提供了实际不会执行的选项，
+    // 用户拿到的结果与所选分析类型无关。
+    if (analysisType === 'cfd') {
+      alert(
+        "Fluid Flow (CFD) 后端尚未实现，无法求解。\n" +
+        "请选择 Static Structural / Heat Transfer / Frequency (Modal)。"
+      );
       return;
     }
 
-    const isThermal = solverSettings.solverType === 'thermal';
-
+    // 模态分析不要求载荷：自由-自由结构也是合法的（会得到 6 个刚体模态）。
+    // 结构分析则必须有载荷，否则结果恒为零，属于"求解成功但没有意义"。
+    if (!isModal && !isThermal && boundaryConditions.length === 0) {
+      alert("请至少添加一个边界条件（左侧 Boundary conditions → + ）。");
+      return;
+    }
     if (isThermal && !boundaryConditions.some(bc => bc.type === 'temperature')) {
       alert(
         "热传导分析至少需要一个【温度】边界条件。\n" +
@@ -455,17 +500,28 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
         });
 
         // 异步任务接口：提交后轮询（同网格划分的理由）
+        const requestBody: Record<string, any> = {
+            geometry_filename: modelName,
+            material_id: selectedMaterial?.id || 'structural_steel', // Default if not selected
+            boundary_conditions: validBCs,
+            faces: facesData, // Pass B-Rep face metadata to solver
+            // 几何坐标的长度单位。默认 mm：CAD 零件基本都是毫米，
+            // 后端会换算成米再求解，结果与输入单位无关（SI）。
+            length_unit: solverSettings?.lengthUnit || 'mm'
+        };
+        if (isModal) {
+            // 阶数来自 SolverSettingsModal 的 "Number of modes" 参数（默认 10）
+            const requested = Number(solverSettings?.parameters?.numModes);
+            requestBody.num_modes = Number.isFinite(requested) && requested > 0
+                ? Math.floor(requested)
+                : 6;
+        }
+
+        const jobKind = isThermal ? 'thermal' : isModal ? 'modal' : 'solve';
         const { data: job } = await axios.post(
-            `${API_BASE_URL}/api/jobs/${isThermal ? 'thermal' : 'solve'}`,
-            {
-                geometry_filename: modelName,
-                material_id: selectedMaterial?.id || 'structural_steel', // Default if not selected
-                boundary_conditions: validBCs,
-                faces: facesData, // Pass B-Rep face metadata to solver
-                // 几何坐标的长度单位。默认 mm：CAD 零件基本都是毫米，
-                // 后端会换算成米再求解，结果与输入单位无关（SI）。
-                length_unit: solverSettings?.lengthUnit || 'mm'
-            });
+            `${API_BASE_URL}/api/jobs/${jobKind}`,
+            requestBody
+        );
         const solveResult = await pollJob(job.job_id, setSolveJobStatus);
 
         console.log('Solver completed:', solveResult);
@@ -483,6 +539,33 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
                 scalarField: temperaturesK.map(t => t - 273.15),
                 resultKind: 'thermal',
             }));
+        } else if (isModal) {
+            // 模态分析：默认显示第 1 阶振型；阶次切换见 handleSelectMode。
+            // 注意振型是**归一化的相对量**（幅值任意），因此着色场是无量纲的，
+            // 图例必须这么标——否则用户会把颜色读成真实位移。
+            setSelectedMode(0);
+            setMeshData(prev => {
+                const field = modeDisplayField(
+                    solveResult?.mode_shapes,
+                    0,
+                    prev?.nodes?.length || 0
+                );
+                return {
+                    ...prev,
+                    ...solveResult,
+                    resultKind: 'modal',
+                    ...(field ? { ...field, max_displacement: field.maxDisplacement } : {}),
+                };
+            });
+            const frequencies: number[] = Array.isArray(solveResult?.frequencies)
+                ? solveResult.frequencies
+                : [];
+            console.log(
+                '模态结果：%d 阶，f1 = %s，刚体模态 %d 个',
+                frequencies.length,
+                formatFrequency(frequencies[0]),
+                solveResult?.rigid_body_modes ?? 0
+            );
         } else {
             // Merge solver results into meshData (or keep separate)
             // We need to pass stress/displacement to Scene3D
@@ -514,6 +597,14 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
         setIsSolving(false);
       }
   };
+
+  // 结果类型决定图例的语义与单位：结构 → Von Mises(Pa)，
+  // 热分析 → 温度(°C)，模态 → 相对位移(归一化, 无量纲)。
+  // 收敛到一个显式的联合类型，避免把任意字符串透传给 Scene3D。
+  const resolvedResultKind: 'structural' | 'thermal' | 'modal' =
+    meshData?.resultKind === 'thermal' || meshData?.resultKind === 'modal'
+      ? meshData.resultKind
+      : 'structural';
 
   return (
     <div className="flex flex-col h-screen w-screen bg-primary overflow-hidden">
@@ -870,7 +961,11 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
             faces={facesData}
             edges={edgesData}
             vertices={verticesData}
-            resultKind={meshData?.resultKind === 'thermal' ? 'thermal' : 'structural'}
+            resultKind={resolvedResultKind}
+            modeFrequencies={meshData?.frequencies}
+            rigidBodyModes={meshData?.rigid_body_modes}
+            selectedMode={selectedMode}
+            onSelectMode={handleSelectMode}
           />
 
           {/* Bottom Overlay Info */}

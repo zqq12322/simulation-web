@@ -14,6 +14,13 @@ import {
   hasDisplacementField,
   modelSpanOf,
 } from '../utils/deformation';
+import {
+  MODE_LEGEND_TITLE,
+  MODE_LEGEND_UNIT,
+  buildModeList,
+  clampModeIndex,
+  modeHint,
+} from '../utils/modalModes';
 
 interface ModelViewerProps {
   modelUrl?: string | null;
@@ -826,8 +833,17 @@ interface Scene3DProps {
   faces?: any[];
   edges?: any[];
   vertices?: any[];
-  /** 结果类型：结构显示 Von Mises 应力(Pa)，热分析显示温度(°C)。默认结构。 */
-  resultKind?: 'structural' | 'thermal';
+  /** 结果类型：结构显示 Von Mises 应力(Pa)，热分析显示温度(°C)，
+   *  模态显示振型的相对位移（归一化、无量纲）。默认结构。 */
+  resultKind?: 'structural' | 'thermal' | 'modal';
+  /** 模态分析的固有频率列表（Hz），用于阶次选择面板 */
+  modeFrequencies?: number[];
+  /** 后端报告的频率≈0 的刚体模态个数 */
+  rigidBodyModes?: number;
+  /** 当前显示的阶次（0 起） */
+  selectedMode?: number;
+  /** 切换阶次 */
+  onSelectMode?: (index: number) => void;
 }
 
 const Scene3D: React.FC<Scene3DProps> = (props) => {
@@ -871,6 +887,29 @@ const Scene3D: React.FC<Scene3DProps> = (props) => {
       ?? Math.max(0, ...displacementMagnitudes(meshData?.displacements));
     return computeDeformationScale(peak, span);
   }, [hasDisplacements, meshData]);
+
+  // ---- 模态分析：阶次列表与当前阶次的说明 ----
+  const isModal = props.resultKind === 'modal';
+  const rigidBodyModes = Number(props.rigidBodyModes) || 0;
+
+  const modeEntries = useMemo(
+    () => (isModal ? buildModeList(props.modeFrequencies, rigidBodyModes) : []),
+    [isModal, props.modeFrequencies, rigidBodyModes],
+  );
+
+  const activeModeIndex = clampModeIndex(props.selectedMode ?? 0, modeEntries.length);
+  const activeMode = activeModeIndex >= 0 ? modeEntries[activeModeIndex] : null;
+  const activeModeHint = isModal ? modeHint(activeMode, rigidBodyModes) : null;
+
+  /** 图例标题与单位：三种分析类型的物理量不同，不能共用一套标签。 */
+  const legendTitle =
+    props.resultKind === 'thermal' ? '温度'
+      : isModal ? MODE_LEGEND_TITLE
+        : 'Von Mises 应力';
+  const legendUnit =
+    props.resultKind === 'thermal' ? '(°C)'
+      : isModal ? MODE_LEGEND_UNIT
+        : '(Pa)';
 
   return (
     <div className="w-full h-full bg-[#f0f4f8] relative">
@@ -1124,12 +1163,20 @@ const Scene3D: React.FC<Scene3DProps> = (props) => {
             width: '120px'
         }}>
             <h4 style={{margin: 0, fontSize: '12px', fontWeight: '600', color: '#333'}}>
-              {props.resultKind === 'thermal' ? '温度' : 'Von Mises 应力'}
+              {legendTitle}
             </h4>
-            {/* 结构：后端与材料 E 同单位 ⇒ Pa；热分析：Workbench 已把 K 换成 °C */}
+            {/* 结构：后端与材料 E 同单位 ⇒ Pa；热分析：Workbench 已把 K 换成 °C；
+                模态：振型按最大位移归一化 ⇒ **无量纲的相对量** */}
             <span style={{fontSize: '10px', color: '#666'}}>
-              {props.resultKind === 'thermal' ? '(°C)' : '(Pa)'}
+              {legendUnit}
             </span>
+            {/* 模态：当前显示阶次的固有频率（阶次本身在右侧的阶次面板里高亮） */}
+            {isModal && activeMode && (
+              <span style={{fontSize: '10px', color: '#7c3aed', fontWeight: 600}}>
+                {activeMode.label}
+                {activeMode.isRigidBody ? ' ·刚体' : ''}
+              </span>
+            )}
             {/* 变形是放大显示的，必须告知倍数，否则用户会把画面上看到的
                 变形量当成真实位移量。 */}
             {hasDisplacements && (
@@ -1158,8 +1205,77 @@ const Scene3D: React.FC<Scene3DProps> = (props) => {
             </div>
         </div>
 
-        {/* Reaction Forces Display（仅结构分析有意义；热分析没有支反力） */}
-        {props.resultKind !== 'thermal'
+        {/* Modal mode list —— 模态分析的核心交互：点频率切振型。
+            放在图例右侧（热分析/模态没有支反力面板，那一带是空的）。 */}
+        {isModal && modeEntries.length > 0 && (
+          <div style={{
+            position: 'absolute',
+            left: '190px',
+            bottom: '20px',
+            background: 'rgba(255, 255, 255, 0.92)',
+            padding: '12px',
+            borderRadius: '8px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
+            backdropFilter: 'blur(5px)',
+            border: '1px solid #e2e8f0',
+            zIndex: 1000,
+            width: '210px',
+            maxHeight: '300px',
+            overflowY: 'auto',
+          }}>
+            <h4 style={{margin: 0, marginBottom: '6px', fontSize: '12px', fontWeight: '600', color: '#333'}}>
+              固有频率（共 {modeEntries.length} 阶）
+            </h4>
+            <div style={{display: 'flex', flexDirection: 'column', gap: '2px'}}>
+              {modeEntries.map((entry) => {
+                const active = entry.index === activeModeIndex;
+                return (
+                  <button
+                    key={entry.index}
+                    onClick={() => props.onSelectMode?.(entry.index)}
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: '8px',
+                      padding: '4px 6px',
+                      borderRadius: '4px',
+                      border: 'none',
+                      cursor: 'pointer',
+                      textAlign: 'left',
+                      fontSize: '11px',
+                      fontFamily: 'inherit',
+                      background: active ? '#ede9fe' : 'transparent',
+                      color: active ? '#5b21b6' : '#444',
+                      fontWeight: active ? 600 : 400,
+                    }}
+                  >
+                    <span>第 {entry.order} 阶</span>
+                    <span style={{fontFamily: 'monospace'}}>
+                      {entry.label}
+                      {entry.isRigidBody ? ' ·刚体' : ''}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            {activeModeHint && (
+              <p style={{
+                margin: '8px 0 0',
+                paddingTop: '6px',
+                borderTop: '1px solid #e2e8f0',
+                fontSize: '10px',
+                lineHeight: 1.5,
+                color: '#7c3aed',
+              }}>
+                {activeModeHint}
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Reaction Forces Display（仅结构分析有意义；热分析/模态没有支反力） */}
+        {props.resultKind === 'structural'
           && meshData?.reaction_forces
           && Object.keys(meshData.reaction_forces).length > 0 && (
           <div style={{

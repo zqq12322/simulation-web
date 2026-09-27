@@ -43,7 +43,7 @@ const ANALYSIS_TYPES: {
     label: 'Frequency (Modal)',
     tags: ['EIGENMODES', 'LINEAR'],
     description:
-      'Natural frequencies and mode shapes of the structure. The backend solver is implemented (K φ = λ M φ with a consistent mass matrix), but this UI has no mode-selection panel yet, so solving from here is not wired up.',
+      'Natural frequencies and mode shapes of the structure. Solving this gives a frequency list; click any entry to display that mode shape. Loads do not affect natural frequencies in linear modal analysis, so force/pressure/temperature conditions are ignored (with a warning).',
   },
 ];
 
@@ -272,13 +272,15 @@ const SolverSettingsModal: React.FC<SolverSettingsModalProps> = ({
             </div>
 
             <p className="text-xs text-gray-500 leading-relaxed border-t border-[#333844] pt-4">
-              后端已实现 <span className="text-gray-300 font-medium">Static Structural</span>（线弹性静力）、
+              后端与界面已实现三种分析类型：
+              <span className="text-gray-300 font-medium">Static Structural</span>（线弹性静力）、
               <span className="text-gray-300 font-medium">Heat Transfer</span>（稳态热传导；
               至少需要一个「温度」边界条件，未指定的面按绝热处理）与
               <span className="text-gray-300 font-medium">Frequency (Modal)</span>
-              （模态分析）。<span className="text-yellow-500/90">界面目前只会执行前两种</span>——
-              模态分析的后端接口（<code className="text-gray-400">/api/modal/solve</code>）已就绪，
-              但还缺少选择振型的界面，因此从这里选 Modal 不会真正求解。Fluid Flow (CFD) 未实现。
+              （模态分析；求解后在视口内点选阶次查看振型。载荷不影响固有频率，
+              力/压力/温度条件会被忽略并给出提示）。
+              <span className="text-yellow-500/90">Fluid Flow (CFD) 尚未实现</span>——
+              选中它求解会直接报错，不会拿别的分析结果冒充。
             </p>
           </div>
 
