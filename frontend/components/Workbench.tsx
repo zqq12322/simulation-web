@@ -26,7 +26,7 @@ import {
   RefreshCw
 } from 'lucide-react';
 import axios from 'axios';
-import { currentAuthHeaders, isUnauthorized, notifySessionExpired } from '../utils/authApi';
+import { currentAuthHeaders, errorStatus, isUnauthorized, notifySessionExpired } from '../utils/authApi';
 import ImportModal from './ImportModal';
 import Scene3D from './Scene3D';
 import MaterialSelector from './MaterialSelector';
@@ -53,6 +53,8 @@ import {
   fetchModelBlobUrl,
   renderFilenameFor,
 } from '../utils/modelSource';
+import { MeshQuality, toMeshQuality } from '../utils/meshQuality';
+import MeshQualityPanel from './MeshQualityPanel';
 
 interface WorkbenchProps {
   project: Project;
@@ -86,6 +88,14 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   const [showMeshSettingsModal, setShowMeshSettingsModal] = useState(false);
   const [isMeshing, setIsMeshing] = useState(false);
   const [meshData, setMeshData] = useState<any>(null); // Store real mesh data from backend
+  // 网格质量（形状质量）：回答用户最常问的"我的网格行不行"。
+  // 注意它只说明网格**干净不干净**，"够不够细"要靠收敛性检查（尚未实现），
+  // 所以后端结论里那句限定会原样显示，不在前端改写。
+  const [meshQuality, setMeshQuality] = useState<MeshQuality | null>(null);
+  const [meshQualityLoading, setMeshQualityLoading] = useState(false);
+  const [meshQualityError, setMeshQualityError] = useState<string | null>(null);
+  /** 自增请求号：用来丢弃过期的网格质量响应（见 loadMeshQuality） */
+  const meshQualityRequestRef = React.useRef(0);
   const [facesData, setFacesData] = useState<any[]>([]); // Store B-Rep faces data
   const [edgesData, setEdgesData] = useState<any[]>([]); // Store B-Rep edges data
   const [verticesData, setVerticesData] = useState<any[]>([]); // Store B-Rep vertices data
@@ -235,6 +245,17 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
           await loadModelPreview(restored.geometryFilename);
         } else {
           setModelUrl(null);
+        }
+
+        // 配置里若记着"已划网格"，就把质量也取回来。否则重新打开项目会看到
+        // "网格状态是 Meshed、但质量面板一片空白"——和上一轮"视口是空的"
+        // 属于同一类问题：状态说有，界面却不给。
+        if (
+          restored.geometryFilename
+          && (restored.meshSettings?.status === 'meshed'
+            || restored.meshSettings?.status === 'solved')
+        ) {
+          void loadMeshQuality(restored.geometryFilename);
         }
 
         // 记下"刚加载时的样子"：之后只有真正改动才会触发自动保存
@@ -529,6 +550,10 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     setVerticesData([]); // Clear previous vertices
     setLoadedGeometry(null); // Force clearing of previous geometry
     setPreviewError(null);
+    // 换了几何，上一个几何的网格质量就没有意义了。不清掉的话，用户会看到
+    // "新零件 + 旧网格的质量直方图"，而那是最容易被当成真的假信息。
+    setMeshQuality(null);
+    setMeshQualityError(null);
     setShowImportModal(false);
     // Show Solver Settings immediately after import
     setShowSolverSettingsModal(true);
@@ -590,6 +615,59 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     handleGenerateMesh(settings);
   };
 
+  /**
+   * 拉取网格质量（形状质量）。
+   *
+   * 两个容易被忽略的细节：
+   *
+   * 1. **404 / 409 不是故障**：它们分别表示"几何文件不在了"和"还没划网格"，
+   *    也就是用户还没生成网格——此时面板应当安静地不出现，而不是报红把人吓一跳。
+   * 2. **要防过期响应**：连续改网格尺寸会发出多个请求，先发的可能后到。
+   *    这里用自增的请求号丢弃过期响应，否则界面会显示上一次网格的质量
+   *    （数字看着很正常，但对应的是已经不存在的网格）。
+   */
+  const loadMeshQuality = React.useCallback(async (filename: string | null) => {
+    const requestId = ++meshQualityRequestRef.current;
+    const isCurrent = () => requestId === meshQualityRequestRef.current;
+
+    if (!filename) {
+      setMeshQuality(null);
+      setMeshQualityError(null);
+      setMeshQualityLoading(false);
+      return;
+    }
+
+    setMeshQualityLoading(true);
+    setMeshQualityError(null);
+    try {
+      const { data } = await axios.get(`${API_BASE_URL}/api/mesh-quality`, {
+        params: { filename },
+        headers: currentAuthHeaders(),
+      });
+      if (!isCurrent()) return;
+      setMeshQuality(toMeshQuality(data));
+    } catch (error) {
+      if (!isCurrent()) return;
+      if (isUnauthorized(error)) {
+        notifySessionExpired('登录已失效，请重新登录后再检查网格质量。');
+        return;
+      }
+      const status = errorStatus(error);
+      if (status === 404 || status === 409) {
+        setMeshQuality(null);
+        return;
+      }
+      setMeshQuality(null);
+      setMeshQualityError(
+        status === null
+          ? '无法连接后端，网格质量未检查。'
+          : `网格质量检查失败（HTTP ${status}）。`,
+      );
+    } finally {
+      if (isCurrent()) setMeshQualityLoading(false);
+    }
+  }, [API_BASE_URL]);
+
   const handleGenerateMesh = async (settingsOverride?: MeshSettings) => {
     
     if (!modelName) {
@@ -650,6 +728,9 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
 
       // Update status to meshed
       setMeshSettings(prev => prev ? { ...prev, status: 'meshed' } : null);
+
+      // 网格刚划完，正好是问"这个网格行不行"的时机
+      void loadMeshQuality(modelName);
       
     } catch (error) {
       console.error("Mesh generation failed:", error);
@@ -1160,6 +1241,13 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
                                {meshSettings.status === 'meshed' ? 'Meshed' : meshSettings.status === 'solved' ? 'Solved' : meshSettings.status === 'meshing' ? 'Meshing...' : meshSettings.status === 'failed' ? 'Failed' : 'Configured'}
                              </span>
                           </div>
+                        )}
+                        {expandedNodes['mesh'] && (
+                          <MeshQualityPanel
+                            quality={meshQuality}
+                            loading={meshQualityLoading}
+                            error={meshQualityError}
+                          />
                         )}
                       </div>
 

@@ -1502,6 +1502,187 @@ def _check_frontend_model_source_math(node: str) -> tuple[bool, str]:
     return ok, ("下载地址 / 预览名规则 / 失败路径 均符合断言" if ok else detail)
 
 
+#: 网格质量的显示逻辑（纯函数）。
+#:
+#: 重点钉的是"缺失 vs 0"这个区分：质量真的是 0（退化单元）和"后端没给这个字段"
+#: 在界面上必须长得不一样。本项目已经吃过一次亏——`formatFrequency(null)`
+#: 曾经返回 `'0 Hz'`，于是"数据缺失"被显示成"刚体模态"。
+_MESH_QUALITY_SELFTEST = r"""
+import { barHeight, describeQualitySummary, describeQualityWarnings,
+         formatQuality, histogramIsComplete, maxBinCount,
+         toMeshQuality } from './meshQuality.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+// 一份与后端响应同形的数据（字段名照抄 /api/mesh-quality）
+const histogram = [];
+for (let i = 0; i < 10; i += 1) {
+  histogram.push({ lo: i / 10, hi: (i + 1) / 10, count: i === 5 ? 100 : 1 });
+}
+const payload = {
+  status: 'ok', filename: 'default_cube.step', elements: 109, nodes: 40,
+  total_volume: 1000.0,
+  quality: { min: 0.2671, max: 1.0, mean: 0.7559, median: 0.8, p05: 0.31 },
+  edge_ratio_max: 1.9, poor_count: 0, non_positive_volume_count: 0,
+  non_finite_count: 0, histogram,
+  worst_elements: [{ index: 12, quality: 0.2671, volume: 0.5, edgeRatio: 1.9 }],
+  poor_threshold: 0.1,
+  verdict: '单元形状质量良好。注意：形状好不等于网格够细，密度是否足够要看收敛性。',
+};
+
+const mapped = toMeshQuality(payload);
+check('能解析后端响应', mapped !== null);
+check('字段名映射正确（snake_case -> camelCase）',
+      mapped.elements === 109 && mapped.nodes === 40
+      && mapped.edgeRatioMax === 1.9 && mapped.poorThreshold === 0.1,
+      JSON.stringify({ e: mapped.elements, n: mapped.nodes, r: mapped.edgeRatioMax }));
+check('统计量完整', mapped.stats.min === 0.2671 && mapped.stats.p05 === 0.31);
+check('结论原样保留', mapped.verdict.includes('收敛'));
+check('最差单元被解析', mapped.worstElements.length === 1
+      && mapped.worstElements[0].index === 12);
+
+// --- 缺失必须是"缺失"，不能变成 0 -------------------------------------------
+check('缺失输入返回 null（而不是一堆 0）',
+      toMeshQuality(null) === null && toMeshQuality(undefined) === null
+      && toMeshQuality('nope') === null && toMeshQuality(42) === null);
+check('缺 quality 统计量返回 null',
+      toMeshQuality({ ...payload, quality: undefined }) === null);
+check('缺 histogram 返回 null',
+      toMeshQuality({ ...payload, histogram: undefined }) === null);
+check('直方图为空返回 null', toMeshQuality({ ...payload, histogram: [] }) === null);
+check('单元数为 0 返回 null', toMeshQuality({ ...payload, elements: 0 }) === null);
+check('min/max 非数字返回 null',
+      toMeshQuality({ ...payload, quality: { ...payload.quality, min: null } }) === null);
+
+// 关键：真实的值 0 必须仍然显示成 0，只有"非数字"才显示 '—'
+check('质量 0 显示为 0.0000', formatQuality(0) === '0.0000', formatQuality(0));
+check('缺失显示为破折号', formatQuality(null) === '—' && formatQuality(undefined) === '—'
+      && formatQuality('') === '—' && formatQuality('0.5') === '—' && formatQuality(NaN) === '—',
+      `${formatQuality(null)} ${formatQuality('0.5')}`);
+check('数值保留 4 位', formatQuality(0.26705) === '0.2671', formatQuality(0.26705));
+
+// --- 条形高度：空直方图不能产生 NaN ------------------------------------------
+check('最大箱计数', maxBinCount(histogram) === 100, String(maxBinCount(histogram)));
+check('空直方图的最大计数为 0',
+      maxBinCount([]) === 0 && maxBinCount(null) === 0);
+check('条形高度归一化', barHeight(50, 100) === 0.5, String(barHeight(50, 100)));
+check('计数为 0 时高度为 0', barHeight(0, 100) === 0);
+check('除数为 0 时不产生 NaN', barHeight(3, 0) === 0 && Number.isFinite(barHeight(3, 0)));
+check('垃圾输入不产生 NaN', barHeight(null, null) === 0 && barHeight('x', 5) === 0);
+
+// --- 摘要与提醒 ---------------------------------------------------------------
+const summary = describeQualitySummary(mapped);
+check('摘要先给最小值（判断网格能不能用看最差的那个单元）',
+      summary.startsWith('最低 0.2671'), summary);
+check('摘要带上单元数', summary.includes('109 单元'), summary);
+check('没有数据时的摘要不说"很好"',
+      describeQualitySummary(null) === '尚未检查', describeQualitySummary(null));
+
+check('健康网格的提醒', describeQualityWarnings(mapped).join('|').includes('未发现畸形单元'),
+      describeQualityWarnings(mapped).join('|'));
+const bad = toMeshQuality({ ...payload, poor_count: 3, non_positive_volume_count: 2 });
+const badWarnings = describeQualityWarnings(bad).join('|');
+check('畸形单元数被说出来', badWarnings.includes('2 个体积非正') && badWarnings.includes('3 个单元质量低于'),
+      badWarnings);
+check('没有数据时不给提醒', describeQualityWarnings(null).length === 0);
+
+// --- 直方图自洽性 -------------------------------------------------------------
+check('一致的直方图判定为自洽', histogramIsComplete(mapped));
+check('计数对不上时判定为不自洽',
+      !histogramIsComplete(toMeshQuality({ ...payload, elements: 110 })));
+check('没有数据时不自洽', !histogramIsComplete(null));
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+#: 把**后端真实返回**的网格质量喂给前端解析逻辑。
+#:
+#: 与模态那条同理：后端字段一旦改名（`edge_ratio_max` -> `edgeRatioMax`），
+#: 界面只会静默地少显示一项，不报错、不影响任何数值。只有拿真实响应跑一遍
+#: 前端的解析才能发现。而且这里额外断言"直方图计数之和 = 单元数"——
+#: 那条只有在两端对"什么算一个单元"的理解一致时才成立。
+_MESH_QUALITY_DISPLAY_CHAIN_SELFTEST = r"""
+import { readFileSync } from 'node:fs';
+import { describeQualitySummary, histogramIsComplete,
+         toMeshQuality } from './meshQuality.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+const raw = JSON.parse(readFileSync(process.env.SIMCLOUD_MESH_QUALITY_PAYLOAD, 'utf8'));
+const quality = toMeshQuality(raw);
+
+check('真实响应能被前端解析（否则界面什么都不显示）', quality !== null);
+if (quality) {
+  check('单元数一致', quality.elements === raw.elements,
+        `${quality.elements} vs ${raw.elements}`);
+  check('节点数一致', quality.nodes === raw.nodes);
+  check('最小值一致', quality.stats.min === raw.quality.min);
+  check('最大值一致', quality.stats.max === raw.quality.max);
+  check('棱长比上限映射成功', quality.edgeRatioMax === raw.edge_ratio_max,
+        `${quality.edgeRatioMax} vs ${raw.edge_ratio_max}`);
+  check('直方图自洽（各箱计数之和 = 单元数）', histogramIsComplete(quality));
+  check('直方图箱数与后端一致', quality.histogram.length === raw.histogram.length);
+  check('结论非空且点出收敛性', quality.verdict.length > 0 && quality.verdict.includes('收敛'),
+        quality.verdict);
+  check('摘要能直接显示', describeQualitySummary(quality).includes(`${raw.elements} 单元`),
+        describeQualitySummary(quality));
+  if (raw.worst_elements.length > 0) {
+    check('最差单元被解析', quality.worstElements.length === raw.worst_elements.length);
+    check('最差单元的质量与后端一致',
+          quality.worstElements[0].quality === raw.worst_elements[0].quality);
+  }
+}
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+def _check_frontend_mesh_quality_math(node: str) -> tuple[bool, str]:
+    """用 node 执行 `frontend/utils/meshQuality.ts` 里的纯逻辑并断言其行为。"""
+    ok, detail = _run_node_module_selftest(node, _MESH_QUALITY_SELFTEST)
+    return ok, ("缺失≠0 / 完整映射 / 直方图自洽性 均符合断言" if ok else detail)
+
+
+def _check_mesh_quality_display_chain(node: str, payload: dict) -> tuple[bool, str]:
+    """把后端真实返回的网格质量喂给前端解析逻辑（字段改名会在这里暴露）。"""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".json", delete=False, encoding="utf-8"
+    ) as handle:
+        json.dump(payload, handle)
+        path = handle.name
+
+    try:
+        ok, detail = _run_node_module_selftest(
+            node,
+            _MESH_QUALITY_DISPLAY_CHAIN_SELFTEST,
+            {"SIMCLOUD_MESH_QUALITY_PAYLOAD": path},
+        )
+    finally:
+        os.unlink(path)
+
+    stats = payload.get("quality") or {}
+    return ok, (f"{payload.get('elements', 0)} 单元，最低质量 {stats.get('min')}，"
+                f"直方图与解析链均通过" if ok else detail)
+
+
+
 def _check_modal_display_chain(node: str, payload: dict) -> tuple[bool, str]:
     """
     把后端真实返回的模态结果喂给前端的取场逻辑。
@@ -1576,6 +1757,9 @@ def task_verify(args: argparse.Namespace) -> int:
 
             passed, detail = _check_frontend_model_source_math(node_bin)
             check("几何取用与鉴权（node 执行前端纯逻辑）", passed, detail)
+
+            passed, detail = _check_frontend_mesh_quality_math(node_bin)
+            check("网格质量显示逻辑（缺失≠0，node 执行前端纯函数）", passed, detail)
         else:
             check("TypeScript 类型检查", False, "未找到 node")
 
@@ -1756,6 +1940,90 @@ def task_verify(args: argparse.Namespace) -> int:
                 )
         except Exception as exc:
             check("API 冒烟测试", False, f"{type(exc).__name__}: {exc}")
+
+        # --- 网格质量：把"我的网格行不行"变成可对照的量 ---------------------------
+        # 对照值是**解析体积**：default_cube.step 是 10×10×10 的立方体，体积恰好
+        # 1000。单元体积之和只有在「节点映射、朝向修正、四面体体积公式」三者
+        # 同时对的时候才等于它，所以这一段同时覆盖 /api/mesh-quality 与
+        # fe_utils.load_tet_mesh_from_msh。
+        #
+        # 刻意**不**断言"结果有限/非 NaN"：那种断言在数量级错 1e6 倍时照样通过，
+        # 本项目已经吃过这个亏（见 docs/03 面载荷精度那一条）。
+        try:
+            # default_cube.step 是**被 git 跟踪**的几何文件，而 POST /api/generate-cube
+            # 会重新写出它——STEP 里带时间戳，字节必然不同。无条件调用会让每次
+            # verify 都把工作区弄脏，并在提交里混进一个"几何看起来变了"的二进制
+            # diff。所以只在缺失时才生成（新克隆的仓库本来就已经有这个文件）。
+            if _http_status(
+                "GET",
+                f"{API_BASE}/api/geometry/default_cube.step/metadata",
+                headers=api_headers,
+            ) != 200:
+                _http_json("POST", f"{API_BASE}/api/generate-cube", headers=api_headers)
+            cube_mesh = _http_json(
+                "POST",
+                f"{API_BASE}/api/generate-mesh?filename=default_cube.step&mesh_size=1.5",
+                headers=api_headers,
+            )
+            quality = _http_json(
+                "GET",
+                f"{API_BASE}/api/mesh-quality?filename=default_cube.step",
+                headers=api_headers,
+            )
+            check(
+                "网格质量：单元体积之和 = 立方体解析体积 1000",
+                abs(quality["total_volume"] - 1000.0) < 1e-6,
+                f"calc={quality['total_volume']:.9f} expect=1000",
+            )
+            check(
+                "网格质量：无退化或朝向错误的单元",
+                quality["non_positive_volume_count"] == 0
+                and quality["non_finite_count"] == 0,
+                f"非正体积={quality['non_positive_volume_count']} "
+                f"非有限={quality['non_finite_count']}",
+            )
+            check(
+                "网格质量：形状质量落在 (0, 1]",
+                0.0 < quality["quality"]["min"]
+                and quality["quality"]["max"] <= 1.0 + 1e-12,
+                f"min={quality['quality']['min']:.4f} max={quality['quality']['max']:.4f} "
+                f"mean={quality['quality']['mean']:.4f}",
+            )
+            # 直方图必须覆盖全部单元：被丢掉的往往是畸形单元，而那正是最需要被看到的
+            histogram_total = sum(bin_["count"] for bin_ in quality["histogram"])
+            check(
+                "网格质量：直方图计数之和 = 单元数",
+                histogram_total == quality["elements"] and quality["elements"] > 0,
+                f"{histogram_total}/{quality['elements']}",
+            )
+            # 两个端点各自读同一个 .msh，单元/节点数必须一致（否则其中一条读取路径有问题）
+            check(
+                "网格质量：单元/节点数与生成网格接口一致",
+                quality["elements"] == len(cube_mesh["elements"])
+                and quality["nodes"] == len(cube_mesh["nodes"]),
+                f"{quality['elements']} 单元 / {quality['nodes']} 节点",
+            )
+            # "形状好" != "网格够细"：结论里必须点出这一点，否则用户会把
+            # 直方图好看直接当成结果可信（那是两件事，密度要看收敛性）。
+            check(
+                "网格质量：结论点出『形状好≠够细』",
+                "收敛" in quality["verdict"],
+                quality["verdict"],
+            )
+            check(
+                "网格质量：未登录被拒",
+                _http_status(
+                    "GET", f"{API_BASE}/api/mesh-quality?filename=default_cube.step"
+                ) == 401,
+                "不带令牌应返回 401",
+            )
+            # 真实响应 -> 前端解析：字段改名只会让界面"静默地少显示一项"，
+            # 造一份假数据是测不出来的（与模态那条同理）。
+            if node_bin:
+                passed, detail = _check_mesh_quality_display_chain(node_bin, quality)
+                check("网格质量前端契约（真实响应对接解析逻辑）", passed, detail)
+        except Exception as exc:
+            check("网格质量检查", False, f"{type(exc).__name__}: {exc}")
 
         info("\n=== 5/7 求解器物理校准 ===")
         try:
