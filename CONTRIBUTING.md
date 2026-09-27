@@ -71,7 +71,7 @@ make dev                # 或 python3 tools/tasks.py dev
 | 命令（跨平台） | Windows 等价 | 验证什么 | 需要服务在跑吗 | 何时用 |
 |---|---|---|---|---|
 | `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**249** 个用例，约 8 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
-| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准 + 认证与隔离（**52** 项） | 需要 | 提交前跑一次 |
+| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准 + 认证与隔离（**56** 项） | 需要 | 提交前跑一次 |
 | `make build` | — | 前端类型检查 + 生产构建 | 不需要 | 改前端后 |
 | CI（`.github/workflows/ci.yml`） | — | 上面几项的自动化版本 | 不需要 | push / PR 时自动跑 |
 
@@ -243,6 +243,8 @@ class YourTest(unittest.TestCase):
 | 看到项目标着"未归属"，改名/删除按钮不见了 | 那是**接上登录之前**创建的项目（`owner_id IS NULL`）。策略是"可见但不可改"，点卡片上的「认领」即可；这是刻意设计——初版做过"第一个注册的用户自动接管"，结果把用户的项目静默划给了 `verify` 的测试账号 |
 | 列表里出现 `verify_alice` / `verify_bob` | 这是 `tools/tasks.py verify` 用的**固定测试账号**（登录优先，不存在才注册），故意不每次新建用户。它们只会看到自己的项目 |
 | 接口返回 401 但口令明明是对的 | 先看是不是令牌过期（默认 30 天，`SIMCLOUD_TOKEN_TTL_DAYS` 可调）；前端在启动时会调 `/api/auth/me` 校验，失效就回登录页。另外注意"连不上后端"与 401 是两回事，前端会分别提示 |
+| 用 `curl` 调接口一律返回 401 | **除 `/`、`/api/health`、`/api/auth/*` 外，所有端点都要求登录**（八个计算类 router 用路由级依赖统一保护）。先 `curl -X POST .../api/auth/login -d '{"username":..,"password":..}'` 拿 token，再加 `-H "Authorization: Bearer $TOKEN"` |
+| `git status` 显示文件被改了，`git diff` 却是空的 | 索引的 stat 缓存过期（常见于用脚本改过文件、或换行符被规范化过）。`git add <这些文件>` 刷新即可——内容其实没变，不会产生改动 |
 
 ## 10. 下一步该做什么
 
