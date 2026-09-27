@@ -70,8 +70,8 @@ make dev                # 或 python3 tools/tasks.py dev
 
 | 命令（跨平台） | Windows 等价 | 验证什么 | 需要服务在跑吗 | 何时用 |
 |---|---|---|---|---|
-| `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**156** 个用例，约 3.6 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
-| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准（**27** 项） | 需要 | 提交前跑一次 |
+| `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**184** 个用例，约 4 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
+| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准 + 项目 CRUD（**35** 项） | 需要 | 提交前跑一次 |
 | `make build` | — | 前端类型检查 + 生产构建 | 不需要 | 改前端后 |
 | CI（`.github/workflows/ci.yml`） | — | 上面几项的自动化版本 | 不需要 | push / PR 时自动跑 |
 
@@ -130,19 +130,25 @@ backend/
 ├── fe_utils.py        # 共享 FE 基础设施：读网格、归属面积、面→节点定位、矢量解析
 ├── jobs.py            # 后台任务：单线程工作器 + /api/jobs/*
 ├── gmsh_session.py    # Gmsh 会话（主线程初始化一次，进程内复用）
-├── material_store.py  # 材料持久化（SQLite）
+├── sqlite_store.py    # ★ SQLite 存储基类：连接/事务/**关闭** + 幂等加列迁移
+├── material_store.py  # 材料持久化（继承 sqlite_store）
+├── project_store.py   # 项目持久化（继承 sqlite_store）
 ├── materials.py       # 材料库
+├── projects.py        # 项目管理 API（/api/projects 增删改查）
 ├── constraints.py     # 边界条件模型与设置校验
 ├── ai_assistant.py    # DeepSeek 助手
 ├── supabase_client.py # 可选云存储
 └── tests/             # unittest 测试（无需服务器）
 frontend/
 ├── index.tsx          # React 入口（注意不是 src/main.tsx）
-├── App.tsx            # 落地页 → 仪表盘 → 工作台
+├── App.tsx            # 落地页 → 仪表盘 → 工作台（项目列表来自后端）
 ├── types.ts           # 全局类型契约
 ├── components/        # 11 个组件，Workbench 是总调度、Scene3D 是 3D 视口
 │   └── resultShader.ts  # 结果云图 GLSL（彩虹映射 + 变形显示）
-└── utils/deformation.ts # 变形放大系数（纯函数，verify 会用 node 直接跑它）
+└── utils/             # 不依赖框架的纯函数（verify 会用 node 直接跑它们）
+    ├── deformation.ts   # 变形放大系数
+    ├── modalModes.ts    # 模态阶次列表 / 频率格式化 / 振型取场
+    └── projectsApi.ts   # 项目记录的接口↔界面映射、错误翻译
 tools/
 └── tasks.py           # ★ 跨平台任务入口（setup/dev/test/verify/build/clean/doctor）
 Dockerfile             # 后端镜像（含 Gmsh 系统库）
@@ -228,6 +234,8 @@ class YourTest(unittest.TestCase):
 | 测试报 `OSError: access violation reading 0x0` | 有后台任务还在工作线程里跑 gmsh，主线程又并发调用了 gmsh。这不是"gmsh 装坏了"：先轮询到任务终态再断言，并在 `tearDown` 里排空队列（见 §4.2 第 1 条） |
 | 模态分析里"加了载荷但频率没变" | **这是正确的**：线性模态分析的固有频率与载荷幅值无关，载荷类边界条件会被忽略并给出警告 |
 | 模态分析报 `num_modes` 超范围 | 允许 1–30。约束过多导致可求自由度不足时也会报 400 |
+| 用 PowerShell 手工调接口时中文变乱码 | **不是后端的问题**。Windows PowerShell 5.1 的 `Invoke-RestMethod`：发 body 时按 ANSI 编码 ⇒ 中文变 `?`；解析 JSON 响应时按 ISO-8859-1 解码 ⇒ 中文变 `éå¯...`。直接读 SQLite 会看到存的是正确的中文。断言编码相关行为请用 Python（`tools/tasks.py` 里的 `_http_json` 显式 `encode/decode('utf-8')`）或浏览器 |
+| 项目列表空了 / 报"无法连接后端" | 项目存在 `backend/data/simcloud.db`（可用 `SIMCLOUD_DB` 改）。先确认后端在跑；这是**唯一**一份数据，删掉它项目就没了 |
 
 ## 10. 下一步该做什么
 
@@ -239,6 +247,6 @@ class YourTest(unittest.TestCase):
 **网格质量与收敛性**。再往后最值得投入的是：
 
 1. **模态分析的前端接线**（选振型、按位移着色）——后端已就绪，界面上还没有入口；
-2. **项目持久化 + 登录**（阶段 3 的最大一块，现在项目管理还是前端 mock）；
+2. **登录与用户隔离**（项目持久化已落地，但还没有"谁拥有哪个项目"）；
 3. **结果后处理**：剖切面、等值面、变形动画、CSV/VTK/PNG 导出；
 4. **网格质量直方图与 h 收敛性检查**（阶段 2 收尾）。

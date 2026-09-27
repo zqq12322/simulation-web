@@ -16,7 +16,7 @@
 | 几何/网格 | Gmsh 4.15（内置 OpenCASCADE 内核），支持 STEP / IGES / STL |
 | 求解器 | scikit-fem 12：**线弹性静力** + **稳态热传导** + **模态分析**（线性四面体单元） |
 | AI | DeepSeek（OpenAI 兼容接口） |
-| 存储 | 本地 `uploads/` 目录；Supabase Storage 可选（未配置时自动禁用） |
+| 存储 | 本地 `uploads/` 目录；SQLite（标准库）存自定义材料与**项目**；Supabase Storage 可选（未配置时自动禁用） |
 | 部署 | Vercel（`vercel.json`：Python Serverless + 静态前端） |
 
 ## 2. 目录结构
@@ -38,6 +38,9 @@
 │   ├── modal.py                # ★ 模态分析：K φ = λ M φ（第三个分析类型）
 │   ├── gmsh_session.py         # Gmsh 会话（主线程初始化一次，进程内复用）
 │   ├── material_store.py       # 材料库持久化（SQLite）
+│   ├── project_store.py        # ★ 项目持久化（SQLite）：ID/时间戳由服务端生成
+│   ├── sqlite_store.py         # ★ SQLite 存储基类：连接/事务/**关闭** + 幂等加列迁移
+│   ├── projects.py             # ★ 项目管理 API（/api/projects 增删改查）
 │   ├── generate_step.py        # 生成测试件（方块挖通孔）
 │   ├── generate_stl.py
 │   ├── tests/                  # unittest 回归测试（含物理校准，无需启动服务器）
@@ -57,7 +60,8 @@
 │   │   └── ...
 │   ├── utils/
 │   │   ├── deformation.ts      # 变形放大系数与顶点属性（纯函数，可被 node 直接测试）
-│   │   └── modalModes.ts       # 模态阶次列表 / 频率格式化 / 振型取场（同上）
+│   │   ├── modalModes.ts       # 模态阶次列表 / 频率格式化 / 振型取场（同上）
+│   │   └── projectsApi.ts      # 项目记录的接口↔界面映射、错误翻译（同上）
 │   └── dist/                   # 生产构建产物
 ├── docs/                       # 项目文档（先读这里）
 │   ├── 01-开发流程与长期计划.md
@@ -154,7 +158,13 @@ cd frontend && npm run dev
 | GET | `/api/health` | 健康检查（含上传目录绝对路径，供 CI/容器探针使用） |
 | GET | `/api/materials` | 材料列表 |
 | GET | `/api/materials/{id}` | 单个材料 |
-| POST | `/api/materials` | 新增自定义材料（内存，重启丢失） |
+| POST | `/api/materials` | 新增自定义材料（SQLite 持久化，重启不丢） |
+| **GET** | **`/api/projects`** | **项目列表**（最新建的在前；来自 SQLite） |
+| **POST** | **`/api/projects`** | **新建项目**（201；ID 与时间戳由服务端生成，请求体里带 `id` 会 422） |
+| **GET** | **`/api/projects/{id}`** | 单个项目（不存在 404） |
+| **PATCH** | **`/api/projects/{id}`** | 改名/改描述/改类型/改可见性（一个字段都没给则 400） |
+| **DELETE** | **`/api/projects/{id}`** | 删除项目（不存在 404，而不是假装删掉了） |
+| **GET** | **`/api/project-metadata`** | 可选分析类型与字段长度上限（供前端渲染，避免两处硬编码） |
 | POST | `/api/generate-cube` | 生成 10×10×10 演示立方体 STEP |
 | POST | `/api/upload-geometry` | 上传几何；STEP/IGES 自动转 STL 供网页预览 |
 | GET | `/api/geometry/{filename}/metadata` | 提取 B-Rep 面/边/顶点（类型、面积、中心、法线） |
@@ -178,8 +188,8 @@ cd frontend && npm run dev
 已验证通过：
 
 - `tsc --noEmit` 无错误；`vite build` 成功；
-- **`python3 tools/tasks.py test`：156 个后端用例全部通过**（约 3.6 秒，无需启动服务器）；
-- **`python3 tools/tasks.py verify`：27 项端到端检查全部通过**；
+- **`python3 tools/tasks.py test`：184 个后端用例全部通过**（约 4 秒，无需启动服务器）；
+- **`python3 tools/tasks.py verify`：35 项端到端检查全部通过**；
 - 全流程跑通：上传 → 网格 → 求解 → 云图（含变形显示）；
 - 求解器物理正确性抽查：10×10×10 立方体轴向拉伸，加载面中心位移 `4.17e-10` vs 解析解 `FL/AE = 5e-10`（比值 0.835，全约束端略刚于自由杆，符合预期）；支反力合计与施加载荷精确抵消。
 
@@ -218,7 +228,7 @@ cd frontend && npm run dev
 | ~~单位制~~ | ✅ 已支持 `m` / `mm`：前端可选，后端换算成米再求解，结果一律 SI（位移 m、应力 Pa） | 换单位后物理结果一致（应力 ×1000²、位移 ×1000） |
 | 几何拾取 | 面标签靠包围盒中心近似 | 复杂件上标签可能错位 |
 | 结果后处理 | 整体云图 + **真实变形显示**（放大系数按模型尺度自动取，图例标注倍数）+ **模态振型选择**（阶次面板，标注刚体模态） | 无剖切/等值面/动画/报告导出 |
-| 项目管理 | 前端内存 mock，刷新即丢 | 无登录/数据库 |
+| 项目管理 | ✅ **已持久化**：项目存在后端 SQLite，跨刷新与后端重启都在；支持新建/改名/删除 | **无登录与用户隔离**——所有人共用一份项目列表（阶段 3 下一块） |
 | 长任务 | ✅ 已提供异步任务接口 `/api/jobs/*`（提交→轮询），前端已改用；任务在**单线程**工作器里排队（gmsh 非线程安全） | 任务表在进程内，**服务重启即丢**（生产级需外部队列） |
 | 前端 i18n | 中英文混杂 | 体验不统一 |
 | LandingPage | 部分按钮为占位链接 | 无实际功能 |
@@ -244,7 +254,37 @@ cd frontend && npm run dev
 
 ## 8. 整理记录
 
-### 阶段 3 · 模态分析前端接线（本轮新增）
+### 阶段 3 · 项目持久化（本轮新增）
+
+> 在此之前后端**根本没有"项目"这个实体**：仪表盘上的项目列表是 `App.tsx` 里
+> 一个硬编码数组（`{ id: '1', title: 'Aerodynamic Wing v3' }`），新建项目只存在
+> 浏览器内存里。刷新就丢，重启更是全丢，**也无法被引用或共享**——而"可协作"
+> 的前提是存在一个可以被共享的对象。
+
+| 项 | 落地内容 | 意义 |
+|---|---|---|
+| `project_store.py` | SQLite 表 `projects`：id / 标题 / 描述 / 分析类型 / 是否私有 / 创建与更新时间 | 项目成为一等持久化实体 |
+| `sqlite_store.py` | 抽出 SQLite 存储基类：连接、事务、**显式关闭**、幂等加列迁移；`MaterialStore` 改为继承 | `_cursor` 那段编码了一个真实 bug（`with sqlite3.connect()` 不关闭连接 ⇒ 句柄泄漏并锁库）。这类规则写两遍一定会漂移 |
+| `/api/projects` CRUD | 增删改查 + `GET /api/project-metadata` | 前端不再依赖 mock |
+| **ID 由服务端生成** | 请求体里带 `id` 直接 422，而不是静默忽略 | 客户端能自选主键就能覆盖别人的记录；静默忽略则会让用户以为按自己的 ID 存下了 |
+| **排序按 `rowid`** | 不按 `created_at`（只精确到秒，同一秒内顺序不确定） | 否则"最新在前"会时好时坏——典型的 flaky 测试来源 |
+| 前端接线 | `App.tsx` 改为挂载时拉取、新建走 POST、卡片可删除；补上加载中 / 失败可重试 / 空列表三种状态 | 后端不可用时**说出来**，而不是显示空列表让用户以为项目丢了 |
+| **修掉一个接入即崩的 bug** | 旧代码 `proj.createdAt.toLocaleDateString()`：后端返回的是 **ISO 字符串**，字符串没有这个方法 | 时间戳解析集中到 `utils/projectsApi.ts` 一个边界上，界面其余部分可以放心用 `Date` |
+| 未实现的意图 | `owner_id` 与鉴权**故意没加** | 一个"存在但没人校验"的属主字段比没有更危险：它会让人以为数据已经隔离了。真正接登录时再加列，`SqliteStore.migrations` 就是为这种演进准备的 |
+
+**验证**（104 个新用例里的 28 个 + `verify` 新增 8 项）
+
+| 层次 | 断言 | 实测 |
+|---|---|---|
+| 存储 | 换 store 实例（模拟重启）数据仍在 | ✅ |
+| 存储 | 同一秒内连建 5 个项目，顺序严格"最新在前" | ✅ |
+| 存储 | 项目库与材料库**共用同一个 SQLite 文件**且互不干扰 | ✅ |
+| HTTP | 201 / 404 / 400 / 422 各自的触发条件 | ✅ |
+| HTTP | 请求体带 `id` 或空标题 → 422 | ✅ |
+| **端到端** | **建项目 → 停后端 → 起后端 → 按 ID 取回** | ✅ 标题、描述、类型、可见性完全一致；中文与 emoji 原样往返；PATCH 也正常 |
+| 前端 | node 直接执行 `projectsApi.ts`：映射、时间戳解析、错误翻译 | ✅ 含"字符串没有 `toLocaleDateString`"这条崩溃回归断言 |
+
+### 阶段 3 · 模态分析前端接线
 
 > 上一轮只做了后端，`SolverSettingsModal` 里只能如实标注"模态已实现但界面未接线"。
 > 本轮把它接上——界面上不再有"已实现却点不了"的功能。
