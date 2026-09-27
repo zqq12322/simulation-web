@@ -70,7 +70,7 @@ make dev                # 或 python3 tools/tasks.py dev
 
 | 命令（跨平台） | Windows 等价 | 验证什么 | 需要服务在跑吗 | 何时用 |
 |---|---|---|---|---|
-| `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**57** 个用例，约 0.5 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
+| `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**68** 个用例，约 0.6 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
 | `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准（**11** 项） | 需要 | 提交前跑一次 |
 | `make build` | — | 前端类型检查 + 生产构建 | 不需要 | 改前端后 |
 | CI（`.github/workflows/ci.yml`） | — | 上面几项的自动化版本 | 不需要 | push / PR 时自动跑 |
@@ -80,6 +80,17 @@ make dev                # 或 python3 tools/tasks.py dev
 校验结果——这套仿真的价值全在"结果是对的"，破坏它比写出 bug 更糟。
 （历史上正因为只断言"应力有限"，漏掉了一个把应力放大 1e7 倍的错误，
 详见 `docs/03-修复记录.md` 第五节。）
+
+**要加新功能（边界条件/分析类型）之前，先读 [`docs/04-如何扩展求解器.md`](docs/04-如何扩展求解器.md)** ——
+里面有数据流、分步做法、验证判据表和已知陷阱。
+
+需要后台起服务（例如在脚本/CI 里接着跑 verify）：
+
+```bash
+python3 tools/tasks.py dev --detach   # 启动后立即返回
+python3 tools/tasks.py verify
+python3 tools/tasks.py stop           # 收干净
+```
 
 ## 5. 代码结构导航
 

@@ -38,6 +38,9 @@ IS_WINDOWS = os.name == "nt"
 API_BASE = os.environ.get("SIMCLOUD_API", "http://127.0.0.1:8000")
 FRONTEND_URL = os.environ.get("SIMCLOUD_FRONTEND", "http://localhost:3000")
 
+#: `dev --detach` 记录子进程 PID，供 `stop` 使用
+_STATE_FILE = ROOT / ".dev-pids.json"
+
 # ---------------------------------------------------------------- 输出helpers
 
 def _configure_streams() -> None:
@@ -166,18 +169,28 @@ def task_build(args: argparse.Namespace) -> int:
 
 
 def task_dev(args: argparse.Namespace) -> int:
-    """同时启动前后端；Ctrl+C 一起停。"""
+    """
+    启动前后端。
+
+    默认前台运行，Ctrl+C 一起停（适合人工开发）。
+    加 ``--detach`` 则后台运行并立即返回（适合脚本 / CI：启动后接着跑 verify）。
+    """
     python = require_venv()
-    node = require_node()
+    require_node()
     npm = "npm.cmd" if IS_WINDOWS else "npm"
 
+    backend_cmd = [
+        str(python), "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000",
+    ]
+    frontend_cmd = [npm, "run", "dev"]
+
+    if args.detach:
+        return _dev_detached(backend_cmd, frontend_cmd)
+
     info(f"启动后端 {API_BASE} ...")
-    backend = subprocess.Popen(
-        [str(python), "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000"],
-        cwd=str(BACKEND),
-    )
+    backend = subprocess.Popen(backend_cmd, cwd=str(BACKEND))
     info(f"启动前端 {FRONTEND_URL} ...")
-    frontend = subprocess.Popen([npm, "run", "dev"], cwd=str(FRONTEND))
+    frontend = subprocess.Popen(frontend_cmd, cwd=str(FRONTEND))
 
     try:
         for _ in range(30):
@@ -188,12 +201,7 @@ def task_dev(args: argparse.Namespace) -> int:
         else:
             warn("后端 30 秒内未就绪，请查看上面的输出")
 
-        print()
-        print(_c("=" * 52, "cyan"))
-        print(f"  前端   : {FRONTEND_URL}")
-        print(f"  后端   : {API_BASE}")
-        print(f"  API文档: {API_BASE}/docs")
-        print(_c("=" * 52, "cyan"))
+        _print_urls()
         print("按 Ctrl+C 停止两个服务。")
 
         backend.wait()
@@ -202,13 +210,111 @@ def task_dev(args: argparse.Namespace) -> int:
         info("\n正在停止服务 ...")
     finally:
         for process in (frontend, backend):
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+            _terminate(process)
     return 0
+
+
+def _dev_detached(backend_cmd: list, frontend_cmd: list) -> int:
+    """后台启动前后端，等后端就绪后返回；PID 写入 .dev-pids.json 供 stop 使用。"""
+    if _STATE_FILE.exists():
+        warn("检测到 .dev-pids.json，可能已有后台服务；先执行 `stop` 或删除该文件")
+
+    backend_log = ROOT / ".dev-backend.log"
+    frontend_log = ROOT / ".dev-frontend.log"
+
+    info(f"后台启动后端（日志：{backend_log.name}）...")
+    backend = _spawn_detached(backend_cmd, BACKEND, backend_log)
+    info(f"后台启动前端（日志：{frontend_log.name}）...")
+    frontend = _spawn_detached(frontend_cmd, FRONTEND, frontend_log)
+
+    _STATE_FILE.write_text(
+        json.dumps({"backend": backend.pid, "frontend": frontend.pid}), encoding="utf-8"
+    )
+
+    for _ in range(30):
+        time.sleep(1)
+        if _health_ok():
+            ok("后端已就绪")
+            break
+    else:
+        warn(f"后端 30 秒内未就绪，请查看 {backend_log}")
+
+    _print_urls()
+    print(f"已在后台运行（PID 记录在 {_STATE_FILE.name}）。停止：python3 tools/tasks.py stop")
+    return 0
+
+
+def task_stop(args: argparse.Namespace) -> int:
+    """停止由 `dev --detach` 启动的后台服务。"""
+    if not _STATE_FILE.exists():
+        warn(f"未找到 {_STATE_FILE.name}，说明没有由本工具后台启动的服务")
+        return 0
+
+    try:
+        state = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        fail(f"{_STATE_FILE.name} 读取失败：{exc}")
+        return 1
+
+    stopped = []
+    for name, pid in state.items():
+        if _kill_tree(int(pid)):
+            stopped.append(f"{name}(PID {pid})")
+
+    _STATE_FILE.unlink(missing_ok=True)
+    if stopped:
+        ok("已停止：" + "、".join(stopped))
+    else:
+        info("记录的进程已经不在运行")
+    return 0
+
+
+def _spawn_detached(cmd: list, cwd: Path, log_path: Path):
+    """跨平台地启动一个脱离父进程的子进程，输出重定向到日志文件。"""
+    log = open(log_path, "ab")
+    kwargs: dict = {"cwd": str(cwd), "stdout": log, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(cmd, **kwargs)
+
+
+def _kill_tree(pid: int) -> bool:
+    """结束进程及其子进程（Windows 上用 taskkill /T，POSIX 上用进程组）。"""
+    try:
+        if IS_WINDOWS:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+            )
+            return result.returncode == 0
+        os.killpg(os.getpgid(pid), 15)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def _terminate(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+
+def _print_urls() -> None:
+    print()
+    print(_c("=" * 52, "cyan"))
+    print(f"  前端   : {FRONTEND_URL}")
+    print(f"  后端   : {API_BASE}")
+    print(f"  API文档: {API_BASE}/docs")
+    print(_c("=" * 52, "cyan"))
 
 
 def task_clean(args: argparse.Namespace) -> int:
@@ -445,6 +551,7 @@ def task_doctor(args: argparse.Namespace) -> int:
 TASKS = {
     "setup": task_setup,
     "dev": task_dev,
+    "stop": task_stop,
     "test": task_test,
     "verify": task_verify,
     "build": task_build,
@@ -466,6 +573,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--skip-frontend",
         action="store_true",
         help="verify 时跳过前端类型检查（例如没装 node 的纯后端环境）",
+    )
+    parser.add_argument(
+        "--detach",
+        action="store_true",
+        help="dev 时后台运行并立即返回（配合 stop 使用；适合脚本/CI）",
     )
     args = parser.parse_args(argv)
     return TASKS[args.task](args)

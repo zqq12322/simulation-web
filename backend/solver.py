@@ -46,6 +46,11 @@ def _parse_pressure(bc) -> float:
     return 0.0
 
 
+def _parse_displacement(bc) -> tuple:
+    """取强制位移值，统一成 ``(ux, uy, uz)``（dict / Vector3 / list 均可）。"""
+    return _parse_force(getattr(bc, "displacement", None))
+
+
 def load_tet_mesh_from_msh(msh_path: str):
     """
     Build a scikit-fem tetrahedral mesh directly with Gmsh.
@@ -279,10 +284,11 @@ async def solve_simulation(request: SolverRequest):
         #   B. 退化路径：拿不到三角形时（例如网格由老版本生成），沿用几何搜索
         #      （点到平面距离 / 包围盒），并按节点数平均分配合力。
         f = np.zeros(basis_vec.N)
-        fixed_dofs = []
+        #: DOF → 指定位移值。0 表示固定约束（齐次），非 0 表示强制位移（非齐次）。
+        prescribed_dofs: Dict[int, float] = {}
         solver_warnings: List[str] = []
 
-        supported_types = {"fixed", "force", "pressure"}
+        supported_types = {"fixed", "displacement", "force", "pressure"}
         model_centroid = mesh.p.mean(axis=1)
 
         for bc in request.boundary_conditions:
@@ -301,7 +307,7 @@ async def solve_simulation(request: SolverRequest):
             if bc.type not in supported_types:
                 message = (
                     f"边界条件「{bc.name}」的类型 '{bc.type}' 暂未被求解器支持，已忽略"
-                    "（当前支持：固定约束 / 力载荷 / 压力）"
+                    "（当前支持：固定约束 / 强制位移 / 力载荷 / 压力）"
                 )
                 logger.warning(message)
                 solver_warnings.append(message)
@@ -364,9 +370,45 @@ async def solve_simulation(request: SolverRequest):
             # ---- 施加 ---------------------------------------------------------
             if bc.type == "fixed":
                 for node_idx in target_nodes_indices:
-                    fixed_dofs.append(basis_vec.nodal_dofs[0][node_idx])
-                    fixed_dofs.append(basis_vec.nodal_dofs[1][node_idx])
-                    fixed_dofs.append(basis_vec.nodal_dofs[2][node_idx])
+                    for component in range(3):
+                        prescribed_dofs[int(basis_vec.nodal_dofs[component][node_idx])] = 0.0
+
+            elif bc.type == "displacement":
+                # 逐分量控制：fixedX/fixedY/fixedZ 决定约束哪些方向，值取自 displacement。
+                # 前端 DisplacementConstraint 的默认值是三个方向全固定、位移为 0，
+                # 语义上等价于固定约束。
+                values = _parse_displacement(bc)
+                flags = (
+                    getattr(bc, "fixedX", None),
+                    getattr(bc, "fixedY", None),
+                    getattr(bc, "fixedZ", None),
+                )
+                # 三个标志都缺省时，按"全部约束"处理（与前端默认一致）
+                if all(flag is None for flag in flags):
+                    flags = (True, True, True)
+
+                applied_components = [
+                    component for component in range(3) if flags[component]
+                ]
+                if not applied_components:
+                    message = (
+                        f"强制位移「{bc.name}」没有勾选任何约束方向，已忽略"
+                    )
+                    logger.warning(message)
+                    solver_warnings.append(message)
+                    continue
+
+                for component in applied_components:
+                    value = float(values[component])
+                    for node_idx in target_nodes_indices:
+                        dof = int(basis_vec.nodal_dofs[component][node_idx])
+                        prescribed_dofs[dof] = value
+
+                logger.debug(
+                    "强制位移作用于 %s 的 %d 个节点，方向 %s，值 %s",
+                    bc.entityIndex, len(target_nodes_indices),
+                    applied_components, [values[c] for c in applied_components],
+                )
 
             elif bc.type == "force":
                 fx, fy, fz = _parse_force(bc.force)
@@ -422,8 +464,12 @@ async def solve_simulation(request: SolverRequest):
                 )
 
         # 6. Solve
-        D = np.unique(fixed_dofs)
-        
+        #
+        # 指定位移（非齐次 Dirichlet）：condense 的 x 参数是**全长向量**，
+        # 只有 x[D] 会被用到（见 skfem.utils.condense 实现：
+        # bout = b[I] - A[I][:, D] @ x[D]），expand=True 会把 u_D 填回解向量。
+        D = np.array(sorted(prescribed_dofs), dtype=np.int64)
+
         # Check if f is all zero and no fixed dofs (to prevent singular matrix if user messed up)
         if len(D) == 0:
              # Fallback: Fix 3 corners to prevent rigid body motion if no constraints
@@ -443,8 +489,12 @@ async def solve_simulation(request: SolverRequest):
                  fallback_dofs.extend([basis_vec.nodal_dofs[0][n], basis_vec.nodal_dofs[1][n], basis_vec.nodal_dofs[2][n]])
              D = np.unique(fallback_dofs)
 
+        prescribed_values = np.zeros(basis_vec.N, dtype=np.float64)
+        for dof, value in prescribed_dofs.items():
+            prescribed_values[dof] = value
+
         # Solve Linear System: K u = f
-        u = solve(*condense(K, f, D=D))
+        u = solve(*condense(K, f, x=prescribed_values, D=D))
 
         # Calculate Reaction Forces at fixed constraints: R = K * u - f
         # R will be non-zero only at constrained DOFs
