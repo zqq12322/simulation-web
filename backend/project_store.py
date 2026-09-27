@@ -20,9 +20,33 @@
   而且客户端能自选 ID 就意味着能覆盖别人的记录。
 - **排序按 ``rowid``**，不按 ``created_at``：时间戳只精确到秒，
   同一秒内建的两个项目会并列，"最新的在最前"就变成不确定的顺序。
-- ``owner_id`` / 鉴权**故意还没加**：一个"存在但没人校验"的属主字段比没有更危险
-  ——它会让人以为数据已经隔离了。等真正接上登录时再加列，
-  ``SqliteStore.migrations`` 就是为这种演进准备的（材料库已经演示过一次）。
+- **查询一律要求显式给出 ``owner_id``**（见下）。
+
+关于 ``owner_id``
+-----------------
+第一版**故意没有**这个字段：一个"存在但没人校验"的属主字段比没有更危险，
+它会让人以为数据已经隔离了。现在真正接上登录了，才把它加上——
+`SqliteStore.migrations` 就是为这种演进准备的（材料库已演示过一次）。
+
+``owner_id IS NULL`` 表示**本轮之前创建的遗留项目**（那时还没有用户概念）。
+对它的策略是刻意保守的：
+
+- **可见**：已登录用户能在列表里看到它们（否则用户会以为自己的项目丢了）；
+- **不可改、不可删**：修改与删除只允许属主本人；
+- **可以显式认领**（`claim`）：由用户主动触发，一行 SQL 把它划给自己。
+
+**为什么不用"第一个注册的用户自动接管"**：那是本轮真的踩到的坑。
+`tools/tasks.py verify` 会注册固定的测试账号，一旦它是第一个用户，就会把开发者
+手工建的项目静默划给自己——用户下次登录发现项目不见了。
+**静默改变数据归属，比"看得见但要手点一下"危险得多。**
+
+查询方法的 ``owner_id`` 是**必填参数**，并且**没有"返回全部"这个模式**：
+
+- ``owner_id="<用户>"`` → 只看这个用户的；``include_unowned=True`` 时附上无主项目；
+- ``owner_id=None``     → 只看**无主**项目。
+
+如果把 ``owner_id=None`` 解释成"不过滤"，任何一处忘记传参的调用都会静默地把所有
+用户的数据混在一起——而这正是"用户隔离"要防的事。宁可让调用方多写一个参数。
 """
 
 from __future__ import annotations
@@ -47,10 +71,16 @@ CREATE TABLE IF NOT EXISTS projects (
     description     TEXT NOT NULL DEFAULT '',
     simulation_type TEXT NOT NULL DEFAULT 'General',
     is_private      INTEGER NOT NULL DEFAULT 1,
+    owner_id        TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
 """
+
+#: 后加的列：``owner_id``（接上登录时新增）。老库会自动补列，旧行为 NULL。
+_MIGRATIONS = {
+    "owner_id": "TEXT",
+}
 
 
 def _now() -> str:
@@ -63,33 +93,61 @@ def new_project_id() -> str:
 
 
 class ProjectStore(SqliteStore):
-    """项目的持久化存储。"""
+    """项目的持久化存储。所有查询都按 ``owner_id`` 限定范围，见模块文档。"""
 
     table = "projects"
     schema = _SCHEMA
+    migrations = _MIGRATIONS
 
     # ------------------------------------------------------------- 读
-    def list_projects(self) -> List[dict]:
+    def list_projects(
+        self, owner_id: Optional[str], include_unowned: bool = False
+    ) -> List[dict]:
         """
-        返回全部项目，**最新建的在前**。
+        列出**某个属主**的项目，最新建的在前。
 
-        按 ``rowid`` 而不是 ``created_at`` 排序：时间戳只到秒，
-        同一秒内创建的项目用时间戳排序结果不确定（测试里就会时好时坏）。
+        ``owner_id=None`` 表示"只看无主项目"（**不是**"所有项目"，见模块文档）。
+        ``include_unowned=True`` 时把无主项目也带进来（列表里它们 ``ownerId`` 为
+        ``None``，前端据此显示"未归属"）。
         """
+        if include_unowned and owner_id is not None:
+            sql = ("SELECT * FROM projects WHERE owner_id IS ? OR owner_id IS NULL"
+                   " ORDER BY rowid DESC")
+        else:
+            sql = "SELECT * FROM projects WHERE owner_id IS ? ORDER BY rowid DESC"
+
         with self._cursor() as connection:
-            rows = connection.execute(
-                "SELECT * FROM projects ORDER BY rowid DESC"
-            ).fetchall()
+            rows = connection.execute(sql, (owner_id,)).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
-    def get_project(self, project_id: str) -> Optional[dict]:
+    def get_project(
+        self,
+        project_id: str,
+        owner_id: Optional[str] = None,
+        include_unowned: bool = False,
+    ) -> Optional[dict]:
+        """
+        按 ID 取项目，并限定属主。
+
+        不属于该属主时返回 ``None``（调用方转成 404）——**不区分"不存在"与
+        "不是你的"**，否则可以通过 id 探测别人有哪些项目。
+        """
+        sql = "SELECT * FROM projects WHERE id = ? AND owner_id IS ?"
+        if include_unowned and owner_id is not None:
+            sql = ("SELECT * FROM projects WHERE id = ?"
+                   " AND (owner_id IS ? OR owner_id IS NULL)")
         with self._cursor() as connection:
-            row = connection.execute(
-                "SELECT * FROM projects WHERE id = ?", (project_id,)
-            ).fetchone()
+            row = connection.execute(sql, (project_id, owner_id)).fetchone()
         return self._row_to_dict(row) if row else None
 
-    def count(self) -> int:
+    def count(self, owner_id: Optional[str] = None) -> int:
+        with self._cursor() as connection:
+            return int(connection.execute(
+                "SELECT COUNT(*) FROM projects WHERE owner_id IS ?", (owner_id,)
+            ).fetchone()[0])
+
+    def count_all(self) -> int:
+        """全库项目数（只用于日志/诊断，不用于任何面向用户的查询）。"""
         with self._cursor() as connection:
             return int(connection.execute(
                 "SELECT COUNT(*) FROM projects"
@@ -99,6 +157,7 @@ class ProjectStore(SqliteStore):
     def create(
         self,
         title: str,
+        owner_id: Optional[str] = None,
         description: str = "",
         simulation_type: str = "General",
         is_private: bool = True,
@@ -124,8 +183,8 @@ class ProjectStore(SqliteStore):
                     """
                     INSERT INTO projects
                         (id, title, description, simulation_type,
-                         is_private, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                         is_private, owner_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         payload["id"],
@@ -133,6 +192,7 @@ class ProjectStore(SqliteStore):
                         payload["description"],
                         payload["simulationType"],
                         1 if payload["isPrivate"] else 0,
+                        owner_id,
                         timestamp,
                         timestamp,
                     ),
@@ -140,8 +200,9 @@ class ProjectStore(SqliteStore):
             except sqlite3.IntegrityError as exc:  # 并发/注入 ID 冲突时的兜底
                 raise ValueError(f"项目 ID 已存在：{payload['id']}") from exc
 
-        logger.info("已创建项目：%s（%s）", payload["id"], payload["title"])
-        return self.get_project(payload["id"]) or payload
+        logger.info("已创建项目：%s（%s，属主 %s）",
+                    payload["id"], payload["title"], owner_id or "无主")
+        return self.get_project(payload["id"], owner_id) or payload
 
     #: ``update`` 允许改的字段 → 数据库列名
     _UPDATABLE = {
@@ -151,12 +212,15 @@ class ProjectStore(SqliteStore):
         "isPrivate": "is_private",
     }
 
-    def update(self, project_id: str, **fields) -> Optional[dict]:
+    def update(
+        self, project_id: str, owner_id: Optional[str] = None, **fields
+    ) -> Optional[dict]:
         """
-        局部更新；项目不存在返回 ``None``。
+        局部更新；**不属于该属主或不存在**都返回 ``None``。
 
         传入未在 ``_UPDATABLE`` 里的字段会抛 ``ValueError``——宁可大声失败，
-        也不要"看起来更新了其实什么都没改"。
+        也不要"看起来更新了其实什么都没改"。（``ownerId`` 也在这里被挡住：
+        项目不能在用户之间被"过户"。）
         """
         unknown = sorted(set(fields) - set(self._UPDATABLE))
         if unknown:
@@ -173,29 +237,65 @@ class ProjectStore(SqliteStore):
             values.append(value)
         assignments.append("updated_at = ?")
         values.append(_now())
-        values.append(project_id)
+        values.extend([project_id, owner_id])
 
         with self._cursor() as connection:
             cursor = connection.execute(
-                f"UPDATE projects SET {', '.join(assignments)} WHERE id = ?",
+                f"UPDATE projects SET {', '.join(assignments)}"
+                " WHERE id = ? AND owner_id IS ?",
                 values,
             )
             if cursor.rowcount == 0:
                 return None
 
         logger.info("已更新项目：%s（字段 %s）", project_id, ", ".join(fields))
-        return self.get_project(project_id)
+        return self.get_project(project_id, owner_id)
 
-    def delete(self, project_id: str) -> bool:
-        """删除一个项目；返回是否真的删掉了。"""
+    def delete(self, project_id: str, owner_id: Optional[str] = None) -> bool:
+        """删除一个项目；返回是否真的删掉了（不属于该属主时返回 False）。"""
         with self._cursor() as connection:
             cursor = connection.execute(
-                "DELETE FROM projects WHERE id = ?", (project_id,)
+                "DELETE FROM projects WHERE id = ? AND owner_id IS ?",
+                (project_id, owner_id),
             )
             removed = cursor.rowcount > 0
         if removed:
             logger.info("已删除项目：%s", project_id)
         return removed
+
+    def claim(self, project_id: str, owner_id: str) -> Optional[dict]:
+        """
+        认领一个**无主**项目；返回认领后的记录。
+
+        - 项目不存在 → ``None``
+        - 项目已属于别人 → ``None``（调用方转 404，不泄露它属于谁）
+        - 项目已经是自己的 → 幂等成功，返回原记录（重复点击不该报错）
+
+        ``WHERE owner_id IS NULL`` 是这里的关键：**不能**写成无条件 UPDATE，
+        否则这个方法就变成了"任意项目过户"。
+
+        为什么要有这个方法（而不是自动接管）：见模块文档。自动接管曾被
+        `tools/tasks.py verify` 的测试账号触发，把开发者手工建的项目静默划走了。
+        """
+        with self._cursor() as connection:
+            existing = connection.execute(
+                "SELECT owner_id FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if existing is None:
+                return None
+
+            current_owner = existing["owner_id"]
+            if current_owner is not None and current_owner != owner_id:
+                return None
+            if current_owner is None:
+                connection.execute(
+                    "UPDATE projects SET owner_id = ?, updated_at = ?"
+                    " WHERE id = ? AND owner_id IS NULL",
+                    (owner_id, _now(), project_id),
+                )
+                logger.info("项目 %s 已被用户 %s 认领", project_id, owner_id)
+
+        return self.get_project(project_id, owner_id)
 
     # ------------------------------------------------------------- 工具
     @staticmethod
@@ -206,6 +306,7 @@ class ProjectStore(SqliteStore):
             "description": row["description"],
             "simulationType": row["simulation_type"],
             "isPrivate": bool(row["is_private"]),
+            "ownerId": row["owner_id"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
@@ -219,6 +320,6 @@ def get_store() -> ProjectStore:
     global _default_store
     if _default_store is None:
         _default_store = ProjectStore()
-        logger.info("项目数据库：%s（已有 %d 个项目）",
-                    _default_store.db_path, _default_store.count())
+        logger.info("项目数据库：%s（共 %d 个项目）",
+                    _default_store.db_path, _default_store.count_all())
     return _default_store

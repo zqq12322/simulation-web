@@ -70,6 +70,24 @@ LENGTH_UNIT_TO_METER: Final[dict] = {"m": 1.0, "mm": 1e-3}
 #: 前端会显式发送用户选择的单位（默认 mm）。
 DEFAULT_LENGTH_UNIT: Final[str] = os.getenv("DEFAULT_LENGTH_UNIT", "m").lower()
 
+# ------------------------------------------------------------------- 认证
+#: 登录令牌有效期（天）。会话存在 SQLite 里，因此可以随时吊销（登出、改密）。
+AUTH_TOKEN_TTL_DAYS: Final[int] = int(os.getenv("SIMCLOUD_TOKEN_TTL_DAYS", "30"))
+
+#: 是否允许自助注册。单人自用或私有部署可以设成 0 关掉，此后只能由已有库里的用户登录。
+ALLOW_REGISTRATION: Final[bool] = os.getenv(
+    "SIMCLOUD_ALLOW_REGISTRATION", "1"
+).strip().lower() not in {"0", "false", "no", ""}
+
+#: 口令长度限制。上限不是为了安全，而是为了**拒绝超长输入**：
+#: scrypt 的代价与输入长度无关但与参数有关，允许 1 MB 的"口令"只会浪费内存与带宽。
+PASSWORD_MIN_LENGTH: Final[int] = int(os.getenv("SIMCLOUD_PASSWORD_MIN", "8"))
+PASSWORD_MAX_LENGTH: Final[int] = 200
+
+#: 用户名长度限制
+USERNAME_MIN_LENGTH: Final[int] = 3
+USERNAME_MAX_LENGTH: Final[int] = 32
+
 
 def ensure_upload_dir() -> Path:
     """确保上传目录存在并返回该目录。"""

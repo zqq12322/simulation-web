@@ -41,8 +41,9 @@ class ProjectStoreTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_new_store_is_empty(self):
-        self.assertEqual(self.store.list_projects(), [])
-        self.assertEqual(self.store.count(), 0)
+        self.assertEqual(self.store.list_projects(None), [])
+        self.assertEqual(self.store.count(None), 0)
+        self.assertEqual(self.store.count_all(), 0)
 
     def test_create_then_read_back(self):
         created = self.store.create(
@@ -65,7 +66,7 @@ class ProjectStoreTest(unittest.TestCase):
         created = self.store.create(title="重启也要在")
 
         reopened = ProjectStore(self.db_path)
-        self.assertEqual(reopened.count(), 1)
+        self.assertEqual(reopened.count(None), 1)
         self.assertEqual(reopened.get_project(created["id"])["title"], "重启也要在")
 
     def test_ids_are_unique_and_server_generated(self):
@@ -83,7 +84,7 @@ class ProjectStoreTest(unittest.TestCase):
         就是用来钉住"按 rowid 排"这个决定的。
         """
         created = [self.store.create(title=f"项目 {index}") for index in range(5)]
-        listed = self.store.list_projects()
+        listed = self.store.list_projects(None)
         self.assertEqual(
             [item["id"] for item in listed],
             [item["id"] for item in reversed(created)],
@@ -133,9 +134,128 @@ class ProjectStoreTest(unittest.TestCase):
         created = self.store.create(title="x")
         for _ in range(3):
             ProjectStore(self.db_path)
-        self.assertEqual(ProjectStore(self.db_path).count(), 1)
+        self.assertEqual(ProjectStore(self.db_path).count(None), 1)
         self.assertEqual(
             ProjectStore(self.db_path).get_project(created["id"])["title"], "x"
+        )
+
+
+class OwnerScopeTest(unittest.TestCase):
+    """
+    归属作用域在**存储层**的语义。
+
+    ``list_projects(owner_id)`` 的 ``owner_id`` 是必填的，且
+    ``owner_id=None`` 表示"无主项目"，**不是**"所有项目"。
+    这一条如果被误解成"不过滤"，任何一个忘记传参的调用都会把所有用户的数据
+    混在一起——所以这里逐条钉住 SQL 的 ``WHERE owner_id IS ?``。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = ProjectStore(Path(self._tmp.name) / "owned.db")
+        self.alice = self.store.create(title="Alice 的", owner_id="user-a")
+        self.bob = self.store.create(title="Bob 的", owner_id="user-b")
+        self.orphan = self.store.create(title="无主的（遗留）")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_each_owner_sees_only_their_projects(self):
+        self.assertEqual(
+            [p["title"] for p in self.store.list_projects("user-a")], ["Alice 的"]
+        )
+        self.assertEqual(
+            [p["title"] for p in self.store.list_projects("user-b")], ["Bob 的"]
+        )
+
+    def test_none_means_unowned_not_everything(self):
+        """最容易写错的一条：None 不能等于"不过滤"。"""
+        unowned = self.store.list_projects(None)
+        self.assertEqual([p["title"] for p in unowned], ["无主的（遗留）"])
+        self.assertEqual(len(unowned), 1, "None 不应该返回所有项目")
+
+    def test_get_is_scoped_to_owner(self):
+        self.assertIsNotNone(self.store.get_project(self.alice["id"], "user-a"))
+        self.assertIsNone(self.store.get_project(self.alice["id"], "user-b"))
+        self.assertIsNone(self.store.get_project(self.alice["id"], None))
+
+    def test_update_is_scoped_to_owner(self):
+        self.assertIsNone(
+            self.store.update(self.alice["id"], "user-b", title="被改了")
+        )
+        self.assertEqual(
+            self.store.get_project(self.alice["id"], "user-a")["title"], "Alice 的"
+        )
+
+    def test_delete_is_scoped_to_owner(self):
+        self.assertFalse(self.store.delete(self.alice["id"], "user-b"))
+        self.assertIsNotNone(self.store.get_project(self.alice["id"], "user-a"))
+        self.assertTrue(self.store.delete(self.alice["id"], "user-a"))
+
+    def test_count_counts_within_scope(self):
+        self.assertEqual(self.store.count("user-a"), 1)
+        self.assertEqual(self.store.count(None), 1)
+        self.assertEqual(self.store.count_all(), 3)
+
+    def test_include_unowned_adds_legacy_projects(self):
+        """``include_unowned=True`` 时列表里多出无主项目（API 走的就是这条）。"""
+        alice_view = self.store.list_projects("user-a", include_unowned=True)
+        self.assertEqual(
+            sorted(p["title"] for p in alice_view), ["Alice 的", "无主的（遗留）"]
+        )
+        # 无主项目在结果里 ownerId 为 None，前端据此显示"未归属"
+        orphan = next(p for p in alice_view if p["title"].startswith("无主"))
+        self.assertIsNone(orphan["ownerId"])
+
+    def test_include_unowned_does_not_leak_other_owners(self):
+        """带上无主项目，但**绝不能**把别人的项目也带进来。"""
+        titles = [
+            p["title"] for p in self.store.list_projects("user-a", include_unowned=True)
+        ]
+        self.assertNotIn("Bob 的", titles)
+
+    def test_get_with_include_unowned(self):
+        self.assertIsNotNone(
+            self.store.get_project(self.orphan["id"], "user-a", include_unowned=True)
+        )
+        # 别人的项目仍然取不到
+        self.assertIsNone(
+            self.store.get_project(self.bob["id"], "user-a", include_unowned=True)
+        )
+        # 关掉开关就只剩自己的
+        self.assertIsNone(
+            self.store.get_project(self.orphan["id"], "user-a")
+        )
+
+    def test_claim_assigns_ownership(self):
+        claimed = self.store.claim(self.orphan["id"], "user-a")
+        self.assertEqual(claimed["ownerId"], "user-a")
+        self.assertEqual(self.store.count(None), 0)
+        self.assertEqual(
+            sorted(p["title"] for p in self.store.list_projects("user-a")),
+            ["Alice 的", "无主的（遗留）"],
+        )
+
+    def test_claim_is_idempotent_for_the_same_owner(self):
+        first = self.store.claim(self.orphan["id"], "user-a")
+        second = self.store.claim(self.orphan["id"], "user-a")
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(second["ownerId"], "user-a")
+
+    def test_claim_refuses_an_owned_project(self):
+        """否则这个方法就成了"任意项目过户"。"""
+        self.assertIsNone(self.store.claim(self.alice["id"], "user-b"))
+        self.assertEqual(
+            self.store.get_project(self.alice["id"], "user-a")["ownerId"], "user-a"
+        )
+
+    def test_claim_unknown_project_returns_none(self):
+        self.assertIsNone(self.store.claim("does-not-exist", "user-a"))
+
+    def test_owner_id_survives_reopen(self):
+        reopened = ProjectStore(self.store.db_path)
+        self.assertEqual(
+            reopened.get_project(self.alice["id"], "user-a")["ownerId"], "user-a"
         )
 
 
@@ -188,7 +308,20 @@ class SharedDatabaseTest(unittest.TestCase):
 
 
 class ProjectsApiTest(unittest.TestCase):
-    """端点层：注入临时库，验证 HTTP 语义与错误码。"""
+    """
+    端点层：注入临时库，验证 HTTP 语义与错误码。
+
+    项目端点现在都要求登录（``user: dict = Depends(require_user)``），直接调用时
+    必须显式传入用户记录。这里用一个**假的用户 dict**（端点只用到 ``id``），
+    真正的认证流程在 `test_auth.py` 里测。
+    """
+
+    USER = {
+        "id": "user-test",
+        "username": "tester",
+        "displayName": "Tester",
+        "createdAt": "2026-03-18T00:00:00+00:00",
+    }
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -207,10 +340,10 @@ class ProjectsApiTest(unittest.TestCase):
         payload = {"title": "新项目", "simulationType": "FEA"}
         payload.update(overrides)
         request = projects_module.ProjectCreate(**payload)
-        return asyncio.run(projects_module.create_project(request))
+        return asyncio.run(projects_module.create_project(request, self.USER))
 
     def _list(self):
-        return asyncio.run(projects_module.list_projects())
+        return asyncio.run(projects_module.list_projects(self.USER))
 
     # ------------------------------------------------------------- 用例
     def test_create_returns_generated_id_and_timestamps(self):
@@ -228,13 +361,13 @@ class ProjectsApiTest(unittest.TestCase):
 
     def test_get_unknown_id_returns_404(self):
         with self.assertRaises(HTTPException) as ctx:
-            asyncio.run(projects_module.get_project("nope"))
+            asyncio.run(projects_module.get_project("nope", self.USER))
         self.assertEqual(ctx.exception.status_code, 404)
 
     def test_patch_updates_only_given_fields(self):
         created = self._create(description="原始描述")
         updated = asyncio.run(projects_module.update_project(
-            created.id, projects_module.ProjectUpdate(title="改名了")
+            created.id, projects_module.ProjectUpdate(title="改名了"), self.USER
         ))
         self.assertEqual(updated.title, "改名了")
         self.assertEqual(updated.description, "原始描述")
@@ -243,23 +376,23 @@ class ProjectsApiTest(unittest.TestCase):
         created = self._create()
         with self.assertRaises(HTTPException) as ctx:
             asyncio.run(projects_module.update_project(
-                created.id, projects_module.ProjectUpdate()
+                created.id, projects_module.ProjectUpdate(), self.USER
             ))
         self.assertEqual(ctx.exception.status_code, 400)
 
     def test_patch_unknown_id_returns_404(self):
         with self.assertRaises(HTTPException) as ctx:
             asyncio.run(projects_module.update_project(
-                "nope", projects_module.ProjectUpdate(title="x")
+                "nope", projects_module.ProjectUpdate(title="x"), self.USER
             ))
         self.assertEqual(ctx.exception.status_code, 404)
 
     def test_delete_then_get_returns_404(self):
         created = self._create()
-        result = asyncio.run(projects_module.delete_project(created.id))
+        result = asyncio.run(projects_module.delete_project(created.id, self.USER))
         self.assertEqual(result, {"deleted": True, "id": created.id})
         with self.assertRaises(HTTPException) as ctx:
-            asyncio.run(projects_module.delete_project(created.id))
+            asyncio.run(projects_module.delete_project(created.id, self.USER))
         self.assertEqual(ctx.exception.status_code, 404)
 
     def test_blank_title_is_rejected(self):

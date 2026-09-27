@@ -20,9 +20,10 @@ from __future__ import annotations
 import re
 from typing import List, Literal, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from auth import require_user
 from logging_config import get_logger
 from project_store import SIMULATION_TYPES, get_store
 
@@ -101,23 +102,41 @@ class ProjectResponse(BaseModel):
     description: str
     simulationType: SimulationType
     isPrivate: bool
+    #: 属主用户 id。当前实现里你只会看到自己的项目，因此它总是等于你本人；
+    #: 保留在响应里是为了让"归属"这件事显式可见（也便于将来做共享）。
+    ownerId: Optional[str] = None
     #: ISO-8601 UTC 字符串；前端用 new Date(...) 解析
     createdAt: str
     updatedAt: str
 
 
+#: 所有项目端点都必须登录。**按属主过滤**（而不是"先查出来再判断"）：
+#: 后者一旦某处漏判就会把别人的数据返回出去。
+OwnedUser = Depends(require_user)
+
+
 @router.get("/projects", response_model=List[ProjectResponse])
-async def list_projects():
-    """列出全部项目，最新建的在前。"""
-    return [ProjectResponse(**item) for item in get_store().list_projects()]
+async def list_projects(user: dict = OwnedUser):
+    """
+    列出**当前用户**的项目，最新建的在前。
+
+    同时带上**无主项目**（``ownerId`` 为 ``null``，前端显示"未归属"）：它们是接上
+    登录之前创建的数据，对已登录用户可见（否则用户会以为项目丢了），
+    但**不可改**，需要显式调用 ``POST /api/projects/{id}/claim`` 认领。
+    """
+    return [
+        ProjectResponse(**item)
+        for item in get_store().list_projects(user["id"], include_unowned=True)
+    ]
 
 
 @router.post("/projects", response_model=ProjectResponse, status_code=201)
-async def create_project(request: ProjectCreate):
-    """新建项目。ID 与时间戳由服务端生成。"""
+async def create_project(request: ProjectCreate, user: dict = OwnedUser):
+    """新建项目（归当前用户所有）。ID 与时间戳由服务端生成。"""
     try:
         created = get_store().create(
             title=request.title,
+            owner_id=user["id"],
             description=request.description,
             simulation_type=request.simulationType,
             is_private=request.isPrivate,
@@ -128,15 +147,42 @@ async def create_project(request: ProjectCreate):
 
 
 @router.get("/projects/{project_id}", response_model=ProjectResponse)
-async def get_project(project_id: str):
-    project = get_store().get_project(project_id)
+async def get_project(project_id: str, user: dict = OwnedUser):
+    """
+    取回自己的某个项目（无主项目也可读）。
+
+    不属于当前用户且不是无主项目时返回 **404**（而不是 403）：403 等于确认
+    "这个 id 存在，只是不是你的"，可以被用来探测别人有哪些项目。
+    """
+    project = get_store().get_project(project_id, user["id"], include_unowned=True)
     if project is None:
         raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
     return ProjectResponse(**project)
 
 
+@router.post("/projects/{project_id}/claim", response_model=ProjectResponse)
+async def claim_project(project_id: str, user: dict = OwnedUser):
+    """
+    认领一个**无主**项目（接上登录之前创建的数据）。
+
+    刻意做成**显式操作**而不是"第一个注册的用户自动接管"：自动接管会静默改变
+    数据归属，本项目已经因此把开发者手工建的项目划给了测试账号。
+    认领是幂等的——重复点击返回同一条记录，不报错。
+    """
+    claimed = get_store().claim(project_id, user["id"])
+    if claimed is None:
+        # 不存在，或者已经属于别人（两者都 404，不泄露归属）
+        raise HTTPException(
+            status_code=404,
+            detail=f"项目不存在或已属于其他用户：{project_id}",
+        )
+    return ProjectResponse(**claimed)
+
+
 @router.patch("/projects/{project_id}", response_model=ProjectResponse)
-async def update_project(project_id: str, request: ProjectUpdate):
+async def update_project(
+    project_id: str, request: ProjectUpdate, user: dict = OwnedUser
+):
     """
     局部更新项目（改名/改描述/改类型/改可见性）。
 
@@ -152,7 +198,7 @@ async def update_project(project_id: str, request: ProjectUpdate):
         )
 
     try:
-        updated = get_store().update(project_id, **fields)
+        updated = get_store().update(project_id, user["id"], **fields)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -162,9 +208,9 @@ async def update_project(project_id: str, request: ProjectUpdate):
 
 
 @router.delete("/projects/{project_id}")
-async def delete_project(project_id: str):
-    """删除项目；不存在时返回 404（而不是假装删掉了）。"""
-    if not get_store().delete(project_id):
+async def delete_project(project_id: str, user: dict = OwnedUser):
+    """删除自己的项目；不存在或不属于自己时返回 404。"""
+    if not get_store().delete(project_id, user["id"]):
         raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
     return {"deleted": True, "id": project_id}
 
