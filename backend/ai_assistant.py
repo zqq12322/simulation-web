@@ -9,7 +9,13 @@ from dotenv import load_dotenv
 # Load environment variables from backend/.env (independent of the working directory)
 load_dotenv(Path(__file__).with_name(".env"))
 
-router = APIRouter()
+from auth import require_user
+
+#: 整个 router 都要求登录。用**路由级依赖**而不是给每个端点加参数：
+#: 端点本身并不需要知道「你是谁」，而且 40 多个既有测试是**直接调用端点函数**的
+#: （不经 HTTP），逐个加参数会让它们全部失效。
+router = APIRouter(dependencies=[Depends(require_user)])
+
 
 # DeepSeek uses an OpenAI-compatible API.
 # The API key must come from the environment (backend/.env) and never be hard-coded.

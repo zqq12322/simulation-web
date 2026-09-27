@@ -24,6 +24,7 @@ import {
   FileBox
 } from 'lucide-react';
 import axios from 'axios';
+import { currentAuthHeaders, isUnauthorized, notifySessionExpired } from '../utils/authApi';
 import ImportModal from './ImportModal';
 import Scene3D from './Scene3D';
 import MaterialSelector from './MaterialSelector';
@@ -97,7 +98,10 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     const deadline = Date.now() + 15 * 60 * 1000; // 最多等 15 分钟
     for (;;) {
       await new Promise((resolve) => setTimeout(resolve, 700));
-      const { data } = await axios.get(`${API_BASE_URL}/api/jobs/${jobId}`);
+      const { data } = await axios.get(
+        `${API_BASE_URL}/api/jobs/${jobId}`,
+        { headers: currentAuthHeaders() }
+      );
       onStatus?.(
         data.status === 'queued'
           ? '排队中…'
@@ -140,7 +144,9 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
         // 1. Apply Material
         if (params.material_id) {
           try {
-            const response = await axios.get(`${API_BASE_URL}/api/materials/${params.material_id}`);
+            const response = await axios.get(`${API_BASE_URL}/api/materials/${params.material_id}`, {
+        headers: currentAuthHeaders(),
+      });
             if (response.data) {
                // Backend returns Material model, frontend expects Material interface
                // They are compatible based on fields
@@ -251,7 +257,10 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     const fetchMetadata = async () => {
       if (modelName) {
         try {
-          const response = await axios.get(`${API_BASE_URL}/api/geometry/${modelName}/metadata`);
+          const response = await axios.get(
+            `${API_BASE_URL}/api/geometry/${modelName}/metadata`,
+            { headers: currentAuthHeaders() }
+          );
           if (response.data) {
              console.log('Geometry metadata loaded:', response.data);
              setFacesData(response.data.faces || []);
@@ -260,6 +269,7 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
           }
         } catch (error) {
           console.error("Failed to fetch geometry metadata:", error);
+          if (isUnauthorized(error)) notifySessionExpired('登录已失效，请重新登录。');
         }
       }
     };
@@ -364,10 +374,14 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     try {
       // 异步任务接口：提交后立即返回 job_id，再轮询。
       // （网格划分/求解是耗时操作，同步接口在大模型上会让请求超时）
-      const { data: job } = await axios.post(`${API_BASE_URL}/api/jobs/generate-mesh`, {
-        filename: modelName,
-        mesh_size: resolvedSettings.meshSize,
-      });
+      const { data: job } = await axios.post(
+        `${API_BASE_URL}/api/jobs/generate-mesh`,
+        {
+          filename: modelName,
+          mesh_size: resolvedSettings.meshSize,
+        },
+        { headers: currentAuthHeaders() }
+      );
       const result = await pollJob(job.job_id, setMeshJobStatus);
 
       console.log('Mesh generation completed:', result);
@@ -390,7 +404,15 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     } catch (error) {
       console.error("Mesh generation failed:", error);
       setMeshSettings(prev => prev ? { ...prev, status: 'failed' } : null);
-      
+
+      // 401 不是"网格划不出来"，而是"你不再是登录状态"：
+      // 交给 App 统一清令牌并回登录面板，不要触发 AI 诊断
+      // （那会把用户引向一个完全无关的方向）。
+      if (isUnauthorized(error)) {
+        notifySessionExpired('登录已失效，请重新登录后再生成网格。');
+        return;
+      }
+
       // Auto-trigger AI diagnostic on failure
       setShowAIAssistant(true);
       setTimeout(() => {
@@ -520,7 +542,8 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
         const jobKind = isThermal ? 'thermal' : isModal ? 'modal' : 'solve';
         const { data: job } = await axios.post(
             `${API_BASE_URL}/api/jobs/${jobKind}`,
-            requestBody
+            requestBody,
+            { headers: currentAuthHeaders() }
         );
         const solveResult = await pollJob(job.job_id, setSolveJobStatus);
 
@@ -585,7 +608,13 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
       } catch (error: any) {
         console.error("Solver failed:", error);
         setSolverSettings(prev => prev ? { ...prev, status: 'failed' } : null);
-        
+
+        // 与网格划分同理：401 是"登录失效"，不是"算不出来"
+        if (isUnauthorized(error)) {
+          notifySessionExpired('登录已失效，请重新登录后再求解。');
+          return;
+        }
+
         // Auto-trigger AI diagnostic on failure
         setShowAIAssistant(true);
         // Wait for panel to open

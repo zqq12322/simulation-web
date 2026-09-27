@@ -964,9 +964,10 @@ def _check_frontend_projects_math(node: str) -> tuple[bool, str]:
 
 #: 认证工具的断言：令牌存取、字段映射、请求头、401 与"连不上"的区分。
 _AUTH_API_SELFTEST = r"""
-import { TOKEN_STORAGE_KEY, authorizationHeader, clearStoredToken,
-         defaultStorage, describeAuthError, describeOwner, errorStatus,
-         isUnauthorized, readStoredToken, toSession, toUser,
+import { TOKEN_STORAGE_KEY, SESSION_EXPIRED_EVENT, authorizationHeader,
+         clearStoredToken, currentAuthHeaders, defaultStorage,
+         describeAuthError, describeOwner, errorStatus, isUnauthorized,
+         notifySessionExpired, readStoredToken, toSession, toUser,
          writeStoredToken } from './authApi.ts';
 
 let failures = [];
@@ -1074,6 +1075,32 @@ check('他人的项目',
 check('无主项目',
       describeOwner({ isPrivate: true, ownerId: null }, 'u1') === '未归属');
 
+// currentAuthHeaders：从存储里读令牌，任何一处 axios 调用都能直接用
+// （不必把 token 穿过整棵组件树）。没有存储时也必须安全返回。
+check('无存储时 currentAuthHeaders 不抛且不带 Authorization',
+      typeof currentAuthHeaders() === 'object'
+      && currentAuthHeaders().Authorization === undefined);
+check('currentAuthHeaders 透传额外头',
+      currentAuthHeaders({ 'Content-Type': 'multipart/form-data' })['Content-Type']
+      === 'multipart/form-data');
+
+// 注入一个假的全局 localStorage，验证"有令牌时会带上"
+globalThis.localStorage = makeStorage();
+writeStoredToken('tok-from-storage');
+check('currentAuthHeaders 自动带上存储里的令牌',
+      currentAuthHeaders().Authorization === 'Bearer tok-from-storage',
+      String(currentAuthHeaders().Authorization));
+clearStoredToken();
+check('登出后 currentAuthHeaders 不再带令牌',
+      currentAuthHeaders().Authorization === undefined);
+delete globalThis.localStorage;
+
+// 会话失效事件：子组件（求解/材料/AI）拿不到 App 的状态，靠广播事件通知
+check('会话失效事件名非空', typeof SESSION_EXPIRED_EVENT === 'string'
+      && SESSION_EXPIRED_EVENT.length > 0, SESSION_EXPIRED_EVENT);
+check('没有 window 时 notifySessionExpired 不抛',
+      (notifySessionExpired('测试'), true));
+
 if (failures.length) {
   console.error('FAIL: ' + failures.join(' | '));
   process.exit(1);
@@ -1131,7 +1158,7 @@ def task_verify(args: argparse.Namespace) -> int:
     node_bin = shutil.which("node")
 
     if not args.skip_frontend:
-        info("=== 1/4 前端类型检查 ===")
+        info("=== 1/7 前端类型检查 ===")
         if node_bin:
             code = subprocess.run(
                 [node_bin, "node_modules/typescript/bin/tsc", "--noEmit"],
@@ -1159,7 +1186,7 @@ def task_verify(args: argparse.Namespace) -> int:
         else:
             check("TypeScript 类型检查", False, "未找到 node")
 
-    info("\n=== 2/4 后端可达性 ===")
+    info("\n=== 2/7 后端可达性 ===")
     try:
         _http_json("GET", f"{API_BASE}/")
         check("GET /", True, "Simulation Backend is running")
@@ -1169,16 +1196,102 @@ def task_verify(args: argparse.Namespace) -> int:
         reachable = False
 
     if reachable:
-        info("\n=== 3/4 API 冒烟测试 ===")
+        info("\n=== 3/7 认证（后续所有检查都要带令牌）===")
+        # 用**固定的测试账号**（登录优先，不存在才注册），避免每次 verify 都往
+        # 开发库里塞新用户。用两个账号是为了能在真实 HTTP 栈上验证隔离——
+        # 单测是直接构造 Authorization 头调 require_user 的，
+        # **没有覆盖 FastAPI 的 Header 依赖注入**，那条链路只有这里能验。
+        alice = bob = None
+        api_headers: dict = {}
         try:
-            materials = _http_json("GET", f"{API_BASE}/api/materials")
+            unauth = _http_status("GET", f"{API_BASE}/api/projects")
+            check(
+                "未登录访问项目列表被拒（401）",
+                unauth == 401,
+                f"GET /api/projects（无令牌）-> HTTP {unauth}",
+            )
+            no_scheme = _http_status(
+                "GET", f"{API_BASE}/api/projects",
+                headers={"Authorization": "token-without-scheme"},
+            )
+            check(
+                "非 Bearer 方案也被拒（401）",
+                no_scheme == 401,
+                f"Authorization: token-without-scheme -> HTTP {no_scheme}",
+            )
+            bad_token = _http_status(
+                "GET", f"{API_BASE}/api/projects", headers=_bearer("not-a-real-token")
+            )
+            check(
+                "伪造令牌被拒（401）",
+                bad_token == 401,
+                f"Bearer not-a-real-token -> HTTP {bad_token}",
+            )
+
+            # 求解/上传类端点现在也要求登录，必须逐个确认（它们以前是开放的）
+            for path, method in (
+                ("/api/materials", "GET"),
+                ("/api/geometry/test_part.step/metadata", "GET"),
+                ("/api/solve", "POST"),
+                ("/api/jobs", "GET"),
+            ):
+                status = _http_status(method, f"{API_BASE}{path}", {})
+                check(
+                    f"未登录访问 {path} 被拒（401）",
+                    status == 401,
+                    f"{method} {path}（无令牌）-> HTTP {status}",
+                )
+
+            alice = _login_or_register("verify_alice", "verify-alice-pass")
+            bob = _login_or_register("verify_bob", "verify-bob-pass")
+            api_headers = _bearer(alice["token"])
+            check(
+                "登录返回令牌，且响应不含口令哈希",
+                bool(alice.get("token")) and bool(alice.get("user", {}).get("id"))
+                and "passwordHash" not in json.dumps(alice),
+                f"alice id={alice.get('user', {}).get('id')}",
+            )
+
+            me = _http_json("GET", f"{API_BASE}/api/auth/me",
+                            headers=api_headers)
+            check(
+                "/auth/me 返回令牌对应的用户",
+                me.get("id") == alice["user"]["id"]
+                and me.get("username") == "verify_alice",
+                f"username={me.get('username')}",
+            )
+
+            wrong_password = _http_status(
+                "POST", f"{API_BASE}/api/auth/login",
+                {"username": "verify_alice", "password": "definitely-wrong"},
+            )
+            unknown_user = _http_status(
+                "POST", f"{API_BASE}/api/auth/login",
+                {"username": "definitely_not_here", "password": "whatever-pass"},
+            )
+            check(
+                "口令错误与用户不存在返回同样的 401（不给用户名枚举）",
+                wrong_password == 401 and unknown_user == 401,
+                f"错误口令={wrong_password}，不存在用户={unknown_user}",
+            )
+        except Exception as exc:
+            import traceback
+
+            traceback.print_exc()
+            check("认证流程", False, f"{type(exc).__name__}: {exc}")
+
+    if reachable:
+        info("\n=== 4/7 API 冒烟测试 ===")
+        try:
+            materials = _http_json("GET", f"{API_BASE}/api/materials",
+                                   headers=api_headers)
             check(
                 "材料库",
                 bool(materials) and materials[0].get("type") is not None,
                 f"{len(materials)} 种，type={materials[0].get('type')}",
             )
 
-            metadata = _http_json("GET", f"{API_BASE}/api/geometry/test_part.step/metadata")
+            metadata = _http_json("GET", f"{API_BASE}/api/geometry/test_part.step/metadata", headers=api_headers)
             faces = metadata["faces"]
             with_normal = sum(1 for f in faces if f.get("normal"))
             with_area = sum(1 for f in faces if (f.get("area") or 0) > 0)
@@ -1200,10 +1313,11 @@ def task_verify(args: argparse.Namespace) -> int:
         except Exception as exc:
             check("API 冒烟测试", False, f"{type(exc).__name__}: {exc}")
 
-        info("\n=== 4/4 求解器物理校准 ===")
+        info("\n=== 5/7 求解器物理校准 ===")
         try:
             mesh = _http_json(
-                "POST", f"{API_BASE}/api/generate-mesh?filename=test_part.step&mesh_size=1.2"
+                "POST", f"{API_BASE}/api/generate-mesh?filename=test_part.step&mesh_size=1.2",
+                headers=api_headers,
             )
             check(
                 "网格生成（带孔方块）",
@@ -1225,7 +1339,7 @@ def task_verify(args: argparse.Namespace) -> int:
                 ],
                 "faces": mesh["faces"],
             }
-            result = _http_json("POST", f"{API_BASE}/api/solve", body)
+            result = _http_json("POST", f"{API_BASE}/api/solve", body, headers=api_headers)
             check("求解返回", result.get("status") == "solved", f"status={result.get('status')}")
 
             total_fx = sum(force[0] for force in result["reaction_forces"].values())
@@ -1259,7 +1373,8 @@ def task_verify(args: argparse.Namespace) -> int:
 
             # 立方体单轴拉伸：与解析解 FL/AE 对照（必须按真实法向挑面）
             cube = _http_json(
-                "POST", f"{API_BASE}/api/generate-mesh?filename=default_cube.step&mesh_size=1.5"
+                "POST", f"{API_BASE}/api/generate-mesh?filename=default_cube.step&mesh_size=1.5",
+                headers=api_headers,
             )
             cube_minus = _face_by_normal(cube["faces"], 0, -1)
             cube_plus = _face_by_normal(cube["faces"], 0, 1)
@@ -1275,7 +1390,7 @@ def task_verify(args: argparse.Namespace) -> int:
                 ],
                 "faces": cube["faces"],
             }
-            cube_result = _http_json("POST", f"{API_BASE}/api/solve", cube_body)
+            cube_result = _http_json("POST", f"{API_BASE}/api/solve", cube_body, headers=api_headers)
 
             best_index, best_distance = -1, float("inf")
             for index, node in enumerate(cube["nodes"]):
@@ -1294,7 +1409,7 @@ def task_verify(args: argparse.Namespace) -> int:
 
             # 单位制：同一份网格按 mm 解释时，长度缩小 1000 倍 ⇒ 面积缩小 1e6 倍
             # ⇒ 应力放大 1e6 倍（位移放大 1000 倍）。这是端到端的单位换算校验。
-            cube_mm = _http_json("POST", f"{API_BASE}/api/solve", dict(cube_body, length_unit="mm"))
+            cube_mm = _http_json("POST", f"{API_BASE}/api/solve", dict(cube_body, length_unit="mm"), headers=api_headers)
             stress_ratio = cube_mm["max_stress"] / cube_result["max_stress"]
             check(
                 "单位换算 (mm vs m：应力 ×1000²)",
@@ -1314,11 +1429,12 @@ def task_verify(args: argparse.Namespace) -> int:
                 "POST",
                 f"{API_BASE}/api/jobs/generate-mesh",
                 {"filename": "test_part.step", "mesh_size": 1.2},
+                headers=api_headers,
             )
             job_payload: dict = {}
             for _ in range(120):
                 time.sleep(0.5)
-                job_payload = _http_json("GET", f"{API_BASE}/api/jobs/{submitted['job_id']}")
+                job_payload = _http_json("GET", f"{API_BASE}/api/jobs/{submitted['job_id']}", headers=api_headers)
                 if job_payload.get("status") in ("succeeded", "failed"):
                     break
 
@@ -1349,7 +1465,7 @@ def task_verify(args: argparse.Namespace) -> int:
                      "temperature": 373.15},
                 ],
             }
-            thermal = _http_json("POST", f"{API_BASE}/api/thermal/solve", thermal_body)
+            thermal = _http_json("POST", f"{API_BASE}/api/thermal/solve", thermal_body, headers=api_headers)
             expected_flux = 50.0 * (373.15 - 273.15) / 10.0   # k=50, L=10 m
             check(
                 "稳态热传导 vs 解析解 q=kΔT/L",
@@ -1380,13 +1496,15 @@ def task_verify(args: argparse.Namespace) -> int:
                 ],
             }
             submitted_thermal = _http_json(
-                "POST", f"{API_BASE}/api/jobs/thermal", frontend_thermal
+                "POST", f"{API_BASE}/api/jobs/thermal", frontend_thermal,
+                headers=api_headers,
             )
             thermal_job: dict = {}
             for _ in range(120):
                 time.sleep(0.5)
                 thermal_job = _http_json(
-                    "GET", f"{API_BASE}/api/jobs/{submitted_thermal['job_id']}"
+                    "GET", f"{API_BASE}/api/jobs/{submitted_thermal['job_id']}",
+                    headers=api_headers,
                 )
                 if thermal_job.get("status") in ("succeeded", "failed"):
                     break
@@ -1414,11 +1532,12 @@ def task_verify(args: argparse.Namespace) -> int:
                     "num_modes": num_modes,
                     "faces": cube["faces"],
                     "boundary_conditions": bcs,
-                })
+                }, headers=api_headers)
                 for _ in range(240):
                     time.sleep(0.5)
                     payload = _http_json(
-                        "GET", f"{API_BASE}/api/jobs/{submitted_modal['job_id']}"
+                        "GET", f"{API_BASE}/api/jobs/{submitted_modal['job_id']}",
+                        headers=api_headers,
                     )
                     if payload.get("status") in ("succeeded", "failed"):
                         return payload
@@ -1493,290 +1612,221 @@ def task_verify(args: argparse.Namespace) -> int:
             traceback.print_exc()
             check("求解器物理校准", False, f"{type(exc).__name__}: {exc}")
 
-    if reachable:
-        info("\n=== 5/6 认证与用户隔离 ===")
-        # 用**固定的测试账号**（登录优先，不存在才注册），避免每次 verify 都往
-        # 开发库里塞新用户。用两个账号是为了能在真实 HTTP 栈上验证隔离——
-        # 单测是直接构造 Authorization 头调 require_user 的，
-        # **没有覆盖 FastAPI 的 Header 依赖注入**，那条链路只有这里能验。
-        alice = bob = None
+    if reachable and alice and bob:
+        info("\n=== 6/7 项目隔离（属主）===")
+        created_id: Optional[str] = None
         try:
-            unauth = _http_status("GET", f"{API_BASE}/api/projects")
+            marker = f"verify-{uuid.uuid4().hex[:8]}"
+            alice_headers = _bearer(alice["token"])
+            bob_headers = _bearer(bob["token"])
+
+            created = _http_json(
+                "POST", f"{API_BASE}/api/projects",
+                {
+                    "title": f"契约检查 {marker}",
+                    "description": "由 tools/tasks.py verify 创建，跑完会删掉",
+                    "simulationType": "FEA",
+                    "isPrivate": True,
+                },
+                headers=alice_headers,
+            )
+            created_id = created.get("id")
+
             check(
-                "未登录访问项目列表被拒（401）",
-                unauth == 401,
-                f"GET /api/projects（无令牌）-> HTTP {unauth}",
-            )
-            no_scheme = _http_status(
-                "GET", f"{API_BASE}/api/projects",
-                headers={"Authorization": "token-without-scheme"},
-            )
-            check(
-                "非 Bearer 方案也被拒（401）",
-                no_scheme == 401,
-                f"Authorization: token-without-scheme -> HTTP {no_scheme}",
-            )
-            bad_token = _http_status(
-                "GET", f"{API_BASE}/api/projects", headers=_bearer("not-a-real-token")
-            )
-            check(
-                "伪造令牌被拒（401）",
-                bad_token == 401,
-                f"Bearer not-a-real-token -> HTTP {bad_token}",
+                "创建项目返回服务端 ID、时间戳与属主",
+                bool(created_id) and bool(created.get("createdAt"))
+                and str(created.get("createdAt", "")).endswith("+00:00")
+                and created.get("ownerId") == alice["user"]["id"],
+                f"id={created_id} owner={created.get('ownerId')}",
             )
 
-            alice = _login_or_register("verify_alice", "verify-alice-pass")
-            bob = _login_or_register("verify_bob", "verify-bob-pass")
+            listing = _http_json(
+                "GET", f"{API_BASE}/api/projects", headers=alice_headers
+            )
+            ids = [item.get("id") for item in listing] if isinstance(listing, list) else []
             check(
-                "登录返回令牌，且响应不含口令哈希",
-                bool(alice.get("token")) and bool(alice.get("user", {}).get("id"))
-                and "passwordHash" not in json.dumps(alice),
-                f"alice id={alice.get('user', {}).get('id')}",
+                "新项目出现在自己的列表最前",
+                bool(ids) and ids[0] == created_id,
+                f"{len(ids)} 个项目，第一个={ids[0] if ids else None}",
             )
 
-            me = _http_json("GET", f"{API_BASE}/api/auth/me",
-                            headers=_bearer(alice["token"]))
-            check(
-                "/auth/me 返回令牌对应的用户",
-                me.get("id") == alice["user"]["id"]
-                and me.get("username") == "verify_alice",
-                f"username={me.get('username')}",
-            )
-
-            wrong_password = _http_status(
-                "POST", f"{API_BASE}/api/auth/login",
-                {"username": "verify_alice", "password": "definitely-wrong"},
-            )
-            unknown_user = _http_status(
-                "POST", f"{API_BASE}/api/auth/login",
-                {"username": "definitely_not_here", "password": "whatever-pass"},
+            fetched = _http_json(
+                "GET", f"{API_BASE}/api/projects/{created_id}",
+                headers=alice_headers,
             )
             check(
-                "口令错误与用户不存在返回同样的 401（不给用户名枚举）",
-                wrong_password == 401 and unknown_user == 401,
-                f"错误口令={wrong_password}，不存在用户={unknown_user}",
+                "按 ID 取回同一项目",
+                fetched.get("id") == created_id
+                and fetched.get("title") == f"契约检查 {marker}",
+                f"title={fetched.get('title')}",
             )
-        except Exception as exc:
-            import traceback
 
-            traceback.print_exc()
-            check("认证流程", False, f"{type(exc).__name__}: {exc}")
+            renamed = _http_json(
+                "PATCH", f"{API_BASE}/api/projects/{created_id}",
+                {"title": "改名后"}, headers=alice_headers,
+            )
+            check(
+                "PATCH 只改给定字段",
+                renamed.get("title") == "改名后"
+                and renamed.get("description")
+                == "由 tools/tasks.py verify 创建，跑完会删掉",
+                f"title={renamed.get('title')}",
+            )
 
-        if alice and bob:
-            info("\n=== 6/6 项目隔离（属主）===")
-            created_id: Optional[str] = None
-            try:
-                marker = f"verify-{uuid.uuid4().hex[:8]}"
-                alice_headers = _bearer(alice["token"])
-                bob_headers = _bearer(bob["token"])
-
-                created = _http_json(
+            check(
+                "服务端拒绝客户端自选 ID",
+                _http_status(
                     "POST", f"{API_BASE}/api/projects",
-                    {
-                        "title": f"契约检查 {marker}",
-                        "description": "由 tools/tasks.py verify 创建，跑完会删掉",
-                        "simulationType": "FEA",
-                        "isPrivate": True,
-                    },
-                    headers=alice_headers,
-                )
-                created_id = created.get("id")
+                    {"id": "my-own-id", "title": "x"}, headers=alice_headers,
+                ) == 422,
+                "请求体里带 id 应为 422（否则客户端能覆盖别人的记录）",
+            )
+            check(
+                "空标题被拒绝",
+                _http_status(
+                    "POST", f"{API_BASE}/api/projects",
+                    {"title": "   "}, headers=alice_headers,
+                ) == 422,
+                "空标题应为 422",
+            )
 
-                check(
-                    "创建项目返回服务端 ID、时间戳与属主",
-                    bool(created_id) and bool(created.get("createdAt"))
-                    and str(created.get("createdAt", "")).endswith("+00:00")
-                    and created.get("ownerId") == alice["user"]["id"],
-                    f"id={created_id} owner={created.get('ownerId')}",
-                )
+            # ---- 本轮的核心承诺：看不到、改不了别人的东西 ----
+            bob_list = _http_json(
+                "GET", f"{API_BASE}/api/projects", headers=bob_headers
+            )
+            bob_ids = (
+                [item.get("id") for item in bob_list]
+                if isinstance(bob_list, list) else []
+            )
+            check(
+                "另一个用户看不到这个项目",
+                created_id not in bob_ids,
+                f"bob 有 {len(bob_ids)} 个项目",
+            )
+            check(
+                "另一个用户读别人的项目是 404（不是 403）",
+                _http_status(
+                    "GET", f"{API_BASE}/api/projects/{created_id}",
+                    headers=bob_headers,
+                ) == 404,
+                "404 而不是 403：不确认该 id 是否存在",
+            )
+            check(
+                "另一个用户改不了别人的项目（404）",
+                _http_status(
+                    "PATCH", f"{API_BASE}/api/projects/{created_id}",
+                    {"title": "被改了"}, headers=bob_headers,
+                ) == 404,
+                "改他人项目应为 404",
+            )
+            check(
+                "另一个用户删不掉别人的项目（404）",
+                _http_status(
+                    "DELETE", f"{API_BASE}/api/projects/{created_id}",
+                    headers=bob_headers,
+                ) == 404,
+                "删他人项目应为 404",
+            )
+            # 而且确实没有被改动
+            still = _http_json(
+                "GET", f"{API_BASE}/api/projects/{created_id}",
+                headers=alice_headers,
+            )
+            check(
+                "被拒绝的操作没有产生任何副作用",
+                still.get("title") == "改名后",
+                f"title={still.get('title')}",
+            )
 
-                listing = _http_json(
+            _http_json(
+                "DELETE", f"{API_BASE}/api/projects/{created_id}",
+                headers=alice_headers,
+            )
+            deleted_status = _http_status(
+                "GET", f"{API_BASE}/api/projects/{created_id}",
+                headers=alice_headers,
+            )
+            check(
+                "删除后确实不存在（404 而不是静默成功）",
+                deleted_status == 404,
+                f"GET 已删除项目 -> HTTP {deleted_status}",
+            )
+            created_id = None
+
+            # ---- 遗留项目（owner_id IS NULL）：可见、不可改、可显式认领 ----
+            # 这类数据只能靠直接写库造出来（HTTP 接口创建的项目一定有属主），
+            # 因此这里显式插一行再删掉，模拟"接上登录之前的数据库"。
+            legacy_id = f"legacy{uuid.uuid4().hex[:6]}"
+            try:
+                _insert_legacy_project(legacy_id, "遗留项目（verify 临时造）")
+                visible = _http_json(
                     "GET", f"{API_BASE}/api/projects", headers=alice_headers
                 )
-                ids = [item.get("id") for item in listing] if isinstance(listing, list) else []
+                legacy_row = next(
+                    (item for item in visible if item.get("id") == legacy_id), None
+                ) if isinstance(visible, list) else None
                 check(
-                    "新项目出现在自己的列表最前",
-                    bool(ids) and ids[0] == created_id,
-                    f"{len(ids)} 个项目，第一个={ids[0] if ids else None}",
-                )
-
-                fetched = _http_json(
-                    "GET", f"{API_BASE}/api/projects/{created_id}",
-                    headers=alice_headers,
+                    "无主项目对已登录用户可见，且仍标为未归属",
+                    legacy_row is not None and legacy_row.get("ownerId") is None,
+                    f"ownerId={legacy_row.get('ownerId') if legacy_row else '未找到'}",
                 )
                 check(
-                    "按 ID 取回同一项目",
-                    fetched.get("id") == created_id
-                    and fetched.get("title") == f"契约检查 {marker}",
-                    f"title={fetched.get('title')}",
-                )
-
-                renamed = _http_json(
-                    "PATCH", f"{API_BASE}/api/projects/{created_id}",
-                    {"title": "改名后"}, headers=alice_headers,
-                )
-                check(
-                    "PATCH 只改给定字段",
-                    renamed.get("title") == "改名后"
-                    and renamed.get("description")
-                    == "由 tools/tasks.py verify 创建，跑完会删掉",
-                    f"title={renamed.get('title')}",
-                )
-
-                check(
-                    "服务端拒绝客户端自选 ID",
+                    "无主项目在认领前不可删（404）",
                     _http_status(
-                        "POST", f"{API_BASE}/api/projects",
-                        {"id": "my-own-id", "title": "x"}, headers=alice_headers,
-                    ) == 422,
-                    "请求体里带 id 应为 422（否则客户端能覆盖别人的记录）",
-                )
-                check(
-                    "空标题被拒绝",
-                    _http_status(
-                        "POST", f"{API_BASE}/api/projects",
-                        {"title": "   "}, headers=alice_headers,
-                    ) == 422,
-                    "空标题应为 422",
-                )
-
-                # ---- 本轮的核心承诺：看不到、改不了别人的东西 ----
-                bob_list = _http_json(
-                    "GET", f"{API_BASE}/api/projects", headers=bob_headers
-                )
-                bob_ids = (
-                    [item.get("id") for item in bob_list]
-                    if isinstance(bob_list, list) else []
-                )
-                check(
-                    "另一个用户看不到这个项目",
-                    created_id not in bob_ids,
-                    f"bob 有 {len(bob_ids)} 个项目",
-                )
-                check(
-                    "另一个用户读别人的项目是 404（不是 403）",
-                    _http_status(
-                        "GET", f"{API_BASE}/api/projects/{created_id}",
-                        headers=bob_headers,
+                        "DELETE", f"{API_BASE}/api/projects/{legacy_id}",
+                        headers=alice_headers,
                     ) == 404,
-                    "404 而不是 403：不确认该 id 是否存在",
+                    "应先认领再操作，避免任意用户改动遗留数据",
+                )
+                claimed = _http_json(
+                    "POST", f"{API_BASE}/api/projects/{legacy_id}/claim",
+                    None, headers=alice_headers,
                 )
                 check(
-                    "另一个用户改不了别人的项目（404）",
+                    "认领后归属变为当前用户",
+                    claimed.get("ownerId") == alice["user"]["id"],
+                    f"ownerId={claimed.get('ownerId')}",
+                )
+                check(
+                    "别人不能认领已经属于他人的项目（404）",
                     _http_status(
-                        "PATCH", f"{API_BASE}/api/projects/{created_id}",
-                        {"title": "被改了"}, headers=bob_headers,
-                    ) == 404,
-                    "改他人项目应为 404",
-                )
-                check(
-                    "另一个用户删不掉别人的项目（404）",
-                    _http_status(
-                        "DELETE", f"{API_BASE}/api/projects/{created_id}",
-                        headers=bob_headers,
-                    ) == 404,
-                    "删他人项目应为 404",
-                )
-                # 而且确实没有被改动
-                still = _http_json(
-                    "GET", f"{API_BASE}/api/projects/{created_id}",
-                    headers=alice_headers,
-                )
-                check(
-                    "被拒绝的操作没有产生任何副作用",
-                    still.get("title") == "改名后",
-                    f"title={still.get('title')}",
-                )
-
-                _http_json(
-                    "DELETE", f"{API_BASE}/api/projects/{created_id}",
-                    headers=alice_headers,
-                )
-                deleted_status = _http_status(
-                    "GET", f"{API_BASE}/api/projects/{created_id}",
-                    headers=alice_headers,
-                )
-                check(
-                    "删除后确实不存在（404 而不是静默成功）",
-                    deleted_status == 404,
-                    f"GET 已删除项目 -> HTTP {deleted_status}",
-                )
-                created_id = None
-
-                # ---- 遗留项目（owner_id IS NULL）：可见、不可改、可显式认领 ----
-                # 这类数据只能靠直接写库造出来（HTTP 接口创建的项目一定有属主），
-                # 因此这里显式插一行再删掉，模拟"接上登录之前的数据库"。
-                legacy_id = f"legacy{uuid.uuid4().hex[:6]}"
-                try:
-                    _insert_legacy_project(legacy_id, "遗留项目（verify 临时造）")
-                    visible = _http_json(
-                        "GET", f"{API_BASE}/api/projects", headers=alice_headers
-                    )
-                    legacy_row = next(
-                        (item for item in visible if item.get("id") == legacy_id), None
-                    ) if isinstance(visible, list) else None
-                    check(
-                        "无主项目对已登录用户可见，且仍标为未归属",
-                        legacy_row is not None and legacy_row.get("ownerId") is None,
-                        f"ownerId={legacy_row.get('ownerId') if legacy_row else '未找到'}",
-                    )
-                    check(
-                        "无主项目在认领前不可删（404）",
-                        _http_status(
-                            "DELETE", f"{API_BASE}/api/projects/{legacy_id}",
-                            headers=alice_headers,
-                        ) == 404,
-                        "应先认领再操作，避免任意用户改动遗留数据",
-                    )
-                    claimed = _http_json(
                         "POST", f"{API_BASE}/api/projects/{legacy_id}/claim",
-                        None, headers=alice_headers,
-                    )
-                    check(
-                        "认领后归属变为当前用户",
-                        claimed.get("ownerId") == alice["user"]["id"],
-                        f"ownerId={claimed.get('ownerId')}",
-                    )
-                    check(
-                        "别人不能认领已经属于他人的项目（404）",
-                        _http_status(
-                            "POST", f"{API_BASE}/api/projects/{legacy_id}/claim",
-                            None, headers=bob_headers,
-                        ) == 404,
-                        "认领不能变成「任意项目过户」",
-                    )
-                    renamed_after_claim = _http_json(
-                        "PATCH", f"{API_BASE}/api/projects/{legacy_id}",
-                        {"title": "认领后可改名"}, headers=alice_headers,
-                    )
-                    check(
-                        "认领后可以正常改名",
-                        renamed_after_claim.get("title") == "认领后可改名",
-                        f"title={renamed_after_claim.get('title')}",
-                    )
-                except Exception as exc:
-                    import traceback
-
-                    traceback.print_exc()
-                    check("遗留项目与认领流程", False, f"{type(exc).__name__}: {exc}")
-                finally:
-                    _delete_legacy_project(legacy_id)
+                        None, headers=bob_headers,
+                    ) == 404,
+                    "认领不能变成「任意项目过户」",
+                )
+                renamed_after_claim = _http_json(
+                    "PATCH", f"{API_BASE}/api/projects/{legacy_id}",
+                    {"title": "认领后可改名"}, headers=alice_headers,
+                )
+                check(
+                    "认领后可以正常改名",
+                    renamed_after_claim.get("title") == "认领后可改名",
+                    f"title={renamed_after_claim.get('title')}",
+                )
             except Exception as exc:
                 import traceback
 
                 traceback.print_exc()
-                check("项目管理 CRUD 与隔离", False, f"{type(exc).__name__}: {exc}")
+                check("遗留项目与认领流程", False, f"{type(exc).__name__}: {exc}")
             finally:
-                # 检查用的项目不要留在用户的数据库里
-                # （测试账号本身会留下，`verify_alice` / `verify_bob` 是可预期的）
-                if created_id and alice:
-                    try:
-                        _http_json(
-                            "DELETE", f"{API_BASE}/api/projects/{created_id}",
-                            headers=_bearer(alice["token"]),
-                        )
-                    except Exception:  # noqa: BLE001 - 清理失败不该影响验证结论
-                        pass
+                _delete_legacy_project(legacy_id)
+        except Exception as exc:
+            import traceback
+
+            traceback.print_exc()
+            check("项目管理 CRUD 与隔离", False, f"{type(exc).__name__}: {exc}")
+        finally:
+            # 检查用的项目不要留在用户的数据库里
+            # （测试账号本身会留下，`verify_alice` / `verify_bob` 是可预期的）
+            if created_id and alice:
+                try:
+                    _http_json(
+                        "DELETE", f"{API_BASE}/api/projects/{created_id}",
+                        headers=_bearer(alice["token"]),
+                    )
+                except Exception:  # noqa: BLE001 - 清理失败不该影响验证结论
+                    pass
 
     failed = [name for name, passed, _ in checks if not passed]
     print()

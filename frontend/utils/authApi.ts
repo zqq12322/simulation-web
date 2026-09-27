@@ -147,6 +147,40 @@ export function isUnauthorized(error: unknown): boolean {
 }
 
 /**
+ * 会话失效事件名。
+ *
+ * 求解/网格/材料这些调用散落在 `Workbench`、`AIAssistantPanel`、`MaterialSelector`
+ * 里，它们**拿不到 App 的会话状态**。与其把 token 与回调层层透传下去，
+ * 不如让任何一处遇到 401 时广播一个事件，由 App 统一处理
+ * （清令牌 + 回登录面板）。这与项目里既有的 `apply-ai-params` 事件是同一个套路。
+ */
+export const SESSION_EXPIRED_EVENT = 'simcloud:session-expired';
+
+/**
+ * 取当前令牌的请求头。
+ *
+ * 从存储里读，而不是要求每个调用方把 token 传进来：令牌本来就是这个 App 的
+ * 会话级状态，存储已经是它的持久层——再传一份到各处只会制造两个真相。
+ * 这样任何一处 axios 调用都能直接用，不必穿透组件树。
+ */
+export function currentAuthHeaders(
+  extra: Record<string, string> = {},
+): Record<string, string> {
+  return authorizationHeader(readStoredToken(), extra);
+}
+
+/** 广播"会话已失效"，让 App 统一清理并回到登录面板。 */
+export function notifySessionExpired(detail?: string): void {
+  try {
+    window.dispatchEvent(
+      new CustomEvent(SESSION_EXPIRED_EVENT, { detail: detail || '' }),
+    );
+  } catch {
+    // 非浏览器环境（例如 node 里跑断言）没有 window：忽略即可
+  }
+}
+
+/**
  * 把认证请求的错误翻译成用户能看懂的一句话。
  *
  * **必须区分 401 与"连不上后端"**：前者要重新登录，后者要先把服务起起来。

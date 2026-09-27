@@ -49,7 +49,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import scipy.sparse.linalg as spla
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from skfem import Basis, BilinearForm, ElementTetP1, ElementVectorH1, MeshTet, asm
 from skfem.helpers import dot
@@ -69,7 +69,13 @@ from logging_config import get_logger
 from materials import MATERIALS_DB
 
 logger = get_logger(__name__)
-router = APIRouter()
+from auth import require_user
+
+#: 整个 router 都要求登录。用**路由级依赖**而不是给每个端点加参数：
+#: 端点本身并不需要知道「你是谁」，而且 40 多个既有测试是**直接调用端点函数**的
+#: （不经 HTTP），逐个加参数会让它们全部失效。
+router = APIRouter(dependencies=[Depends(require_user)])
+
 
 #: 模态分析里有意义的边界条件类型（都是约束类）
 SUPPORTED_TYPES = {"fixed", "displacement"}

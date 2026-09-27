@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { MessageSquare, Send, X, Sparkles, AlertTriangle, FileJson } from 'lucide-react';
 import axios from 'axios';
+import { currentAuthHeaders, isUnauthorized, notifySessionExpired } from '../utils/authApi';
 
 export interface AIAssistantPanelRef {
   triggerDiagnostic: (errorMessage?: string) => void;
@@ -113,7 +114,9 @@ const AIAssistantPanel = React.forwardRef<AIAssistantPanelRef, AIAssistantPanelP
         endpoint = `${API_BASE_URL}/api/ai/configure`;
       }
 
-      const response = await axios.post(endpoint, requestData);
+      const response = await axios.post(endpoint, requestData, {
+        headers: currentAuthHeaders(),
+      });
       
       const aiContent: string = response.data?.response ?? '';
       if (!aiContent) {
@@ -132,6 +135,11 @@ const AIAssistantPanel = React.forwardRef<AIAssistantPanelRef, AIAssistantPanelP
 
     } catch (error) {
       console.error('AI Error:', error);
+      if (isUnauthorized(error)) {
+        notifySessionExpired('登录已失效，请重新登录后再使用 AI 助手。');
+        setMessages(prev => [...prev, { role: 'system', content: '登录已失效，请重新登录。', type: 'text' }]);
+        return;
+      }
       setMessages(prev => [...prev, { role: 'system', content: 'AI 服务暂时不可用，请检查后端连接。', type: 'text' }]);
     } finally {
       setLoading(false);

@@ -1,6 +1,7 @@
 import React, { useRef, useState } from 'react';
 import { X, UploadCloud, FileBox, CheckCircle, Loader2 } from 'lucide-react';
 import axios from 'axios';
+import { currentAuthHeaders, isUnauthorized, notifySessionExpired } from '../utils/authApi';
 
 interface ImportModalProps {
   isOpen: boolean;
@@ -74,9 +75,10 @@ const ImportModal: React.FC<ImportModalProps> = ({ isOpen, onClose, onImport }) 
         
         // Upload to backend
         const response = await axios.post(`${API_BASE_URL}/api/upload-geometry`, formData, {
-          headers: {
-            'Content-Type': 'multipart/form-data'
-          }
+          // 只带认证头，**不要显式设置 Content-Type**：FormData 必须由浏览器
+          // 自己带上 multipart 的 boundary，手写 'multipart/form-data' 反而可能
+          // 让后端解析不出分片。
+          headers: currentAuthHeaders(),
         });
         
         console.log("Upload successful:", response.data);
@@ -87,6 +89,11 @@ const ImportModal: React.FC<ImportModalProps> = ({ isOpen, onClose, onImport }) 
         
       } catch (err) {
         console.error("Upload failed:", err);
+        if (isUnauthorized(err)) {
+          notifySessionExpired('登录已失效，请重新登录后再上传几何。');
+          setError("登录已失效，请重新登录。");
+          return;
+        }
         setError("上传文件失败。请确保后端服务已启动。");
       } finally {
         setUploading(false);

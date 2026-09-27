@@ -16,6 +16,7 @@ import {
 } from './utils/projectsApi';
 import {
   AuthSession,
+  SESSION_EXPIRED_EVENT,
   authorizationHeader,
   clearStoredToken,
   describeAuthError,
@@ -155,6 +156,21 @@ function App() {
     if (!session) return;
     refreshProjects();
   }, [session, refreshProjects]);
+
+  /**
+   * 会话失效的统一入口。
+   *
+   * 求解、网格、材料、AI 这些调用散落在子组件里，它们遇到 401 时只能广播事件
+   * ——否则就得把 token 和回调一层层传下去。收在这里处理一次。
+   */
+  useEffect(() => {
+    const handleExpired = (event: Event) => {
+      const detail = (event as CustomEvent<string>).detail;
+      handleSessionExpired(detail || undefined);
+    };
+    window.addEventListener(SESSION_EXPIRED_EVENT, handleExpired);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, handleExpired);
+  }, [handleSessionExpired]);
 
   /** 登录 / 注册。失败时抛错，由 AuthPanel 显示原因。 */
   const handleAuthenticate = async (

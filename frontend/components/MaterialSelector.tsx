@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { X, Plus, Check, ChevronDown, ChevronUp, RefreshCw, AlertTriangle } from 'lucide-react';
 import { Material } from '../types';
 import axios from 'axios';
+import { currentAuthHeaders, isUnauthorized, notifySessionExpired } from '../utils/authApi';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
@@ -38,10 +39,18 @@ const MaterialSelector: React.FC<MaterialSelectorProps> = ({
     setLoading(true);
     setError(null);
     try {
-      const response = await axios.get(`${API_BASE_URL}/api/materials`);
+      const response = await axios.get(`${API_BASE_URL}/api/materials`, {
+        headers: currentAuthHeaders(),
+      });
       setMaterials(response.data);
     } catch (err) {
       console.error("Failed to fetch materials:", err);
+      if (isUnauthorized(err)) {
+        notifySessionExpired('登录已失效，请重新登录。');
+        setError('登录已失效，请重新登录。');
+        return;
+      }
+      // 401 与"后端没起来"是两回事，提示必须分开——否则用户会一直去重启服务
       setError(`无法从后端加载材料库 (${API_BASE_URL})，请确认后端服务已启动。`);
       setMaterials([]);
     } finally {
@@ -70,7 +79,9 @@ const MaterialSelector: React.FC<MaterialSelectorProps> = ({
       };
       
       // Save to backend so it is selectable there as well
-      await axios.post(`${API_BASE_URL}/api/materials`, newMaterialPayload);
+      await axios.post(`${API_BASE_URL}/api/materials`, newMaterialPayload, {
+        headers: currentAuthHeaders(),
+      });
       
       setMaterials([...materials, newMaterialPayload]);
       setShowCustomMaterialForm(false);
@@ -84,7 +95,12 @@ const MaterialSelector: React.FC<MaterialSelectorProps> = ({
       });
     } catch (err) {
       console.error("Failed to create material:", err);
-      alert("Failed to save custom material");
+      if (isUnauthorized(err)) {
+        notifySessionExpired('登录已失效，请重新登录后再保存材料。');
+        return;
+      }
+      const detail = (err as any)?.response?.data?.detail;
+      alert(detail ? `保存材料失败：${detail}` : "保存自定义材料失败");
     }
   };
 

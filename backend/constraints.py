@@ -1,8 +1,14 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, ConfigDict
 from typing import List, Literal, Optional, Union
 
-router = APIRouter()
+from auth import require_user
+
+#: 整个 router 都要求登录。用**路由级依赖**而不是给每个端点加参数：
+#: 端点本身并不需要知道「你是谁」，而且 40 多个既有测试是**直接调用端点函数**的
+#: （不经 HTTP），逐个加参数会让它们全部失效。
+router = APIRouter(dependencies=[Depends(require_user)])
+
 
 class Vector3(BaseModel):
     x: float
