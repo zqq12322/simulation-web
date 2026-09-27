@@ -6,61 +6,14 @@ import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { Material, AnyBoundaryCondition, MeshSettings } from '../types';
 import { Eye, EyeOff, MousePointer2, Hexagon, Component, BoxSelect } from 'lucide-react';
-
-  // Custom Shader for Simulation Results (Rainbow Color Map)
-const SimulationResultShader = {
-  vertexShader: `
-    varying vec3 vPosition;
-    varying vec3 vNormal;
-    varying float vStress;
-    attribute float stress; 
-    // attribute vec3 displacement;
-    
-    void main() {
-      vPosition = position;
-      vNormal = normal;
-      vStress = stress;
-      
-      // Apply deformation (placeholder - needs displacement attribute)
-      vec3 deformedPosition = position; 
-      
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(deformedPosition, 1.0);
-    }
-  `,
-  fragmentShader: `
-    varying vec3 vPosition;
-    varying vec3 vNormal;
-    varying float vStress;
-    uniform float minVal;
-    uniform float maxVal;
-    uniform vec3 color1; // Blue
-    uniform vec3 color2; // Cyan
-    uniform vec3 color3; // Green
-    uniform vec3 color4; // Yellow
-    uniform vec3 color5; // Red
-    
-    // Function to map value to rainbow color
-    vec3 getRainbowColor(float value, float min, float max) {
-      float t = clamp((value - min) / (max - min), 0.0, 1.0);
-      
-      if (t < 0.25) return mix(color1, color2, t * 4.0);
-      if (t < 0.5) return mix(color2, color3, (t - 0.25) * 4.0);
-      if (t < 0.75) return mix(color3, color4, (t - 0.5) * 4.0);
-      return mix(color4, color5, (t - 0.75) * 4.0);
-    }
-
-    void main() {
-      // Use the actual stress value passed from vertex shader
-      vec3 color = getRainbowColor(vStress, minVal, maxVal);
-      
-      // Add simple lighting
-      vec3 lightDir = normalize(vec3(1.0, 1.0, 1.0));
-      float diff = max(dot(normalize(vNormal), lightDir), 0.3);
-      
-      gl_FragColor = vec4(color * diff, 1.0);
-    }
-  `
-};
+import { SimulationResultShader } from './resultShader';
+import {
+  computeDeformationScale,
+  displacementMagnitudes,
+  flattenDisplacements,
+  hasDisplacementField,
+  modelSpanOf,
+} from '../utils/deformation';
 
 interface ModelViewerProps {
   modelUrl?: string | null;
@@ -80,6 +33,8 @@ interface ModelViewerProps {
   // Owned by Scene3D and shared with ModelViewer so the auto-framing effect
   // can drive the OrbitControls that are declared in Scene3D's <Canvas>.
   controlsRef?: React.RefObject<any>;
+  /** 变形放大系数（无量纲），由 Scene3D 按模型尺度算出并传下来。 */
+  deformationScale?: number;
 }
 
 const ModelViewer: React.FC<ModelViewerProps> = ({ 
@@ -97,7 +52,8 @@ const ModelViewer: React.FC<ModelViewerProps> = ({
   rotation = new THREE.Euler(0, 0, 0),
   showLabels = true,
   pickingMode = 'face',
-  controlsRef
+  controlsRef,
+  deformationScale = 1
 }) => {
   const meshRef = useRef<THREE.Mesh>(null);
   const [loadedGeometry, setLoadedGeometry] = useState<THREE.BufferGeometry | null>(null);
@@ -537,6 +493,16 @@ const ModelViewer: React.FC<ModelViewerProps> = ({
           geometry.setAttribute('stress', new THREE.BufferAttribute(flatScalars, 1));
       }
 
+      // 变形场：顶点着色器按 position + displacement * scale 显示变形。
+      // 属性长度必须恰好等于顶点数，缺失时补零（见 utils/deformation.ts）。
+      geometry.setAttribute(
+          'displacement',
+          new THREE.BufferAttribute(
+              flattenDisplacements(meshData.displacements, meshData.nodes.length),
+              3,
+          ),
+      );
+
       // To prevent Z-fighting and rendering internal faces of tetrahedrons,
       // we extract only the boundary faces. A boundary face is referenced exactly once.
       const faceMap = new Map<string, { count: number, indices: [number, number, number] }>();
@@ -626,19 +592,16 @@ const ModelViewer: React.FC<ModelViewerProps> = ({
         const maxS = Math.max(...scalarField);
         resultMaterial.uniforms.minVal.value = minS;
         resultMaterial.uniforms.maxVal.value = maxS;
-        
-        // Auto-calculate deformation scale
-        if (meshData.max_displacement > 0) {
-            const targetVisualDisp = 0.5;
-            const scaleFactor = targetVisualDisp / meshData.max_displacement;
-            resultMaterial.uniforms.deformationScale.value = scaleFactor;
-        }
+
+        // 放大系数由 Scene3D 按模型尺度统一计算（旧代码在这里写死 0.5，
+        // 对毫米级 CAD 零件等于不显示变形、对 1 单位模型又夸张到 50%）。
+        resultMaterial.uniforms.deformationScale.value = deformationScale;
 
         // We already set attributes in the geometry construction effect
         // Just need to ensure material knows it needs update
         resultMaterial.needsUpdate = true;
     }
-  }, [meshSettings, meshData, resultMaterial]);
+  }, [meshSettings, meshData, resultMaterial, deformationScale]);
 
   // Determine what to render
   const geometryToRender = meshSettings?.status === 'solved' || meshSettings?.status === 'meshed' 
@@ -888,6 +851,27 @@ const Scene3D: React.FC<Scene3DProps> = (props) => {
     return { minStress: min, maxStress: max };
   }, [meshData]);
 
+  // 是否带有可显示的位移场（结构分析 / 模态振型有，热分析没有）
+  const hasDisplacements = useMemo(
+    () => hasDisplacementField(meshData?.displacements, meshData?.nodes?.length || 0),
+    [meshData],
+  );
+
+  /**
+   * 变形放大系数：把最大位移放大到模型尺度的固定比例。
+   *
+   * 位移通常比模型小好几个数量级，1:1 画出来完全看不见，所以必须放大；
+   * 但放大倍数必须相对模型尺寸——见 utils/deformation.ts 的说明
+   * （旧实现写死 0.5 个坐标单位，在毫米零件上等于没显示）。
+   */
+  const deformationScale = useMemo(() => {
+    if (!hasDisplacements) return 1;
+    const span = modelSpanOf(meshData?.nodes);
+    const peak = meshData?.max_displacement
+      ?? Math.max(0, ...displacementMagnitudes(meshData?.displacements));
+    return computeDeformationScale(peak, span);
+  }, [hasDisplacements, meshData]);
+
   return (
     <div className="w-full h-full bg-[#f0f4f8] relative">
       
@@ -1090,7 +1074,7 @@ const Scene3D: React.FC<Scene3DProps> = (props) => {
         
         <Suspense fallback={null}>
              {/* Removed Center to rule out bounding box issues */}
-             <ModelViewer {...props} showLabels={showLabels} pickingMode={pickingMode} controlsRef={controlsRef} />
+             <ModelViewer {...props} showLabels={showLabels} pickingMode={pickingMode} controlsRef={controlsRef} deformationScale={deformationScale} />
         </Suspense>
         
         <OrbitControls ref={controlsRef} makeDefault />
@@ -1146,6 +1130,15 @@ const Scene3D: React.FC<Scene3DProps> = (props) => {
             <span style={{fontSize: '10px', color: '#666'}}>
               {props.resultKind === 'thermal' ? '(°C)' : '(Pa)'}
             </span>
+            {/* 变形是放大显示的，必须告知倍数，否则用户会把画面上看到的
+                变形量当成真实位移量。 */}
+            {hasDisplacements && (
+              <span style={{fontSize: '10px', color: '#2563eb'}}>
+                变形放大 ×{deformationScale >= 100
+                  ? deformationScale.toExponential(1)
+                  : deformationScale.toFixed(1)}
+              </span>
+            )}
             <div style={{display: 'flex', flexDirection: 'row', height: '180px', gap: '10px', marginTop: '5px'}}>
                 <div style={{
                     width: '16px', 

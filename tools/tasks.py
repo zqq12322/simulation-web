@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -442,8 +443,130 @@ def _face_by_normal(faces, axis: int, sign: int):
     raise AssertionError(f"未找到法向约为 {'+' if sign > 0 else '-'}{'XYZ'[axis]} 的面")
 
 
+def _check_result_shader_contract() -> tuple[bool, str]:
+    """
+    着色器契约：结果云图必须**真的**显示变形。
+
+    这道检查针对一个真实发生过的、静态检查发现不了的缺陷：顶点着色器里声明了
+    ``uniform float deformationScale``，但 ``deformedPosition`` 被赋成了
+    ``position``——云图永远画的是未变形的几何。它不报错、不影响任何数值，
+    只在"求解后看图"时才暴露为"看不出变形"。
+
+    检查方式：直接读取 GLSL 源码文本，断言
+      * 位移属性存在；
+      * 放大系数 uniform 存在；
+      * ``deformedPosition`` 的赋值**同时**引用了二者；
+      * 并且**不是**恒等赋值。
+    """
+    shader_path = FRONTEND / "components" / "resultShader.ts"
+    if not shader_path.exists():
+        return False, f"缺少 {shader_path.relative_to(ROOT)}"
+
+    source = shader_path.read_text(encoding="utf-8")
+    # 先去掉块注释：这个文件的文档注释里**故意**保留了出错前的反例片段
+    # （`vec3 deformedPosition = position;`）作为说明，不剥掉就会匹配到它。
+    code = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+    problems: list[str] = []
+
+    if "attribute vec3 displacement" not in code:
+        problems.append("顶点着色器没有声明 attribute vec3 displacement")
+    if "uniform float deformationScale" not in code:
+        problems.append("顶点着色器没有声明 uniform float deformationScale")
+
+    matches = re.findall(r"vec3\s+deformedPosition\s*=\s*([^;]+);", code)
+    if not matches:
+        problems.append("顶点着色器没有计算 deformedPosition")
+    for expression in matches:
+        if "displacement" not in expression:
+            problems.append(f"deformedPosition 没有使用位移场：{expression.strip()}")
+        if "deformationScale" not in expression:
+            problems.append(f"deformedPosition 没有应用放大系数：{expression.strip()}")
+        if expression.strip() == "position":
+            problems.append("deformedPosition 被赋成了 position（变形不显示，历史缺陷）")
+
+    return (not problems), "；".join(problems) if problems else "位移属性与放大系数都参与了顶点计算"
+
+
+#: 用 node 直接执行前端纯函数模块并断言其行为。
+#: node >= 23 可以 import .ts（类型擦除），因此前端算法不必在 Python 里重写一遍
+#: —— 重写一遍就等于测试了一个"副本"，那种测试证明不了发布代码是对的。
+_DEFORMATION_SELFTEST = r"""
+import { computeDeformationScale, displacementMagnitudes, flattenDisplacements,
+         hasDisplacementField, modelSpanOf,
+         TARGET_DEFORMATION_FRACTION, MAX_DEFORMATION_SCALE } from './deformation.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+// 1) 定义本身：放大后的位移应等于"模型尺度的固定比例"。
+//    跨尺寸/跨量级都要成立 —— 这正是它与旧的写死常量（0.5 个坐标单位的区别：
+//    那个常量在小零件上太小、在大零件上太大）。
+//    注意要比较**相对幅度** d*scale/span，而不是绝对幅度 d*scale：
+//    模型尺寸不同，画面上该有的绝对变形量本来就不同。
+for (const [span, d] of [[100, 0.001], [100, 0.02], [100, 0.5],
+                         [1000, 0.1], [10, 0.001], [0.01, 1e-7]]) {
+  const scale = computeDeformationScale(d, span);
+  const relative = (d * scale) / span;
+  check(`放大后相对幅度 span=${span} d=${d}`,
+        Math.abs(relative - TARGET_DEFORMATION_FRACTION) < 1e-12,
+        `${relative} vs ${TARGET_DEFORMATION_FRACTION}`);
+}
+
+// 3) 退化输入必须静止而不是发散（NaN/Infinity 会把整个画面画没）
+const span = 100;
+check('位移为 0 时系数为 1', computeDeformationScale(0, span) === 1);
+check('位移缺失时系数为 1', computeDeformationScale(undefined, span) === 1);
+check('模型尺度为 0 时系数为 1', computeDeformationScale(0.1, 0) === 1);
+check('NaN 输入不产生 NaN 输出', Number.isFinite(computeDeformationScale(NaN, span)));
+check('极小位移被上限截断',
+      computeDeformationScale(1e-12, span) === MAX_DEFORMATION_SCALE);
+
+// 4) 顶点属性长度必须严格等于 3 * 节点数
+check('刚好匹配', flattenDisplacements([[1, 2, 3], [4, 5, 6]], 2).length === 6);
+check('数据不足时补零', flattenDisplacements([[1, 2, 3]], 3).length === 9
+      && flattenDisplacements([[1, 2, 3]], 3)[8] === 0);
+check('数据过多时截断', flattenDisplacements([[1,2,3],[4,5,6],[7,8,9]], 1).length === 3);
+check('没有数据也返回全长零数组', flattenDisplacements(undefined, 4).length === 12);
+check('节点数为 0 时为空数组', flattenDisplacements([[1,2,3]], 0).length === 0);
+
+// 5) 模型尺度：三个方向取最大值（与后端 compute_model_span 的定义一致）
+check('modelSpanOf 取最大方向', modelSpanOf([[0,0,0],[1,2,0.5]]) === 2);
+check('空输入返回 0', modelSpanOf([]) === 0 && modelSpanOf(null) === 0);
+
+// 6) 位移模长与"是否有位移场"
+const magnitudes = displacementMagnitudes([[3, 4, 0], [0, 0, 0]]);
+check('位移模长', magnitudes[0] === 5 && magnitudes[1] === 0, JSON.stringify(magnitudes));
+check('位移场存在性', hasDisplacementField([[1,2,3]], 1) && !hasDisplacementField([[1,2,3]], 2));
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+def _check_frontend_deformation_math(node: str) -> tuple[bool, str]:
+    """用 node 执行 `frontend/utils/deformation.ts` 里的纯函数并断言其行为。"""
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", _DEFORMATION_SELFTEST],
+        cwd=str(FRONTEND / "utils"),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    if completed.returncode == 0 and "OK" in (completed.stdout or ""):
+        return True, "放大系数 / 属性长度 / 退化输入 均符合断言"
+    detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+    return False, (detail[-1] if detail else f"exit={completed.returncode}")
+
+
 def task_verify(args: argparse.Namespace) -> int:
-    """端到端验证 + 物理校准。等价于 docs 里描述的 11 项检查。"""
+    """端到端验证 + 物理校准（当前 24 项，见 docs/01 的"三层验证"）。"""
     checks: list[tuple[str, bool, str]] = []
 
     def check(name: str, passed: bool, detail: str = "") -> None:
@@ -460,6 +583,15 @@ def task_verify(args: argparse.Namespace) -> int:
                 cwd=str(FRONTEND),
             ).returncode
             check("TypeScript 类型检查", code == 0, f"exit={code}")
+
+            # 结果云图的两件事都是"不看图就发现不了"的，所以这里做机器检查：
+            # 1) 着色器是否真的把位移场用上了（历史缺陷：deformedPosition = position）；
+            # 2) 变形放大系数这个纯函数的行为（用 node 直接跑前端的 .ts）
+            passed, detail = _check_result_shader_contract()
+            check("结果云图显示变形（着色器契约）", passed, detail)
+
+            passed, detail = _check_frontend_deformation_math(node)
+            check("变形放大系数（node 执行前端纯函数）", passed, detail)
         else:
             check("TypeScript 类型检查", False, "未找到 node")
 
@@ -545,6 +677,20 @@ def task_verify(args: argparse.Namespace) -> int:
                 "应力无 NaN",
                 nan_count == 0,
                 f"NaN={nan_count}, max={result['max_stress']:.2f}",
+            )
+
+            # 前端显示变形要用到这四个字段（见 Scene3D / utils/deformation.ts）。
+            # 后端字段一旦改名，前端只会静默地"不显示变形"或算出 NaN 放大系数，
+            # 因此在这里把字段契约固定下来。
+            display_fields = ["nodes", "elements", "displacements", "max_displacement"]
+            missing = [
+                field for field in display_fields
+                if field not in result and field not in mesh
+            ]
+            check(
+                "变形显示所需字段齐全",
+                not missing,
+                f"缺失 {missing}" if missing else "nodes/elements/displacements/max_displacement",
             )
 
             # 立方体单轴拉伸：与解析解 FL/AE 对照（必须按真实法向挑面）
@@ -690,6 +836,59 @@ def task_verify(args: argparse.Namespace) -> int:
                 and abs(thermal_result.get("max_heat_flux", 0.0) - expected_frontend_flux)
                 < expected_frontend_flux * 1e-3,
                 f"q={thermal_result.get('max_heat_flux')} expect={expected_frontend_flux}",
+            )
+
+            # 模态分析：这里刻意**不**去对某个"标准频率"下手（短粗立方体没有干净
+            # 的闭式解），而是校验两条**精确关系**，它们都来自解析结论：
+            #   1) 自由-自由结构恰好有 6 个刚体模态（3 平移 + 3 转动），频率为 0；
+            #   2) ω ∝ √(E/ρ)/L ⇒ 同一份网格按 mm 与按 m 解释，频率相差**恰好 1000 倍**。
+            def _solve_modal(unit, bcs, num_modes):
+                submitted_modal = _http_json("POST", f"{API_BASE}/api/jobs/modal", {
+                    "geometry_filename": "default_cube.step",
+                    "material_id": "structural_steel",
+                    "length_unit": unit,
+                    "num_modes": num_modes,
+                    "faces": cube["faces"],
+                    "boundary_conditions": bcs,
+                })
+                for _ in range(240):
+                    time.sleep(0.5)
+                    payload = _http_json(
+                        "GET", f"{API_BASE}/api/jobs/{submitted_modal['job_id']}"
+                    )
+                    if payload.get("status") in ("succeeded", "failed"):
+                        return payload
+                return {"status": "timeout"}
+
+            free_free = _solve_modal("mm", [], 8)
+            free_free_result = free_free.get("result") or {}
+            check(
+                "模态分析刚体模态（自由-自由 ⇒ 6 个零频）",
+                free_free.get("status") == "succeeded"
+                and free_free_result.get("rigid_body_modes") == 6,
+                f"status={free_free.get('status')} "
+                f"rigid={free_free_result.get('rigid_body_modes')}",
+            )
+
+            fixed_face = {
+                "id": "fix", "name": "固定端", "type": "fixed",
+                "applicationType": "face", "entityIndex": cube_minus["id"],
+            }
+            modal_mm = _solve_modal("mm", [fixed_face], 4)
+            modal_m = _solve_modal("m", [fixed_face], 4)
+            mm_freqs = (modal_mm.get("result") or {}).get("frequencies") or []
+            m_freqs = (modal_m.get("result") or {}).get("frequencies") or []
+            ratios = [
+                mm / m for mm, m in zip(mm_freqs, m_freqs) if m > 0.0
+            ]
+            check(
+                "模态分析单位缩放（mm vs m 频率 ×1000）",
+                modal_mm.get("status") == "succeeded"
+                and modal_m.get("status") == "succeeded"
+                and len(ratios) == 4
+                and all(abs(ratio - 1000.0) < 1e-6 for ratio in ratios),
+                f"f1={mm_freqs[0]:.6g} Hz, 比值={ratios[:2]}"
+                if ratios else f"mm={modal_mm.get('status')} m={modal_m.get('status')}",
             )
         except Exception as exc:
             check("求解器物理校准", False, f"{type(exc).__name__}: {exc}")
