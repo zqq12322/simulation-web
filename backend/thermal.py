@@ -101,6 +101,18 @@ def _temperature_kelvin(bc: BoundaryCondition) -> Optional[float]:
     return None
 
 
+def assemble_conductivity(basis: Basis, conductivity: float):
+    """
+    导热矩阵 ``∫ k ∇T·∇v dV``。
+
+    单独抽成函数，是为了让**收敛性基准**（`convergence.py`）能复用同一份装配。
+    如果基准自己再写一遍 `asm(laplace, basis)`，它验证的就是一个"副本"——
+    副本对了并不能证明生产代码对。这和 `tools/tasks.py` 里那句注释是同一个
+    道理：用 node 直接执行前端的 `.ts` 模块，而不是在 Python 里重写一遍。
+    """
+    return conductivity * asm(laplace, basis)
+
+
 async def solve_thermal_impl(request: ThermalRequest) -> ThermalResult:
     """稳态热传导求解（实现，在后台工作线程中执行，见 jobs.py）。"""
     try:
@@ -148,7 +160,7 @@ async def solve_thermal_impl(request: ThermalRequest) -> ThermalResult:
     basis = Basis(mesh, ElementTetP1())
 
     # 导热矩阵：∫ k ∇T·∇v dV
-    stiffness = conductivity * asm(laplace, basis)
+    stiffness = assemble_conductivity(basis, conductivity)
 
     prescribed: Dict[int, float] = {}
     warnings: List[str] = []

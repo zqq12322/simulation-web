@@ -2026,6 +2026,114 @@ def task_verify(args: argparse.Namespace) -> int:
             check("网格质量检查", False, f"{type(exc).__name__}: {exc}")
 
         info("\n=== 5/7 求解器物理校准 ===")
+
+        # --- 收敛阶基准：先确认这套离散确实按理论阶收敛 ---------------------------
+        # 顺序是刻意的：如果离散格式本身不按理论阶收敛，后面"力对得上、热对得上"
+        # 的断言都可能只是碰巧对上了。所以这一条排在所有物理量对照之前。
+        #
+        # mode=both 同时跑两种网格来源：
+        #   structured 自相似 ⇒ 比值恰好是 2^p，可以按理论值收得很紧；
+        #   pipeline 走真实路径（gmsh → load_tet_mesh_from_msh），非结构网格在前
+        #   渐近区会偏离，容差放宽。
+        # 用的是制造解 T = x² − y²（三维调和函数），精确解已知，所以量的是
+        # **真实误差**而不是"两次结果的差"。约 11 秒。
+        try:
+            benchmark = _http_json(
+                "POST",
+                f"{API_BASE}/api/convergence/benchmark",
+                {"mode": "both", "levels": 4},
+                headers=api_headers,
+            )
+
+            def _assessment(payload: dict, mode: str):
+                for item in payload.get("assessments") or []:
+                    if item.get("mode") == mode:
+                        return item
+                return None
+
+            structured_l2 = _assessment(benchmark["l2"], "structured")
+            structured_h1 = _assessment(benchmark["h1"], "structured")
+            pipeline_l2 = _assessment(benchmark["l2"], "pipeline")
+            pipeline_h1 = _assessment(benchmark["h1"], "pipeline")
+
+            check(
+                "收敛基准：结果状态为 ok",
+                benchmark["status"] == "ok",
+                benchmark["verdict"],
+            )
+            check(
+                "收敛基准：结构化网格 L2 阶 = 2（P1 单元）",
+                structured_l2 is not None
+                and abs(structured_l2["observed_order"] - 2.0) < 0.05,
+                f"观测阶 {structured_l2 and structured_l2['observed_order']:.4f}",
+            )
+            check(
+                "收敛基准：结构化网格 H1 阶 = 1",
+                structured_h1 is not None
+                and abs(structured_h1["observed_order"] - 1.0) < 0.05,
+                f"观测阶 {structured_h1 and structured_h1['observed_order']:.4f}",
+            )
+            # 真实网格路径：阶数必须接近理论值（前渐近，容差放宽）
+            check(
+                "收敛基准：真实网格流水线 L2 阶趋近 2",
+                pipeline_l2 is not None
+                and 1.75 <= pipeline_l2["observed_order"] <= 2.05,
+                f"观测阶 {pipeline_l2 and pipeline_l2['observed_order']:.4f}",
+            )
+            check(
+                "收敛基准：真实网格流水线 H1 阶趋近 1",
+                pipeline_h1 is not None
+                and 0.85 <= pipeline_h1["observed_order"] <= 1.15,
+                f"观测阶 {pipeline_h1 and pipeline_h1['observed_order']:.4f}",
+            )
+            # 误差必须**逐级下降**：只看首末两级会被中间的抖动骗过去。
+            # 序列直接从 assessment["values"] 取——`benchmark["levels"]` 里两种
+            # 模式的级别是前后排在一起的，按模式分开取才不会混。
+            for name, key in (("L2", "l2"), ("H1", "h1")):
+                for mode in ("structured", "pipeline"):
+                    assessment = _assessment(benchmark[key], mode)
+                    series = assessment and assessment.get("values")
+                    if not series:
+                        continue
+                    check(
+                        f"收敛基准：{mode} 的 {name} 误差逐级下降",
+                        all(b < a for a, b in zip(series, series[1:])),
+                        " → ".join(f"{value:.4g}" for value in series),
+                    )
+
+            bad_mode = _http_status(
+                "POST",
+                f"{API_BASE}/api/convergence/benchmark",
+                {"mode": "nope"},
+                headers=api_headers,
+            )
+            check(
+                "收敛基准：非法 mode 被拒（400）",
+                bad_mode == 400,
+                f"HTTP {bad_mode}",
+            )
+            check(
+                "收敛基准：未登录被拒",
+                _http_status(
+                    "POST", f"{API_BASE}/api/convergence/benchmark", {"mode": "structured"}
+                ) == 401,
+                "不带令牌应返回 401",
+            )
+            # 基准会临时生成一份几何副本；用完必须删干净，否则会在仓库里
+            # 留下未跟踪文件（上一轮 POST /api/generate-cube 就是这么埋的坑）
+            leftover = _http_status(
+                "GET",
+                f"{API_BASE}/api/geometry/benchmark_cube.step/metadata",
+                headers=api_headers,
+            )
+            check(
+                "收敛基准：临时几何已清理",
+                leftover == 404,
+                f"benchmark_cube.step -> HTTP {leftover}",
+            )
+        except Exception as exc:
+            check("收敛基准", False, f"{type(exc).__name__}: {exc}")
+
         try:
             mesh = _http_json(
                 "POST", f"{API_BASE}/api/generate-mesh?filename=test_part.step&mesh_size=1.2",
