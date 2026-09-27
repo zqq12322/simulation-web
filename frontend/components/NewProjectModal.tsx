@@ -4,7 +4,7 @@ import { X, Globe, Lock, Wind, Layers, Thermometer, Box } from 'lucide-react';
 interface NewProjectModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onCreate: (title: string, description: string, type: string) => void;
+  onCreate: (title: string, description: string, type: string, isPrivate: boolean) => void;
 }
 
 type SimulationType = 'CFD' | 'FEA' | 'Thermal' | 'General';
@@ -20,7 +20,12 @@ const NewProjectModal: React.FC<NewProjectModalProps> = ({ isOpen, onClose, onCr
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (title.trim()) {
-      onCreate(title, description, selectedType);
+      onCreate(title, description, selectedType, isPrivate);
+      // Reset for the next time the modal is opened
+      setTitle('');
+      setDescription('');
+      setSelectedType('General');
+      setIsPrivate(true);
     }
   };
 

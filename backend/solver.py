@@ -4,8 +4,7 @@ from typing import List, Dict, Any
 import numpy as np
 from skfem import *
 from skfem.helpers import dot, grad, trace, sym_grad, eye, identity, ddot
-from skfem.models.elasticity import linear_elasticity, lame_parameters
-from skfem.visuals.matplotlib import draw, plot
+from skfem.models.elasticity import linear_elasticity, linear_stress, lame_parameters
 import os
 import gmsh
 
@@ -15,6 +14,64 @@ from materials import MATERIALS_DB
 from constraints import BoundaryCondition
 
 router = APIRouter()
+
+
+def load_tet_mesh_from_msh(msh_path: str) -> MeshTet:
+    """
+    Build a scikit-fem tetrahedral mesh directly with Gmsh.
+
+    ``Mesh.load`` would delegate to meshio, which is not part of the backend
+    dependencies. Gmsh is already required for meshing, so we read the mesh back
+    with it instead of adding another dependency.
+    """
+    if not gmsh.isInitialized():
+        gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+    gmsh.clear()
+
+    try:
+        gmsh.open(msh_path)
+
+        node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
+        nodes = np.asarray(node_coords, dtype=np.float64).reshape(-1, 3)
+        node_tags = np.asarray(node_tags, dtype=np.int64)
+
+        # Node tags are not guaranteed to start at 0, so map them explicitly.
+        tag_to_index = np.zeros(int(node_tags.max()) + 1, dtype=np.int64)
+        tag_to_index[node_tags] = np.arange(len(node_tags), dtype=np.int64)
+
+        element_types, _, element_nodes = gmsh.model.mesh.getElements(dim=3)
+
+        cells = []
+        for etype, enodes in zip(element_types, element_nodes):
+            if etype != 4:  # keep 4-node tetrahedra only
+                continue
+            conn = np.asarray(enodes, dtype=np.int64).reshape(-1, 4)
+            cells.append(tag_to_index[conn])
+    finally:
+        if gmsh.isInitialized():
+            gmsh.finalize()
+
+    if not cells:
+        raise ValueError("No 4-node tetrahedral elements found in the mesh file.")
+
+    t = np.vstack(cells).T.astype(np.int64)  # shape (4, n_elements)
+    points = nodes.T  # shape (3, n_nodes)
+
+    # scikit-fem expects a positive Jacobian per element; flip inverted ones.
+    # Note: NumPy >= 2.0 evaluates np.cross along the LAST axis, so the edge
+    # vectors are transposed to (n_elements, 3) before taking the cross product.
+    v0, v1, v2, v3 = (points[:, t[i]] for i in range(4))
+    e1 = (v1 - v0).T
+    e2 = (v2 - v0).T
+    e3 = (v3 - v0).T
+    det = np.einsum('ij,ij->i', np.cross(e1, e2), e3)
+    flip = det < 0
+    if np.any(flip):
+        t[[1, 2], flip] = t[[2, 1], flip]
+
+    return MeshTet(points, t)
+
 
 class SolverRequest(BaseModel):
     geometry_filename: str
@@ -58,7 +115,7 @@ async def solve_simulation(request: SolverRequest):
     nu = material.poissonsRatio
     
     try:
-        # 2. Load Mesh (using scikit-fem's interface to Meshio/Gmsh)
+        # 2. Load Mesh (Gmsh -> scikit-fem, no meshio dependency)
         msh_path = file_path + ".msh"
         
         # Check if MSH exists
@@ -67,6 +124,7 @@ async def solve_simulation(request: SolverRequest):
             print(f"Mesh file {msh_path} not found, generating...")
             if not gmsh.isInitialized():
                 gmsh.initialize()
+            gmsh.clear()
             gmsh.model.add("SolverModel")
             gmsh.merge(file_path)
             gmsh.option.setNumber("Mesh.MeshSizeMin", 1.0) # Default size
@@ -78,7 +136,7 @@ async def solve_simulation(request: SolverRequest):
             print(f"Using cached mesh file: {msh_path}")
         
         # Load mesh into scikit-fem
-        mesh = Mesh.load(msh_path)
+        mesh = load_tet_mesh_from_msh(msh_path)
         print(f"Mesh loaded: {mesh}")
 
         # 3. Define Element and Basis
@@ -248,32 +306,24 @@ async def solve_simulation(request: SolverRequest):
 
         # 7. Post-Processing: Calculate Von Mises Stress
         
-        # Define Functional for Von Mises Stress
-        @Functional
-        def get_von_mises(w):
-            # w corresponds to the solution interpolated at quadrature points
-            e = sym_grad(w)
-            # Constitutive relation: sigma = 2*mu*e + lam*tr(e)*I
-            s = 2.0 * mu * e + lam * trace(e) * eye(e, 3)
-            
-            # Deviatoric stress: s_dev = s - 1/3 * tr(s) * I
-            s_dev = s - (1.0/3.0) * trace(s) * eye(s, 3)
-            
-            # Von Mises: sqrt(3/2 * s_dev : s_dev)
-            # Use manual double dot product since ddot might not be available in all versions or behaves differently
-            # ddot(A, B) = A_ij * B_ij
-            
-            # s_dev is a 3x3 tensor
-            val = ddot(s_dev, s_dev)
-            return np.sqrt(1.5 * val)
+        # Linear-elastic stress-strain relation sigma = 2*mu*e + lam*tr(e)*I
+        C = linear_stress(lam, mu)
 
-        # Project stress to P1 nodes
-        basis_scalar = Basis(mesh, ElementTetP1())
-        # We need to interpolate the VECTOR solution u using the VECTOR basis
+        # Evaluate the stress at the quadrature points of the vector basis and
+        # L2-project it onto the P1 nodal basis. (In scikit-fem 12 a Functional
+        # can no longer be handed to Basis.project, so the values are evaluated
+        # directly; both bases share ElementTetP1 and therefore the same
+        # quadrature points.)
         u_interp = basis_vec.interpolate(u)
-        
-        # Then project the functional result
-        stress_vals = basis_scalar.project(get_von_mises(u_interp))
+        strain_qp = sym_grad(u_interp)
+        stress_qp = C(strain_qp)
+        # Deviatoric stress: s_dev = s - 1/3 * tr(s) * I
+        stress_dev_qp = stress_qp - (1.0 / 3.0) * trace(stress_qp) * eye(trace(stress_qp), 3)
+        # Von Mises: sqrt(3/2 * s_dev : s_dev), shape (n_qp, n_elements)
+        von_mises_qp = np.sqrt(1.5 * ddot(stress_dev_qp, stress_dev_qp))
+
+        basis_scalar = Basis(mesh, ElementTetP1())
+        stress_vals = basis_scalar.project(von_mises_qp)
         
         # Extract displacements
         u_x = u[basis_vec.nodal_dofs[0]].flatten()

@@ -1,22 +1,32 @@
 import os
+from pathlib import Path
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from backend/.env (independent of the working directory)
+load_dotenv(Path(__file__).with_name(".env"))
 
 router = APIRouter()
 
-# Initialize DeepSeek Client
-# Note: DeepSeek uses OpenAI-compatible API
-# Users need to provide their API key via environment variable or request header
-DEEPSEEK_API_KEY = "sk-99c29615b30144aaa7afaef6bc2607f5" # In production, use os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+# DeepSeek uses an OpenAI-compatible API.
+# The API key must come from the environment (backend/.env) and never be hard-coded.
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL) if DEEPSEEK_API_KEY else None
+
+
+def get_client() -> OpenAI:
+    """Return the DeepSeek client or a clear error if it is not configured."""
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="AI 服务未配置：请在 backend/.env 中设置 DEEPSEEK_API_KEY",
+        )
+    return client
 
 class AIRequest(BaseModel):
     user_input: str
@@ -58,7 +68,7 @@ async def chat_with_ai(request: AIRequest):
         if request.context:
             messages.append({"role": "system", "content": f"Current Context: {request.context}"})
 
-        response = client.chat.completions.create(
+        response = get_client().chat.completions.create(
             model="deepseek-chat",
             messages=messages,
             stream=False
@@ -100,7 +110,7 @@ async def diagnose_simulation(request: AIRequest):
             {"role": "user", "content": f"Please diagnose this setup: {context_str}"}
         ]
 
-        response = client.chat.completions.create(
+        response = get_client().chat.completions.create(
             model="deepseek-chat",
             messages=messages,
             stream=False
@@ -149,7 +159,7 @@ async def configure_parameters(request: AIRequest):
             {"role": "user", "content": request.user_input}
         ]
 
-        response = client.chat.completions.create(
+        response = get_client().chat.completions.create(
             model="deepseek-chat",
             messages=messages,
             stream=False

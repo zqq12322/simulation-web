@@ -22,7 +22,7 @@ const AIAssistantPanel = React.forwardRef<AIAssistantPanelRef, AIAssistantPanelP
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([
     { role: 'system', content: '我是您的 AI 仿真助手。您可以让我帮您配置参数、诊断问题或分析结果。', type: 'text' },
-    { role: 'system', content: '已为您自动加载并运行演示案例。\n您现在看到的是一个受压立方体的应力分布云图。', type: 'text' }
+    { role: 'system', content: '提示：先导入几何并划分网格，然后可以用下方「一键配置示例」快速生成一套边界条件。', type: 'text' }
   ]);
   const [loading, setLoading] = useState(false);
 
@@ -53,7 +53,7 @@ const AIAssistantPanel = React.forwardRef<AIAssistantPanelRef, AIAssistantPanelP
                       type: 'pressure',
                       applicationType: 'face',
                       entityIndex: 2, // Face 2 (Opposite)
-                      value: 1000,
+                      pressure: 1000, // must match BoundaryConditionSelector's field name
                       color: '#00ff00'
                   }
               ]
@@ -115,7 +115,10 @@ const AIAssistantPanel = React.forwardRef<AIAssistantPanelRef, AIAssistantPanelP
 
       const response = await axios.post(endpoint, requestData);
       
-      let aiContent = response.data.response;
+      const aiContent: string = response.data?.response ?? '';
+      if (!aiContent) {
+          throw new Error('Empty response from AI service');
+      }
       let msgType: 'text' | 'json' | 'diagnostic' = 'text';
 
       // Simple type detection
@@ -246,7 +249,7 @@ const AIAssistantPanel = React.forwardRef<AIAssistantPanelRef, AIAssistantPanelP
             rows={1}
           />
           <button 
-            onClick={handleSend}
+            onClick={() => handleSend()}
             disabled={!input.trim() || loading}
             className="absolute right-2 top-1/2 -translate-y-1/2 text-purple-400 hover:text-purple-300 disabled:opacity-50 disabled:cursor-not-allowed"
           >

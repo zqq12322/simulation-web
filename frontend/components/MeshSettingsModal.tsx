@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { X, Check, Plus, Trash2 } from 'lucide-react';
 import { MeshSettings } from '../types';
 
@@ -24,6 +24,18 @@ const MeshSettingsModal: React.FC<MeshSettingsModalProps> = ({
   const [regionEntityType, setRegionEntityType] = useState<'face' | 'edge' | 'vertex'>(selectedEntity?.type || 'face');
   const [regionEntityIndex, setRegionEntityIndex] = useState<number>(selectedEntity?.index || 0);
   const [regionRefinementLevel, setRegionRefinementLevel] = useState<number>(1);
+
+  // The component stays mounted, so the local state must be resynced every time
+  // the modal is (re)opened; otherwise it would show stale settings.
+  useEffect(() => {
+    if (!isOpen) return;
+    setMeshType(currentSettings?.meshType || 'tetrahedral');
+    setMeshSize(currentSettings?.meshSize || 1.0);
+    setQuality(currentSettings?.quality || 0.8);
+    setRefinementRegions(currentSettings?.refinementRegions || []);
+    setRegionEntityType(selectedEntity?.type || 'face');
+    setRegionEntityIndex(selectedEntity?.index || 0);
+  }, [isOpen, currentSettings, selectedEntity]);
 
   const handleAddRefinementRegion = () => {
     const newRegion = {
@@ -260,7 +272,7 @@ const MeshSettingsModal: React.FC<MeshSettingsModalProps> = ({
             onClick={handleSave}
             className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
           >
-            保存网格设置
+            保存并生成网格
           </button>
         </div>
       </div>

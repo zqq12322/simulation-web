@@ -14,6 +14,7 @@ export interface Project {
   description: string;
   createdAt: Date;
   simulationType?: 'CFD' | 'FEA' | 'Thermal' | 'General';
+  isPrivate?: boolean;
 }
 
 export type ViewState = 'dashboard' | 'workbench';
@@ -29,7 +30,9 @@ export interface MeshSettings {
     refinementLevel: number;
   }[];
   quality: number;
-  status: 'not_meshed' | 'meshing' | 'meshed' | 'failed';
+  // 'solved' is set by the workbench once a result exists, which switches the
+  // 3D view into stress-colour mode.
+  status: 'not_meshed' | 'meshing' | 'meshed' | 'failed' | 'solved';
 }
 
 // 求解器类型

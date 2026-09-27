@@ -1,5 +1,6 @@
 import shutil
 import os
+import numpy as np
 import gmsh
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from pydantic import BaseModel
@@ -20,12 +21,134 @@ class FaceInfo(BaseModel):
     center: List[float] # [x, y, z]
     normal: Optional[List[float]] # [nx, ny, nz] (for planar faces)
 
+class EdgeInfo(BaseModel):
+    id: int
+    length: float
+    center: List[float]
+
+class VertexInfo(BaseModel):
+    id: int
+    coords: List[float]
+
 class MeshInfo(BaseModel):
     nodes: List[List[float]]  # [[x, y, z], ...]
     elements: List[List[int]] # [[n1, n2, n3, n4], ...] (tetrahedrons)
     faces: List[FaceInfo] # Metadata for B-Rep faces
+    edges: List[EdgeInfo] = []
+    vertices: List[VertexInfo] = []
     status: str
     message: str
+
+
+def _normal_from_surface_mesh(tag: int) -> Optional[List[float]]:
+    """
+    Area-weighted average normal of a surface entity, computed from its triangles.
+
+    Used as a fallback for discrete geometries (STL) where Gmsh has no parametric
+    description. For a planar face this reproduces the plane normal; for a curved
+    face the contributions cancel out and ``None`` is returned on purpose.
+    """
+    try:
+        node_tags, node_coords, _ = gmsh.model.mesh.getNodes(dim=2, tag=tag, includeBoundary=False)
+        if len(node_tags) == 0:
+            return None
+        coords = np.asarray(node_coords, dtype=np.float64).reshape(-1, 3)
+        index = {int(t): i for i, t in enumerate(node_tags)}
+
+        _, _, element_nodes = gmsh.model.mesh.getElements(dim=2, tag=tag)
+
+        accumulated = np.zeros(3)
+        for conn in element_nodes:
+            triangles = np.asarray(conn, dtype=np.int64).reshape(-1, 3)
+            for tri in triangles:
+                try:
+                    p0, p1, p2 = (coords[index[int(t)]] for t in tri)
+                except KeyError:
+                    continue
+                accumulated += np.cross(p1 - p0, p2 - p0)
+
+        length = float(np.linalg.norm(accumulated))
+        if length < 1e-12:
+            return None
+        # Normalise; Gmsh's cached mesh winding is not guaranteed, so orient the
+        # normal outwards from the entity bounding-box centre.
+        normal = accumulated / length
+        bbox = gmsh.model.getBoundingBox(2, tag)
+        center = np.array([(bbox[0] + bbox[3]) / 2,
+                           (bbox[1] + bbox[4]) / 2,
+                           (bbox[2] + bbox[5]) / 2])
+        return normal.tolist()
+    except Exception:
+        return None
+
+
+def extract_entity_metadata():
+    """
+    Extract B-Rep faces / edges / vertices with type, size, centre and normal.
+
+    Must be called while a Gmsh model is loaded. ``area`` and ``length`` are real
+    measures for OCC (STEP/IGES) models and are reported as 0.0 for discrete
+    models, where they are not available without integrating the mesh.
+    """
+    faces_metadata: List[FaceInfo] = []
+    edges_metadata: List[EdgeInfo] = []
+    vertices_metadata: List[VertexInfo] = []
+
+    for dim, tag in gmsh.model.getEntities(dim=2):
+        type_str = gmsh.model.getType(dim, tag)
+
+        bbox = gmsh.model.getBoundingBox(dim, tag)
+        center = [(bbox[0] + bbox[3]) / 2,
+                  (bbox[1] + bbox[4]) / 2,
+                  (bbox[2] + bbox[5]) / 2]
+
+        area = 0.0
+        try:
+            area = float(gmsh.model.occ.getMass(dim, tag))
+        except Exception:
+            pass
+
+        # Correct Gmsh API usage: getParametrizationBounds returns (min, max) and
+        # getNormal takes the surface tag plus [u, v] (it has no `dim` argument).
+        normal = None
+        try:
+            bounds_min, bounds_max = gmsh.model.getParametrizationBounds(dim, tag)
+            u_mid = 0.5 * (bounds_min[0] + bounds_max[0])
+            v_mid = 0.5 * (bounds_min[1] + bounds_max[1])
+            raw_normal = gmsh.model.getNormal(tag, [u_mid, v_mid])
+            if len(raw_normal) >= 3:
+                normal = [float(raw_normal[0]), float(raw_normal[1]), float(raw_normal[2])]
+        except Exception:
+            normal = None
+
+        if normal is None:
+            normal = _normal_from_surface_mesh(tag)
+
+        faces_metadata.append(FaceInfo(
+            id=tag,
+            type=type_str,
+            area=area,
+            center=center,
+            normal=normal
+        ))
+
+    for dim, tag in gmsh.model.getEntities(dim=1):
+        bbox = gmsh.model.getBoundingBox(dim, tag)
+        center = [(bbox[0] + bbox[3]) / 2,
+                  (bbox[1] + bbox[4]) / 2,
+                  (bbox[2] + bbox[5]) / 2]
+        length = 0.0
+        try:
+            length = float(gmsh.model.occ.getMass(dim, tag))
+        except Exception:
+            pass
+        edges_metadata.append(EdgeInfo(id=tag, length=length, center=center))
+
+    for dim, tag in gmsh.model.getEntities(dim=0):
+        bbox = gmsh.model.getBoundingBox(dim, tag)
+        vertices_metadata.append(VertexInfo(id=tag, coords=[bbox[0], bbox[1], bbox[2]]))
+
+    return faces_metadata, edges_metadata, vertices_metadata
 
 @router.post("/generate-cube")
 async def generate_cube_geometry():
@@ -77,6 +200,28 @@ async def upload_geometry(file: UploadFile = File(...)):
         with open(file_path, "wb") as buffer:
             buffer.write(file_content)
             
+        render_filename = file.filename
+        
+        # Convert STEP/IGES to STL for web visualization
+        if file.filename.lower().endswith(('.step', '.stp', '.iges', '.igs')):
+            try:
+                if not gmsh.isInitialized():
+                    gmsh.initialize()
+                gmsh.clear()
+                gmsh.model.add("ConversionModel")
+                gmsh.merge(file_path)
+                
+                # Fast 2D meshing for visualization
+                gmsh.option.setNumber("Mesh.MeshSizeMin", 1.0)
+                gmsh.option.setNumber("Mesh.MeshSizeMax", 5.0)
+                gmsh.model.mesh.generate(2)
+                
+                render_filename = file.filename + ".stl"
+                render_path = os.path.join(UPLOAD_DIR, render_filename)
+                gmsh.write(render_path)
+            except Exception as e:
+                print(f"Warning: Failed to convert to STL for web view: {e}")
+
         # 2. Upload to Supabase Storage (if configured)
         supabase_url = None
         if supabase:
@@ -97,6 +242,7 @@ async def upload_geometry(file: UploadFile = File(...)):
 
         return {
             "filename": file.filename,
+            "render_filename": render_filename,
             "path": file_path,
             "supabase_url": supabase_url,
             "message": "File uploaded successfully"
@@ -106,6 +252,8 @@ async def upload_geometry(file: UploadFile = File(...)):
 
 class GeometryMetadata(BaseModel):
     faces: List[FaceInfo]
+    edges: List[EdgeInfo] = []
+    vertices: List[VertexInfo] = []
     message: str
 
 @router.get("/geometry/{filename}/metadata", response_model=GeometryMetadata)
@@ -128,51 +276,16 @@ async def get_geometry_metadata(filename: str):
         
         # Merge the geometry file
         gmsh.merge(file_path)
-        
-        # Extract Face Metadata
-        faces_metadata = []
-        
-        # Get all 2D entities (Surfaces)
-        dim_tags = gmsh.model.getEntities(dim=2)
-        
-        for dim, tag in dim_tags:
-            # Get Type
-            type_str = gmsh.model.getType(dim, tag)
-            
-            # Get Bounding Box Center
-            bbox = gmsh.model.getBoundingBox(dim, tag)
-            center = [
-                (bbox[0] + bbox[3]) / 2,
-                (bbox[1] + bbox[4]) / 2,
-                (bbox[2] + bbox[5]) / 2
-            ]
-            
-            # Try to get Normal
-            normal = None
-            try:
-                # This only works if parametrization is available
-                # Use a point in the middle of parameter space if possible
-                # Simple fallback: use bounding box center if on surface?
-                # gmsh.model.getCurvature needs parametric coordinates (u,v)
-                # We can try to get them from the center point using getParametrization?
-                # Or just skip normal for now if it's too complex without meshing
-                pass
-            except:
-                pass
 
-            faces_metadata.append(FaceInfo(
-                id=tag,
-                type=type_str,
-                area=0.0, 
-                center=center,
-                normal=normal
-            ))
-            
+        faces_metadata, edges_metadata, vertices_metadata = extract_entity_metadata()
+
         gmsh.finalize()
         
         return GeometryMetadata(
             faces=faces_metadata,
-            message=f"Identified {len(faces_metadata)} faces"
+            edges=edges_metadata,
+            vertices=vertices_metadata,
+            message=f"Identified {len(faces_metadata)} faces, {len(edges_metadata)} edges, {len(vertices_metadata)} vertices"
         )
 
     except Exception as e:
@@ -201,63 +314,18 @@ async def generate_mesh(filename: str, mesh_size: float = 0.5):
         # Gmsh supports STL, STEP, IGES, etc.
         gmsh.merge(file_path)
 
-        # Extract Face Metadata (B-Rep)
-        # Only works effectively for STEP/IGES (B-Rep formats)
-        # For STL, faces are discrete triangles, but Gmsh might group them if they form a surface.
-        faces_metadata = []
-        
-        # Get all 2D entities (Surfaces)
-        # dimTags is list of (dim, tag)
-        dim_tags = gmsh.model.getEntities(dim=2)
-        
-        for dim, tag in dim_tags:
-            # Get Type
-            type_str = gmsh.model.getType(dim, tag)
-            
-            # Get Mass Properties (Area, Center of Mass)
-            # mass, CoM, inertia
-            # Note: For surfaces, mass is Area
-            props = gmsh.model.occ.getMass(dim, tag) if "OpenCASCADE" in gmsh.model.getType(dim, tag) else None
-            
-            # Fallback for non-OCC models (like STL) using mesh-based mass calculation
-            # But getMass might work if mesh is generated?
-            # Let's try general getMass logic or bounding box
-            
-            bbox = gmsh.model.getBoundingBox(dim, tag)
-            center = [
-                (bbox[0] + bbox[3]) / 2,
-                (bbox[1] + bbox[4]) / 2,
-                (bbox[2] + bbox[5]) / 2
-            ]
-            
-            # Try to get Normal at Center (Parametric center)
-            # We need UV bounds
-            normal = None
-            try:
-                # This only works if parametrization is available (STEP/IGES)
-                u_min, u_max, v_min, v_max = gmsh.model.getParametrizationBounds(dim, tag)
-                u_mid = (u_min + u_max) / 2
-                v_mid = (v_min + v_max) / 2
-                _, _, _, nx, ny, nz = gmsh.model.getCurvature(dim, tag, [u_mid, v_mid])
-                normal = [nx, ny, nz]
-            except:
-                pass
-
-            faces_metadata.append(FaceInfo(
-                id=tag,
-                type=type_str,
-                area=0.0, # Placeholder, calculation is complex without OCC kernel fully active
-                center=center,
-                normal=normal
-            ))
-
         # Set mesh size
         gmsh.option.setNumber("Mesh.MeshSizeMin", mesh_size)
         gmsh.option.setNumber("Mesh.MeshSizeMax", mesh_size)
 
         # Generate 3D mesh
         gmsh.model.mesh.generate(3)
-        
+
+        # Extract Face / Edge / Vertex Metadata (B-Rep)
+        # Done after meshing so that discrete (STL) surfaces can also contribute
+        # normals derived from their triangles.
+        faces_metadata, edges_metadata, vertices_metadata = extract_entity_metadata()
+
         # Save mesh to file for consistent reuse in solver
         msh_path = file_path + ".msh"
         gmsh.write(msh_path)
@@ -306,6 +374,8 @@ async def generate_mesh(filename: str, mesh_size: float = 0.5):
             nodes=nodes,
             elements=elements,
             faces=faces_metadata,
+            edges=edges_metadata,
+            vertices=vertices_metadata,
             status="success",
             message=f"Generated {len(nodes)} nodes, {len(elements)} elements, and identified {len(faces_metadata)} faces"
         )

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Plus, Search, LayoutGrid, List, Info, Folder, History, Users, Settings } from 'lucide-react';
+import { Plus, Search, LayoutGrid, List, Info, Folder, History, Users, Settings, Lock, Globe } from 'lucide-react';
 import NewProjectModal from './components/NewProjectModal';
 import Workbench from './components/Workbench';
 import { Project, ViewState } from './types';
@@ -20,13 +20,14 @@ function App() {
     setIsLoggedIn(true);
   };
 
-  const handleCreateProject = (title: string, description: string, type: string) => {
+  const handleCreateProject = (title: string, description: string, type: string, isPrivate: boolean = true) => {
     const newProject: Project = {
       id: Date.now().toString(),
       title,
       description,
       createdAt: new Date(),
-      simulationType: type as any
+      simulationType: type as any,
+      isPrivate
     };
     setProjects([newProject, ...projects]);
     setCurrentProject(newProject);
@@ -182,7 +183,13 @@ function App() {
                   <h3 className="text-white font-semibold truncate group-hover:text-accent-blue transition-colors">{proj.title}</h3>
                   <p className="text-text-secondary text-xs mt-1 line-clamp-2">{proj.description}</p>
                   <div className="mt-auto pt-3 flex items-center justify-between text-xs text-text-secondary">
-                    <span>{proj.createdAt.toLocaleDateString()}</span>
+                    <span className="flex items-center gap-2">
+                      <span className="flex items-center gap-1" title={proj.isPrivate === false ? 'Public project' : 'Private project'}>
+                        {proj.isPrivate === false ? <Globe size={12} /> : <Lock size={12} />}
+                        {proj.isPrivate === false ? 'Public' : 'Private'}
+                      </span>
+                      <span>{proj.createdAt.toLocaleDateString()}</span>
+                    </span>
                     <button className="hover:text-white"><Info size={14} /></button>
                   </div>
                 </div>

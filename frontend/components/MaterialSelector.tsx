@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { X, Plus, Check, ChevronDown, ChevronUp, RefreshCw } from 'lucide-react';
+import { X, Plus, Check, ChevronDown, ChevronUp, RefreshCw, AlertTriangle } from 'lucide-react';
 import { Material } from '../types';
 import axios from 'axios';
+
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 interface MaterialSelectorProps {
   isOpen: boolean;
@@ -36,13 +38,12 @@ const MaterialSelector: React.FC<MaterialSelectorProps> = ({
     setLoading(true);
     setError(null);
     try {
-      // Replace with your actual backend URL
-      const response = await axios.get('http://localhost:8000/api/materials');
+      const response = await axios.get(`${API_BASE_URL}/api/materials`);
       setMaterials(response.data);
     } catch (err) {
       console.error("Failed to fetch materials:", err);
-      setError("Failed to load materials from server. Using local backup.");
-      // Fallback or empty list
+      setError(`无法从后端加载材料库 (${API_BASE_URL})，请确认后端服务已启动。`);
+      setMaterials([]);
     } finally {
       setLoading(false);
     }
@@ -68,8 +69,8 @@ const MaterialSelector: React.FC<MaterialSelectorProps> = ({
         id: `custom-${Date.now()}`
       };
       
-      // Optionally save to backend
-      await axios.post('http://localhost:8000/api/materials', newMaterialPayload);
+      // Save to backend so it is selectable there as well
+      await axios.post(`${API_BASE_URL}/api/materials`, newMaterialPayload);
       
       setMaterials([...materials, newMaterialPayload]);
       setShowCustomMaterialForm(false);
@@ -137,6 +138,19 @@ const MaterialSelector: React.FC<MaterialSelectorProps> = ({
 
         {/* Material List */}
         <div className="p-4">
+          {error && (
+            <div className="mb-4 flex items-start gap-2 rounded-md border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-300">
+              <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+              <div className="flex-1">{error}</div>
+              <button
+                onClick={fetchMaterials}
+                className="shrink-0 rounded border border-red-500/40 px-2 py-1 text-xs hover:bg-red-500/20 transition-colors"
+              >
+                重试
+              </button>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {filteredMaterials.map((material) => (
               <div
@@ -178,6 +192,12 @@ const MaterialSelector: React.FC<MaterialSelectorProps> = ({
               </div>
             ))}
           </div>
+
+          {!loading && !error && filteredMaterials.length === 0 && (
+            <div className="py-8 text-center text-sm text-text-secondary italic">
+              {materials.length === 0 ? '材料库为空。' : '没有符合筛选条件的材料。'}
+            </div>
+          )}
         </div>
 
         {/* Add Custom Material Button */}

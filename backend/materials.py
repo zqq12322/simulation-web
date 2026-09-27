@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 router = APIRouter()
 
@@ -11,6 +11,7 @@ class Material(BaseModel):
     youngsModulus: float  # Pa
     poissonsRatio: float
     color: str
+    type: Literal['metal', 'plastic', 'concrete', 'wood', 'custom'] = 'metal'
     description: Optional[str] = None
 
 # Predefined materials database (in-memory for now)
@@ -23,6 +24,7 @@ MATERIALS_DB = [
         youngsModulus=2.0e11,
         poissonsRatio=0.3,
         color="#808080",
+        type="metal",
         description="Standard structural steel for general construction"
     ),
     Material(
@@ -32,6 +34,7 @@ MATERIALS_DB = [
         youngsModulus=6.9e10,
         poissonsRatio=0.33,
         color="#C0C0C0",
+        type="metal",
         description="Lightweight aluminum alloy 6061-T6"
     ),
     Material(
@@ -41,6 +44,7 @@ MATERIALS_DB = [
         youngsModulus=1.2e11,
         poissonsRatio=0.34,
         color="#B87333",
+        type="metal",
         description="Pure copper with high conductivity"
     ),
     Material(
@@ -50,6 +54,7 @@ MATERIALS_DB = [
         youngsModulus=1.1e11,
         poissonsRatio=0.32,
         color="#878681",
+        type="metal",
         description="High strength-to-weight ratio titanium alloy"
     ),
      Material(
@@ -59,6 +64,7 @@ MATERIALS_DB = [
         youngsModulus=2.3e9,
         poissonsRatio=0.35,
         color="#FFFFE0",
+        type="plastic",
         description="Common thermoplastic polymer"
     )
 ]

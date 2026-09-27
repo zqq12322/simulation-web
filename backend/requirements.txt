@@ -1,8 +1,10 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
 numpy
 scipy
 scikit-fem
+gmsh
+supabase
 openai
 python-dotenv

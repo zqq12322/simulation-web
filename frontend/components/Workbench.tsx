@@ -53,6 +53,7 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   const [showMaterialSelector, setShowMaterialSelector] = useState(false);
   const [boundaryConditions, setBoundaryConditions] = useState<AnyBoundaryCondition[]>([]);
   const [showBoundaryConditionSelector, setShowBoundaryConditionSelector] = useState(false);
+  const [bcSelectorDefaultType, setBcSelectorDefaultType] = useState<'fixed' | 'displacement' | 'force' | 'pressure' | 'temperature'>('fixed');
   const [selectedEntity, setSelectedEntity] = useState<{ type: 'face' | 'edge' | 'vertex'; index: number } | null>(null);
   const [editingBoundaryCondition, setEditingBoundaryCondition] = useState<AnyBoundaryCondition | null>(null);
   // Mesh settings state
@@ -61,6 +62,8 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   const [isMeshing, setIsMeshing] = useState(false);
   const [meshData, setMeshData] = useState<any>(null); // Store real mesh data from backend
   const [facesData, setFacesData] = useState<any[]>([]); // Store B-Rep faces data
+  const [edgesData, setEdgesData] = useState<any[]>([]); // Store B-Rep edges data
+  const [verticesData, setVerticesData] = useState<any[]>([]); // Store B-Rep vertices data
   const [loadedGeometry, setLoadedGeometry] = useState<any>(null); // To force clear previous geometry
 
   // Solver settings state
@@ -209,9 +212,11 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
       if (modelName) {
         try {
           const response = await axios.get(`${API_BASE_URL}/api/geometry/${modelName}/metadata`);
-          if (response.data && response.data.faces) {
+          if (response.data) {
              console.log('Geometry metadata loaded:', response.data);
-             setFacesData(response.data.faces);
+             setFacesData(response.data.faces || []);
+             setEdgesData(response.data.edges || []);
+             setVerticesData(response.data.vertices || []);
           }
         } catch (error) {
           console.error("Failed to fetch geometry metadata:", error);
@@ -222,14 +227,17 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     fetchMetadata();
   }, [modelName, API_BASE_URL]);
 
-  const handleImport = (file: File) => {
+  const handleImport = (file: File, renderFilename?: string) => {
     // Force a re-render by appending a timestamp to prevent browser caching
     const timestamp = new Date().getTime();
-    const url = `${API_BASE_URL}/uploads/${file.name}?t=${timestamp}`;
+    const targetFile = renderFilename || file.name;
+    const url = `${API_BASE_URL}/uploads/${targetFile}?t=${timestamp}`;
     console.log("Setting model URL to:", url);
     setModelUrl(url);
-    setModelName(file.name);
+    setModelName(file.name); // Keep original name for backend processing
     setFacesData([]); // Clear previous faces
+    setEdgesData([]); // Clear previous edges
+    setVerticesData([]); // Clear previous vertices
     setLoadedGeometry(null); // Force clearing of previous geometry
     setShowImportModal(false);
     // Show Solver Settings immediately after import
@@ -243,6 +251,12 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   
   const handleSelect = (type: 'face' | 'edge' | 'vertex', index: number) => {
     setSelectedEntity({ type, index });
+  };
+
+  const handleAddBoundaryConditionFromScene = (type: 'fixed' | 'force') => {
+    setBcSelectorDefaultType(type);
+    setEditingBoundaryCondition(null);
+    setShowBoundaryConditionSelector(true);
   };
   
   const handleBoundaryConditionSelect = (boundaryCondition: AnyBoundaryCondition) => {
@@ -274,42 +288,45 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   const handleMeshSettingsSave = (settings: MeshSettings) => {
     console.log('Saving mesh settings:', settings);
     setMeshSettings(settings);
+    // Saving the settings now also runs the mesher, so the user cannot end up
+    // with configured-but-never-generated mesh (which silently blocked solving).
+    handleGenerateMesh(settings);
   };
 
-  const handleGenerateMesh = async () => {
-    console.log('Attempting to generate mesh with settings:', meshSettings);
+  const handleGenerateMesh = async (settingsOverride?: MeshSettings) => {
+    console.log('Attempting to generate mesh with settings:', settingsOverride || meshSettings);
     
     if (!modelName) {
-      alert("Please import a geometry first.");
+      alert("请先导入几何模型。");
       return;
     }
 
-    // Ensure meshSettings is initialized before generating mesh
+    // Settings that were just saved in the modal are not visible in `meshSettings`
+    // yet (state updates are async), so prefer the explicit override.
+    const resolvedSettings: MeshSettings = settingsOverride || meshSettings || {
+      id: `mesh_${Date.now()}`,
+      name: 'Default Mesh Settings',
+      meshType: 'tetrahedral',
+      meshSize: 0.5,
+      refinementRegions: [],
+      quality: 0.8,
+      status: 'not_meshed'
+    };
     if (!meshSettings) {
-       // Create default mesh settings if none exist
-       const defaultSettings: MeshSettings = {
-         id: `mesh_${Date.now()}`,
-         name: 'Default Mesh Settings',
-         meshType: 'tetrahedral',
-         meshSize: 0.5,
-         refinementRegions: [],
-         quality: 0.8,
-         status: 'not_meshed'
-       };
-       setMeshSettings(defaultSettings);
+      setMeshSettings(resolvedSettings);
     }
 
     setIsMeshing(true);
     
     // Update status to meshing
-    setMeshSettings(prev => prev ? { ...prev, status: 'meshing' } : null);
+    setMeshSettings(prev => prev ? { ...prev, status: 'meshing' } : { ...resolvedSettings, status: 'meshing' });
 
     try {
       // Call Backend API
       const response = await axios.post(`${API_BASE_URL}/api/generate-mesh`, null, {
         params: {
           filename: modelName,
-          mesh_size: meshSettings?.meshSize || 0.5
+          mesh_size: resolvedSettings.meshSize
         }
       });
 
@@ -319,6 +336,12 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
       setMeshData(response.data);
       if (response.data.faces) {
           setFacesData(response.data.faces);
+      }
+      if (response.data.edges) {
+          setEdgesData(response.data.edges);
+      }
+      if (response.data.vertices) {
+          setVerticesData(response.data.vertices);
       }
 
       // Update status to meshed
@@ -340,11 +363,30 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
 
   const handleSolverSettingsSave = (settings: SolverSettings) => {
     setSolverSettings(settings);
+    setShowSolverSettingsModal(false); // Make sure modal closes
   };
 
   const handleSolve = async () => {
-    if (solverSettings && meshSettings?.status === 'meshed') {
-      setIsSolving(true);
+    if (!modelName) {
+      alert("请先导入几何模型。");
+      return;
+    }
+    if (!solverSettings) {
+      alert("请先创建仿真设置（左侧 SIMULATIONS → + ）。");
+      setShowSolverSettingsModal(true);
+      return;
+    }
+    if (meshSettings?.status !== 'meshed') {
+      alert("请先生成网格（左侧 Mesh → 齿轮图标 → 生成网格）。");
+      setShowMeshSettingsModal(true);
+      return;
+    }
+    if (boundaryConditions.length === 0) {
+      alert("请至少添加一个边界条件（左侧 Boundary conditions → + ）。");
+      return;
+    }
+
+    setIsSolving(true);
       
       // Update status to solving
       setSolverSettings(prev => prev ? { ...prev, status: 'solving' } : null);
@@ -394,7 +436,6 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
       } finally {
         setIsSolving(false);
       }
-    }
   };
 
   return (
@@ -615,18 +656,29 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
                             <MeshIcon size={14} className="mr-2 text-purple-400" />
                             <span>Mesh</span>
                           </div>
-                          <button 
-                            onClick={(e) => { e.stopPropagation(); setShowMeshSettingsModal(true); }}
-                            className="opacity-0 group-hover:opacity-100 text-blue-400 hover:text-blue-300 mr-2"
-                          >
-                            <Settings size={14} />
-                          </button>
+                          <div className="flex items-center gap-1 mr-2 opacity-0 group-hover:opacity-100">
+                            <button 
+                              onClick={(e) => { e.stopPropagation(); handleGenerateMesh(); }}
+                              disabled={isMeshing}
+                              className="text-purple-400 hover:text-purple-300 disabled:opacity-40"
+                              title="生成网格"
+                            >
+                              <Play size={12} fill="currentColor" />
+                            </button>
+                            <button 
+                              onClick={(e) => { e.stopPropagation(); setShowMeshSettingsModal(true); }}
+                              className="text-blue-400 hover:text-blue-300"
+                              title="网格设置"
+                            >
+                              <Settings size={14} />
+                            </button>
+                          </div>
                         </div>
                         {expandedNodes['mesh'] && meshSettings && (
                           <div className="ml-10 py-1 flex items-center">
-                             <span className={`w-2 h-2 rounded-full mr-2 ${meshSettings.status === 'meshed' ? 'bg-green-500' : 'bg-yellow-500'}`}></span>
+                             <span className={`w-2 h-2 rounded-full mr-2 ${meshSettings.status === 'meshed' || meshSettings.status === 'solved' ? 'bg-green-500' : meshSettings.status === 'failed' ? 'bg-red-500' : 'bg-yellow-500'}`}></span>
                              <span className="text-xs text-gray-400">
-                               {meshSettings.status === 'meshed' ? 'Meshed' : 'Configured'}
+                               {meshSettings.status === 'meshed' ? 'Meshed' : meshSettings.status === 'solved' ? 'Solved' : meshSettings.status === 'meshing' ? 'Meshing...' : meshSettings.status === 'failed' ? 'Failed' : 'Configured'}
                              </span>
                           </div>
                         )}
@@ -705,13 +757,16 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
             selectedMaterial={selectedMaterial} 
             boundaryConditions={boundaryConditions}
             onSelect={handleSelect}
+            onAddBoundaryCondition={handleAddBoundaryConditionFromScene}
             meshSettings={
-              solverSettings?.status === 'solved' 
-                ? { ...meshSettings!, status: 'solved' as any } 
+              solverSettings?.status === 'solved' && meshSettings
+                ? { ...meshSettings, status: 'solved' } 
                 : meshSettings
             }
             meshData={meshData}
             faces={facesData}
+            edges={edgesData}
+            vertices={verticesData}
           />
 
           {/* Bottom Overlay Info */}
@@ -744,8 +799,9 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
           setEditingBoundaryCondition(null);
         }}
         onBoundaryConditionSelect={handleBoundaryConditionSelect}
-        selectedEntity={selectedEntity}
+        selectedEntity={selectedEntity || undefined}
         editingBoundaryCondition={editingBoundaryCondition || undefined}
+        defaultBcType={bcSelectorDefaultType}
       />
       
       <MeshSettingsModal
