@@ -70,8 +70,8 @@ make dev                # 或 python3 tools/tasks.py dev
 
 | 命令（跨平台） | Windows 等价 | 验证什么 | 需要服务在跑吗 | 何时用 |
 |---|---|---|---|---|
-| `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**184** 个用例，约 4 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
-| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准 + 项目 CRUD（**35** 项） | 需要 | 提交前跑一次 |
+| `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**249** 个用例，约 8 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
+| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准 + 认证与隔离（**52** 项） | 需要 | 提交前跑一次 |
 | `make build` | — | 前端类型检查 + 生产构建 | 不需要 | 改前端后 |
 | CI（`.github/workflows/ci.yml`） | — | 上面几项的自动化版本 | 不需要 | push / PR 时自动跑 |
 
@@ -130,25 +130,28 @@ backend/
 ├── fe_utils.py        # 共享 FE 基础设施：读网格、归属面积、面→节点定位、矢量解析
 ├── jobs.py            # 后台任务：单线程工作器 + /api/jobs/*
 ├── gmsh_session.py    # Gmsh 会话（主线程初始化一次，进程内复用）
+├── passwords.py       # ★ 口令哈希（scrypt；参数写进哈希串，可平滑升级）
+├── auth_store.py      # ★ 用户与会话（令牌只存哈希、可吊销、SQL 里判过期）
+├── auth.py            # ★ 注册/登录/登出/me + require_user 依赖
 ├── sqlite_store.py    # ★ SQLite 存储基类：连接/事务/**关闭** + 幂等加列迁移
 ├── material_store.py  # 材料持久化（继承 sqlite_store）
 ├── project_store.py   # 项目持久化（继承 sqlite_store）
 ├── materials.py       # 材料库
-├── projects.py        # 项目管理 API（/api/projects 增删改查）
+├── projects.py        # 项目管理 API（/api/projects 增删改查，需登录）
 ├── constraints.py     # 边界条件模型与设置校验
 ├── ai_assistant.py    # DeepSeek 助手
 ├── supabase_client.py # 可选云存储
 └── tests/             # unittest 测试（无需服务器）
 frontend/
 ├── index.tsx          # React 入口（注意不是 src/main.tsx）
-├── App.tsx            # 落地页 → 仪表盘 → 工作台（项目列表来自后端）
+├── App.tsx            # 落地页 → 登录 → 仪表盘 → 工作台
 ├── types.ts           # 全局类型契约
-├── components/        # 11 个组件，Workbench 是总调度、Scene3D 是 3D 视口
-│   └── resultShader.ts  # 结果云图 GLSL（彩虹映射 + 变形显示）
+├── components/        # 含 AuthPanel（登录/注册）与 resultShader（云图 GLSL）
 └── utils/             # 不依赖框架的纯函数（verify 会用 node 直接跑它们）
+    ├── authApi.ts       # 令牌存取 / 请求头 / 401 与网络错误的区分
     ├── deformation.ts   # 变形放大系数
     ├── modalModes.ts    # 模态阶次列表 / 频率格式化 / 振型取场
-    └── projectsApi.ts   # 项目记录的接口↔界面映射、错误翻译
+    └── projectsApi.ts   # 项目记录的接口↔界面映射、属主判定、错误翻译
 tools/
 └── tasks.py           # ★ 跨平台任务入口（setup/dev/test/verify/build/clean/doctor）
 Dockerfile             # 后端镜像（含 Gmsh 系统库）
@@ -236,6 +239,10 @@ class YourTest(unittest.TestCase):
 | 模态分析报 `num_modes` 超范围 | 允许 1–30。约束过多导致可求自由度不足时也会报 400 |
 | 用 PowerShell 手工调接口时中文变乱码 | **不是后端的问题**。Windows PowerShell 5.1 的 `Invoke-RestMethod`：发 body 时按 ANSI 编码 ⇒ 中文变 `?`；解析 JSON 响应时按 ISO-8859-1 解码 ⇒ 中文变 `éå¯...`。直接读 SQLite 会看到存的是正确的中文。断言编码相关行为请用 Python（`tools/tasks.py` 里的 `_http_json` 显式 `encode/decode('utf-8')`）或浏览器 |
 | 项目列表空了 / 报"无法连接后端" | 项目存在 `backend/data/simcloud.db`（可用 `SIMCLOUD_DB` 改）。先确认后端在跑；这是**唯一**一份数据，删掉它项目就没了 |
+| 忘了口令 / 想把账号清掉 | 没有"重置口令"的界面（也没有找回邮件）。单人自用可以直接删库重来：停服务 → 删 `backend/data/simcloud.db` → 重启（**项目与自定义材料会一起没有**）。要保留项目就先备份该文件 |
+| 看到项目标着"未归属"，改名/删除按钮不见了 | 那是**接上登录之前**创建的项目（`owner_id IS NULL`）。策略是"可见但不可改"，点卡片上的「认领」即可；这是刻意设计——初版做过"第一个注册的用户自动接管"，结果把用户的项目静默划给了 `verify` 的测试账号 |
+| 列表里出现 `verify_alice` / `verify_bob` | 这是 `tools/tasks.py verify` 用的**固定测试账号**（登录优先，不存在才注册），故意不每次新建用户。它们只会看到自己的项目 |
+| 接口返回 401 但口令明明是对的 | 先看是不是令牌过期（默认 30 天，`SIMCLOUD_TOKEN_TTL_DAYS` 可调）；前端在启动时会调 `/api/auth/me` 校验，失效就回登录页。另外注意"连不上后端"与 401 是两回事，前端会分别提示 |
 
 ## 10. 下一步该做什么
 
@@ -247,6 +254,6 @@ class YourTest(unittest.TestCase):
 **网格质量与收敛性**。再往后最值得投入的是：
 
 1. **模态分析的前端接线**（选振型、按位移着色）——后端已就绪，界面上还没有入口；
-2. **登录与用户隔离**（项目持久化已落地，但还没有"谁拥有哪个项目"）；
+2. **给求解/上传端点也加上登录要求**（目前只有项目与认证端点要求登录，求解端点仍开放）；
 3. **结果后处理**：剖切面、等值面、变形动画、CSV/VTK/PNG 导出；
 4. **网格质量直方图与 h 收敛性检查**（阶段 2 收尾）。
