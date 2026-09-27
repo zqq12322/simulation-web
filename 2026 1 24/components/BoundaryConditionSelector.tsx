@@ -8,6 +8,7 @@ interface BoundaryConditionSelectorProps {
   onBoundaryConditionSelect: (boundaryCondition: AnyBoundaryCondition) => void;
   selectedEntity?: { type: ApplicationType; index: number };
   editingBoundaryCondition?: AnyBoundaryCondition;
+  defaultBcType?: BoundaryConditionType;
 }
 
 // 定义每种边界条件类型对应的颜色
@@ -24,10 +25,11 @@ const BoundaryConditionSelector: React.FC<BoundaryConditionSelectorProps> = ({
   onClose,
   onBoundaryConditionSelect,
   selectedEntity,
-  editingBoundaryCondition
+  editingBoundaryCondition,
+  defaultBcType = 'fixed'
 }) => {
   // 如果有编辑的边界条件，则使用其数据初始化状态，否则使用默认值或选中的实体
-  const [bcType, setBcType] = useState<BoundaryConditionType>(editingBoundaryCondition?.type || 'fixed');
+  const [bcType, setBcType] = useState<BoundaryConditionType>(editingBoundaryCondition?.type || defaultBcType);
   const [applicationType, setApplicationType] = useState<ApplicationType>(editingBoundaryCondition?.applicationType || selectedEntity?.type || 'face');
   const [entityIndex, setEntityIndex] = useState<number>(editingBoundaryCondition?.entityIndex || selectedEntity?.index || 0);
   const [name, setName] = useState<string>(editingBoundaryCondition?.name || `${bcType} - ${applicationType} ${entityIndex}`);
@@ -50,10 +52,44 @@ const BoundaryConditionSelector: React.FC<BoundaryConditionSelectorProps> = ({
   // 编辑模式下，我们需要保留原始ID
   const isEditing = !!editingBoundaryCondition;
 
+  // 当模态框打开时，重置状态
+  React.useEffect(() => {
+    if (isOpen) {
+      setBcType(editingBoundaryCondition?.type || defaultBcType);
+      setApplicationType(editingBoundaryCondition?.applicationType || selectedEntity?.type || 'face');
+      setEntityIndex(editingBoundaryCondition?.entityIndex || selectedEntity?.index || 0);
+      setName(editingBoundaryCondition?.name || `${editingBoundaryCondition?.type || defaultBcType} - ${editingBoundaryCondition?.applicationType || selectedEntity?.type || 'face'} ${editingBoundaryCondition?.entityIndex || selectedEntity?.index || 0}`);
+      
+      if (editingBoundaryCondition) {
+        if (editingBoundaryCondition.type === 'displacement') {
+          setDisplacement(editingBoundaryCondition.displacement);
+          setFixedX(editingBoundaryCondition.fixedX);
+          setFixedY(editingBoundaryCondition.fixedY);
+          setFixedZ(editingBoundaryCondition.fixedZ);
+        } else if (editingBoundaryCondition.type === 'force') {
+          setForce(editingBoundaryCondition.force);
+        } else if (editingBoundaryCondition.type === 'pressure') {
+          setPressure(editingBoundaryCondition.pressure);
+        } else if (editingBoundaryCondition.type === 'temperature') {
+          setTemperature(editingBoundaryCondition.temperature);
+        }
+      } else {
+        // Reset to defaults when adding new
+        setDisplacement({ x: 0, y: 0, z: 0 });
+        setFixedX(true); setFixedY(true); setFixedZ(true);
+        setForce({ x: 0, y: -100, z: 0 });
+        setPressure(1);
+        setTemperature(25);
+      }
+    }
+  }, [isOpen, editingBoundaryCondition, selectedEntity, defaultBcType]);
+
   // 当边界条件类型或应用对象类型变化时，更新默认名称
   React.useEffect(() => {
-    setName(`${bcType} - ${applicationType} ${entityIndex}`);
-  }, [bcType, applicationType, entityIndex]);
+    if (!isEditing) {
+      setName(`${bcType} - ${applicationType} ${entityIndex}`);
+    }
+  }, [bcType, applicationType, entityIndex, isEditing]);
 
   // 处理表单提交
   const handleSubmit = (e: React.FormEvent) => {

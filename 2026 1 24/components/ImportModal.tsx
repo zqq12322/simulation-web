@@ -5,7 +5,7 @@ import axios from 'axios';
 interface ImportModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onImport: (file: File) => void;
+  onImport: (file: File, renderFilename?: string) => void;
 }
 
 const ImportModal: React.FC<ImportModalProps> = ({ isOpen, onClose, onImport }) => {
@@ -82,7 +82,7 @@ const ImportModal: React.FC<ImportModalProps> = ({ isOpen, onClose, onImport }) 
         console.log("Upload successful:", response.data);
         
         // Notify parent component to load file into viewer
-        onImport(selectedFile);
+        onImport(selectedFile, response.data.render_filename);
         onClose();
         
       } catch (err) {
