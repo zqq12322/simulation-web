@@ -27,6 +27,7 @@ export interface ProjectRecord {
   description?: unknown;
   simulationType?: unknown;
   isPrivate?: unknown;
+  ownerId?: unknown;
   createdAt?: unknown;
   updatedAt?: unknown;
 }
@@ -82,7 +83,29 @@ export function toProject(record: ProjectRecord | null | undefined): Project | n
     createdAt: parseTimestamp(record.createdAt) ?? new Date(0),
     simulationType: normaliseSimulationType(record.simulationType),
     isPrivate: record.isPrivate !== false,
+    // 缺失与 null 都表示"无主"（后端用 owner_id IS NULL 表达遗留项目）。
+    // 归一化成 null，界面就不必区分 undefined / null 两种情况。
+    ownerId: typeof record.ownerId === 'string' && record.ownerId ? record.ownerId : null,
   };
+}
+
+/** 该项目是否无主（接上登录之前创建的遗留数据）。 */
+export function isUnowned(project: Pick<Project, 'ownerId'> | null | undefined): boolean {
+  return !project || !project.ownerId;
+}
+
+/**
+ * 该项目能否被当前用户修改/删除。
+ *
+ * 无主项目**不能**——必须先认领。这样"看得见但要手点一下"取代了
+ * "谁先注册谁自动得到"，后者曾把开发者手工建的项目静默划给测试账号。
+ */
+export function canModify(
+  project: Pick<Project, 'ownerId'> | null | undefined,
+  currentUserId: string | null | undefined,
+): boolean {
+  if (isUnowned(project)) return false;
+  return !!currentUserId && project!.ownerId === currentUserId;
 }
 
 /** 列表映射：过滤掉坏记录，而不是让整个列表渲染失败。 */

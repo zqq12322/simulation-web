@@ -422,38 +422,130 @@ def _health_ok() -> bool:
         return False
 
 
-def _http_json(method: str, url: str, payload: Any = None, timeout: float = 120.0):
+def _http_json(
+    method: str,
+    url: str,
+    payload: Any = None,
+    timeout: float = 120.0,
+    headers: Optional[dict] = None,
+):
+    request_headers = {"Accept": "application/json"}
+    if headers:
+        request_headers.update(headers)
     data = None
-    headers = {"Accept": "application/json"}
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json; charset=utf-8"
+        request_headers["Content-Type"] = "application/json; charset=utf-8"
 
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    request = urllib.request.Request(
+        url, data=data, headers=request_headers, method=method
+    )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = response.read().decode("utf-8")
     return json.loads(body) if body else None
 
 
-def _http_status(method: str, url: str, payload: Any = None, timeout: float = 120.0) -> int:
+def _http_status(
+    method: str,
+    url: str,
+    payload: Any = None,
+    timeout: float = 120.0,
+    headers: Optional[dict] = None,
+) -> int:
     """
     发一个请求并**返回状态码**（成功与失败都返回），用于断言错误码。
 
     与 `_http_json` 的区别：`_http_json` 把非 2xx 当异常抛出——那对"验证正常流程"
     很方便，但要断言"这个请求应当被拒绝"就必须能拿到 4xx/5xx 本身。
     """
+    request_headers = {"Accept": "application/json"}
+    if headers:
+        request_headers.update(headers)
     data = None
-    headers = {"Accept": "application/json"}
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json; charset=utf-8"
+        request_headers["Content-Type"] = "application/json; charset=utf-8"
 
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    request = urllib.request.Request(
+        url, data=data, headers=request_headers, method=method
+    )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return int(response.status)
     except urllib.error.HTTPError as error:
         return int(error.code)
+
+
+def _bearer(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _project_db_path() -> Path:
+    """开发数据库路径（与 `backend/config.py` 的 `SIMCLOUD_DB` 规则一致）。"""
+    override = os.environ.get("SIMCLOUD_DB")
+    if override:
+        return Path(override)
+    return BACKEND / "data" / "simcloud.db"
+
+
+def _insert_legacy_project(project_id: str, title: str) -> None:
+    """
+    直接往库里插一条 ``owner_id IS NULL`` 的项目，**模拟"接上登录之前的数据库"**。
+
+    为什么需要它：遗留项目只能这样造——HTTP 接口创建的项目一定有属主。
+    这也是本轮最值得端到端验证的一条策略（可见但不可改、需显式认领），
+    而它没法只靠接口构造出前置状态。
+    """
+    import sqlite3
+    from datetime import datetime, timezone
+
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    connection = sqlite3.connect(str(_project_db_path()))
+    try:
+        with connection:
+            connection.execute(
+                "INSERT INTO projects (id, title, description, simulation_type,"
+                " is_private, owner_id, created_at, updated_at)"
+                " VALUES (?, ?, '', 'General', 1, NULL, ?, ?)",
+                (project_id, title, timestamp, timestamp),
+            )
+    finally:
+        connection.close()
+
+
+def _delete_legacy_project(project_id: str) -> None:
+    """清掉 verify 临时造的遗留项目（要按主键直删，因为它可能已被认领）。"""
+    import sqlite3
+
+    try:
+        connection = sqlite3.connect(str(_project_db_path()))
+        try:
+            with connection:
+                connection.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        finally:
+            connection.close()
+    except Exception:  # noqa: BLE001 - 清理失败不该影响验证结论
+        pass
+
+
+def _login_or_register(username: str, password: str) -> dict:
+    """
+    拿到一个可用令牌：先尝试登录，失败（401）则注册——注册也会直接返回令牌。
+
+    verify 用**固定的测试账号**，因此不会每次运行都往开发库里塞新用户。
+    """
+    try:
+        return _http_json(
+            "POST", f"{API_BASE}/api/auth/login",
+            {"username": username, "password": password},
+        )
+    except urllib.error.HTTPError as error:
+        if error.code != 401:
+            raise
+    return _http_json(
+        "POST", f"{API_BASE}/api/auth/register",
+        {"username": username, "password": password},
+    )
 
 
 def _face_by_normal(faces, axis: int, sign: int):
@@ -765,8 +857,8 @@ def _check_frontend_modal_math(node: str) -> tuple[bool, str]:
 #: 声明为 `Date`。旧代码直接 `.toLocaleDateString()`，接上真实接口就抛
 #: TypeError —— 断言里显式证明了旧写法会炸、新写法不会。
 _PROJECTS_API_SELFTEST = r"""
-import { SIMULATION_TYPES, describeProjectError, formatCreatedAt,
-         parseTimestamp, toProject, toProjectList } from './projectsApi.ts';
+import { SIMULATION_TYPES, canModify, describeProjectError, formatCreatedAt,
+         isUnowned, parseTimestamp, toProject, toProjectList } from './projectsApi.ts';
 
 let failures = [];
 const check = (name, ok, detail = '') => {
@@ -775,7 +867,7 @@ const check = (name, ok, detail = '') => {
 
 const record = {
   id: 'abc123', title: '悬臂梁', description: '10×10×100',
-  simulationType: 'FEA', isPrivate: false,
+  simulationType: 'FEA', isPrivate: false, ownerId: 'user-1',
   createdAt: '2026-03-18T00:00:00+00:00', updatedAt: '2026-03-18T00:00:00+00:00',
 };
 
@@ -788,6 +880,7 @@ check('createdAt 值正确', project.createdAt.toISOString() === '2026-03-18T00:
       project.createdAt.toISOString());
 check('simulationType 保留', project.simulationType === 'FEA');
 check('isPrivate 保留为 false', project.isPrivate === false);
+check('ownerId 保留', project.ownerId === 'user-1');
 
 // 2) 回归：**字符串没有 toLocaleDateString** —— 旧代码就是这么崩的
 check('字符串不是 Date（旧写法必然抛错）',
@@ -808,6 +901,23 @@ check('null 记录被丢弃', toProject(null) === null && toProject(undefined) =
 check('未知 simulationType 回落 General',
       toProject({ id: 'x', title: 't', simulationType: 'CFD2' }).simulationType === 'General');
 check('缺 description 回落空串', toProject({ id: 'x', title: 't' }).description === '');
+
+// ownerId：缺失与 null 都归一化成 null（后端用 owner_id IS NULL 表达遗留项目）
+check('缺 ownerId 归一化为 null', toProject({ id: 'x', title: 't' }).ownerId === null);
+check('ownerId 为 null 时保持 null',
+      toProject({ id: 'x', title: 't', ownerId: null }).ownerId === null);
+check('ownerId 非字符串时归一化为 null',
+      toProject({ id: 'x', title: 't', ownerId: 42 }).ownerId === null);
+
+// 无主项目：**可见但不可改**。这取代了"谁先注册谁自动得到"，
+// 后者曾把开发者手工建的项目静默划给 verify 的测试账号。
+check('识别无主项目', isUnowned({ ownerId: null }) && isUnowned({}) && isUnowned(null));
+check('有主项目不算无主', !isUnowned({ ownerId: 'user-1' }));
+check('自己的项目可改', canModify({ ownerId: 'user-1' }, 'user-1'));
+check('别人的项目不可改', !canModify({ ownerId: 'user-2' }, 'user-1'));
+check('无主项目不可改（必须先认领）', !canModify({ ownerId: null }, 'user-1'));
+check('未登录时不可改', !canModify({ ownerId: 'user-1' }, null)
+      && !canModify({ ownerId: 'user-1' }, undefined));
 
 // 4) 列表映射：坏记录被过滤，而不是让整个列表渲染失败
 check('非数组返回空列表', toProjectList('x').length === 0
@@ -850,6 +960,132 @@ def _check_frontend_projects_math(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/projectsApi.ts` 里的纯函数并断言其行为。"""
     ok, detail = _run_node_module_selftest(node, _PROJECTS_API_SELFTEST)
     return ok, ("记录映射 / 时间戳解析 / 错误翻译 均符合断言" if ok else detail)
+
+
+#: 认证工具的断言：令牌存取、字段映射、请求头、401 与"连不上"的区分。
+_AUTH_API_SELFTEST = r"""
+import { TOKEN_STORAGE_KEY, authorizationHeader, clearStoredToken,
+         defaultStorage, describeAuthError, describeOwner, errorStatus,
+         isUnauthorized, readStoredToken, toSession, toUser,
+         writeStoredToken } from './authApi.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+// 用一个假存储，断言"读写清"三条路径。假存储可以模拟抛异常的环境
+// （Safari 隐私模式、被策略禁用的存储），那正是组件里直接写 localStorage 会白屏的场景。
+const makeStorage = () => {
+  const map = new Map();
+  return {
+    getItem: (k) => (map.has(k) ? map.get(k) : null),
+    setItem: (k, v) => { map.set(k, String(v)); },
+    removeItem: (k) => { map.delete(k); },
+    _dump: () => map,
+  };
+};
+
+let storage = makeStorage();
+check('初始没有令牌', readStoredToken(storage) === null);
+check('写入令牌成功', writeStoredToken('tok-123', storage) === true);
+check('读回令牌', readStoredToken(storage) === 'tok-123');
+check('键名固定', storage._dump().has(TOKEN_STORAGE_KEY), TOKEN_STORAGE_KEY);
+clearStoredToken(storage);
+check('清除令牌', readStoredToken(storage) === null);
+check('清除是幂等的', (clearStoredToken(storage), readStoredToken(storage) === null));
+
+// 空白令牌不该被当成"已登录"
+check('空白令牌视为未登录', readStoredToken(makeStorage()) === null);
+const blank = makeStorage();
+blank.setItem(TOKEN_STORAGE_KEY, '   ');
+check('只有空格的令牌视为未登录', readStoredToken(blank) === null);
+check('拒绝写入空令牌', writeStoredToken('', makeStorage()) === false);
+
+// 存储不可用（构造器抛异常 / null）时，一律安全返回，绝不把异常抛给组件
+const throwing = {
+  getItem: () => { throw new Error('SecurityError'); },
+  setItem: () => { throw new Error('QuotaExceededError'); },
+  removeItem: () => { throw new Error('SecurityError'); },
+};
+check('读取失败的存储返回 null', readStoredToken(throwing) === null);
+check('写入失败的存储返回 false（不抛）', writeStoredToken('t', throwing) === false);
+check('清除失败的存储不抛', (clearStoredToken(throwing), true));
+check('null 存储安全', readStoredToken(null) === null
+      && writeStoredToken('t', null) === false && (clearStoredToken(null), true));
+
+// 请求头：没有令牌时**不能**发 "Bearer undefined"
+check('无令牌时不带 Authorization',
+      authorizationHeader(null).Authorization === undefined
+      && authorizationHeader(undefined).Authorization === undefined
+      && authorizationHeader('').Authorization === undefined);
+check('有令牌时带 Bearer',
+      authorizationHeader('abc').Authorization === 'Bearer abc');
+check('令牌两侧空白被去掉',
+      authorizationHeader('  abc  ').Authorization === 'Bearer abc');
+check('额外头被保留',
+      authorizationHeader('abc', { 'Content-Type': 'application/json' })['Content-Type']
+      === 'application/json');
+check('默认带 Accept', authorizationHeader(null).Accept === 'application/json');
+
+// 用户 / 会话映射
+const userRecord = {
+  id: 'u1', username: 'alice', displayName: 'Alice',
+  createdAt: '2026-03-18T00:00:00+00:00',
+};
+check('用户映射', toUser(userRecord).username === 'alice');
+check('缺 displayName 时回落到 username',
+      toUser({ id: 'u1', username: 'bob' }).displayName === 'bob');
+check('缺 id 或 username 返回 null',
+      toUser({ username: 'bob' }) === null && toUser({ id: 'u1' }) === null
+      && toUser(null) === null && toUser('nope') === null);
+
+check('会话映射', (toSession({ token: 't', user: userRecord }) || {}).token === 't');
+check('缺令牌的响应返回 null', toSession({ user: userRecord }) === null);
+check('缺用户的响应返回 null', toSession({ token: 't' }) === null);
+check('令牌全是空白返回 null', toSession({ token: '   ', user: userRecord }) === null);
+check('垃圾输入返回 null', toSession(null) === null && toSession('x') === null);
+
+// 401 与"连不上后端"必须区分：前者要重新登录，后者要先把服务起起来
+check('识别 401', isUnauthorized({ response: { status: 401 } })
+      && !isUnauthorized({ response: { status: 500 } })
+      && !isUnauthorized({ code: 'ERR_NETWORK' }));
+check('状态码提取', errorStatus({ response: { status: 403 } }) === 403
+      && errorStatus({ code: 'ERR_NETWORK' }) === null
+      && errorStatus(null) === null);
+
+const unauthorized = describeAuthError({ response: { status: 401 } });
+check('401 提示口令错误', unauthorized.includes('口令'), unauthorized);
+const declaredDetail = describeAuthError({
+  response: { status: 401, data: { detail: '登录已失效，请重新登录' } } });
+check('401 透出后端 detail', declaredDetail.includes('登录已失效'), declaredDetail);
+const offline = describeAuthError({ code: 'ERR_NETWORK' });
+check('网络错误提到启动后端', offline.includes('后端'), offline);
+const validation = describeAuthError({ response: { status: 422 } });
+check('422 提到输入不合法', validation.includes('不合法'), validation);
+check('未知输入有兜底', describeAuthError(null) === '未知错误。');
+
+// 属主标记：让"归属"在界面上显式可见（含"无主"这种遗留状态）
+check('自己的项目', describeOwner({ isPrivate: true, ownerId: 'u1' }, 'u1') === '我的项目');
+check('自己的公开项目',
+      describeOwner({ isPrivate: false, ownerId: 'u1' }, 'u1') === '我的项目（公开）');
+check('他人的项目',
+      describeOwner({ isPrivate: true, ownerId: 'u2' }, 'u1') === '他人的项目');
+check('无主项目',
+      describeOwner({ isPrivate: true, ownerId: null }, 'u1') === '未归属');
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+def _check_frontend_auth_math(node: str) -> tuple[bool, str]:
+    """用 node 执行 `frontend/utils/authApi.ts` 里的纯函数并断言其行为。"""
+    ok, detail = _run_node_module_selftest(node, _AUTH_API_SELFTEST)
+    return ok, ("令牌存取 / 请求头 / 错误区分 均符合断言" if ok else detail)
 
 
 def _check_modal_display_chain(node: str, payload: dict) -> tuple[bool, str]:
@@ -917,6 +1153,9 @@ def task_verify(args: argparse.Namespace) -> int:
 
             passed, detail = _check_frontend_projects_math(node_bin)
             check("项目记录映射与错误翻译（node 执行前端纯函数）", passed, detail)
+
+            passed, detail = _check_frontend_auth_math(node_bin)
+            check("认证工具（node 执行前端纯函数）", passed, detail)
         else:
             check("TypeScript 类型检查", False, "未找到 node")
 
@@ -1255,86 +1494,289 @@ def task_verify(args: argparse.Namespace) -> int:
             check("求解器物理校准", False, f"{type(exc).__name__}: {exc}")
 
     if reachable:
-        info("\n=== 5/5 项目管理（持久化实体）===")
-        # 在这之前项目只活在前端内存里：新建即丢、无法引用。这组检查走真实 HTTP，
-        # 验证"项目是一个真正的后端实体"这条承诺：ID 由服务端生成、能被列出来、
-        # 能改名、删掉之后确实 404。
-        created_id: Optional[str] = None
+        info("\n=== 5/6 认证与用户隔离 ===")
+        # 用**固定的测试账号**（登录优先，不存在才注册），避免每次 verify 都往
+        # 开发库里塞新用户。用两个账号是为了能在真实 HTTP 栈上验证隔离——
+        # 单测是直接构造 Authorization 头调 require_user 的，
+        # **没有覆盖 FastAPI 的 Header 依赖注入**，那条链路只有这里能验。
+        alice = bob = None
         try:
-            marker = f"verify-{uuid.uuid4().hex[:8]}"
-            created = _http_json("POST", f"{API_BASE}/api/projects", {
-                "title": f"契约检查 {marker}",
-                "description": "由 tools/tasks.py verify 创建，跑完会删掉",
-                "simulationType": "FEA",
-                "isPrivate": True,
-            })
-            created_id = created.get("id")
-
+            unauth = _http_status("GET", f"{API_BASE}/api/projects")
             check(
-                "创建项目返回服务端 ID 与时间戳",
-                bool(created_id) and bool(created.get("createdAt"))
-                and str(created.get("createdAt", "")).endswith("+00:00"),
-                f"id={created_id} createdAt={created.get('createdAt')}",
+                "未登录访问项目列表被拒（401）",
+                unauth == 401,
+                f"GET /api/projects（无令牌）-> HTTP {unauth}",
             )
-
-            listing = _http_json("GET", f"{API_BASE}/api/projects")
-            ids = [item.get("id") for item in listing] if isinstance(listing, list) else []
-            check(
-                "新项目出现在列表最前",
-                bool(ids) and ids[0] == created_id,
-                f"{len(ids)} 个项目，第一个={ids[0] if ids else None}",
+            no_scheme = _http_status(
+                "GET", f"{API_BASE}/api/projects",
+                headers={"Authorization": "token-without-scheme"},
             )
-
-            fetched = _http_json("GET", f"{API_BASE}/api/projects/{created_id}")
             check(
-                "按 ID 取回同一项目",
-                fetched.get("id") == created_id
-                and fetched.get("title") == f"契约检查 {marker}",
-                f"title={fetched.get('title')}",
+                "非 Bearer 方案也被拒（401）",
+                no_scheme == 401,
+                f"Authorization: token-without-scheme -> HTTP {no_scheme}",
+            )
+            bad_token = _http_status(
+                "GET", f"{API_BASE}/api/projects", headers=_bearer("not-a-real-token")
+            )
+            check(
+                "伪造令牌被拒（401）",
+                bad_token == 401,
+                f"Bearer not-a-real-token -> HTTP {bad_token}",
             )
 
-            renamed = _http_json(
-                "PATCH", f"{API_BASE}/api/projects/{created_id}", {"title": "改名后"}
-            )
+            alice = _login_or_register("verify_alice", "verify-alice-pass")
+            bob = _login_or_register("verify_bob", "verify-bob-pass")
             check(
-                "PATCH 只改给定字段",
-                renamed.get("title") == "改名后"
-                and renamed.get("description") == "由 tools/tasks.py verify 创建，跑完会删掉",
-                f"title={renamed.get('title')}",
+                "登录返回令牌，且响应不含口令哈希",
+                bool(alice.get("token")) and bool(alice.get("user", {}).get("id"))
+                and "passwordHash" not in json.dumps(alice),
+                f"alice id={alice.get('user', {}).get('id')}",
             )
 
+            me = _http_json("GET", f"{API_BASE}/api/auth/me",
+                            headers=_bearer(alice["token"]))
             check(
-                "服务端拒绝客户端自选 ID",
-                _http_status("POST", f"{API_BASE}/api/projects",
-                             {"id": "my-own-id", "title": "x"}) == 422,
-                "请求体里带 id 应为 422（否则客户端能覆盖别人的记录）",
-            )
-            check(
-                "空标题被拒绝",
-                _http_status("POST", f"{API_BASE}/api/projects", {"title": "   "}) == 422,
-                "空标题应为 422",
+                "/auth/me 返回令牌对应的用户",
+                me.get("id") == alice["user"]["id"]
+                and me.get("username") == "verify_alice",
+                f"username={me.get('username')}",
             )
 
-            _http_json("DELETE", f"{API_BASE}/api/projects/{created_id}")
-            deleted_status = _http_status("GET", f"{API_BASE}/api/projects/{created_id}")
-            check(
-                "删除后确实不存在（404 而不是静默成功）",
-                deleted_status == 404,
-                f"GET 已删除项目 -> HTTP {deleted_status}",
+            wrong_password = _http_status(
+                "POST", f"{API_BASE}/api/auth/login",
+                {"username": "verify_alice", "password": "definitely-wrong"},
             )
-            created_id = None
+            unknown_user = _http_status(
+                "POST", f"{API_BASE}/api/auth/login",
+                {"username": "definitely_not_here", "password": "whatever-pass"},
+            )
+            check(
+                "口令错误与用户不存在返回同样的 401（不给用户名枚举）",
+                wrong_password == 401 and unknown_user == 401,
+                f"错误口令={wrong_password}，不存在用户={unknown_user}",
+            )
         except Exception as exc:
             import traceback
 
             traceback.print_exc()
-            check("项目管理 CRUD", False, f"{type(exc).__name__}: {exc}")
-        finally:
-            # 检查用的项目不要留在用户的数据库里
-            if created_id:
+            check("认证流程", False, f"{type(exc).__name__}: {exc}")
+
+        if alice and bob:
+            info("\n=== 6/6 项目隔离（属主）===")
+            created_id: Optional[str] = None
+            try:
+                marker = f"verify-{uuid.uuid4().hex[:8]}"
+                alice_headers = _bearer(alice["token"])
+                bob_headers = _bearer(bob["token"])
+
+                created = _http_json(
+                    "POST", f"{API_BASE}/api/projects",
+                    {
+                        "title": f"契约检查 {marker}",
+                        "description": "由 tools/tasks.py verify 创建，跑完会删掉",
+                        "simulationType": "FEA",
+                        "isPrivate": True,
+                    },
+                    headers=alice_headers,
+                )
+                created_id = created.get("id")
+
+                check(
+                    "创建项目返回服务端 ID、时间戳与属主",
+                    bool(created_id) and bool(created.get("createdAt"))
+                    and str(created.get("createdAt", "")).endswith("+00:00")
+                    and created.get("ownerId") == alice["user"]["id"],
+                    f"id={created_id} owner={created.get('ownerId')}",
+                )
+
+                listing = _http_json(
+                    "GET", f"{API_BASE}/api/projects", headers=alice_headers
+                )
+                ids = [item.get("id") for item in listing] if isinstance(listing, list) else []
+                check(
+                    "新项目出现在自己的列表最前",
+                    bool(ids) and ids[0] == created_id,
+                    f"{len(ids)} 个项目，第一个={ids[0] if ids else None}",
+                )
+
+                fetched = _http_json(
+                    "GET", f"{API_BASE}/api/projects/{created_id}",
+                    headers=alice_headers,
+                )
+                check(
+                    "按 ID 取回同一项目",
+                    fetched.get("id") == created_id
+                    and fetched.get("title") == f"契约检查 {marker}",
+                    f"title={fetched.get('title')}",
+                )
+
+                renamed = _http_json(
+                    "PATCH", f"{API_BASE}/api/projects/{created_id}",
+                    {"title": "改名后"}, headers=alice_headers,
+                )
+                check(
+                    "PATCH 只改给定字段",
+                    renamed.get("title") == "改名后"
+                    and renamed.get("description")
+                    == "由 tools/tasks.py verify 创建，跑完会删掉",
+                    f"title={renamed.get('title')}",
+                )
+
+                check(
+                    "服务端拒绝客户端自选 ID",
+                    _http_status(
+                        "POST", f"{API_BASE}/api/projects",
+                        {"id": "my-own-id", "title": "x"}, headers=alice_headers,
+                    ) == 422,
+                    "请求体里带 id 应为 422（否则客户端能覆盖别人的记录）",
+                )
+                check(
+                    "空标题被拒绝",
+                    _http_status(
+                        "POST", f"{API_BASE}/api/projects",
+                        {"title": "   "}, headers=alice_headers,
+                    ) == 422,
+                    "空标题应为 422",
+                )
+
+                # ---- 本轮的核心承诺：看不到、改不了别人的东西 ----
+                bob_list = _http_json(
+                    "GET", f"{API_BASE}/api/projects", headers=bob_headers
+                )
+                bob_ids = (
+                    [item.get("id") for item in bob_list]
+                    if isinstance(bob_list, list) else []
+                )
+                check(
+                    "另一个用户看不到这个项目",
+                    created_id not in bob_ids,
+                    f"bob 有 {len(bob_ids)} 个项目",
+                )
+                check(
+                    "另一个用户读别人的项目是 404（不是 403）",
+                    _http_status(
+                        "GET", f"{API_BASE}/api/projects/{created_id}",
+                        headers=bob_headers,
+                    ) == 404,
+                    "404 而不是 403：不确认该 id 是否存在",
+                )
+                check(
+                    "另一个用户改不了别人的项目（404）",
+                    _http_status(
+                        "PATCH", f"{API_BASE}/api/projects/{created_id}",
+                        {"title": "被改了"}, headers=bob_headers,
+                    ) == 404,
+                    "改他人项目应为 404",
+                )
+                check(
+                    "另一个用户删不掉别人的项目（404）",
+                    _http_status(
+                        "DELETE", f"{API_BASE}/api/projects/{created_id}",
+                        headers=bob_headers,
+                    ) == 404,
+                    "删他人项目应为 404",
+                )
+                # 而且确实没有被改动
+                still = _http_json(
+                    "GET", f"{API_BASE}/api/projects/{created_id}",
+                    headers=alice_headers,
+                )
+                check(
+                    "被拒绝的操作没有产生任何副作用",
+                    still.get("title") == "改名后",
+                    f"title={still.get('title')}",
+                )
+
+                _http_json(
+                    "DELETE", f"{API_BASE}/api/projects/{created_id}",
+                    headers=alice_headers,
+                )
+                deleted_status = _http_status(
+                    "GET", f"{API_BASE}/api/projects/{created_id}",
+                    headers=alice_headers,
+                )
+                check(
+                    "删除后确实不存在（404 而不是静默成功）",
+                    deleted_status == 404,
+                    f"GET 已删除项目 -> HTTP {deleted_status}",
+                )
+                created_id = None
+
+                # ---- 遗留项目（owner_id IS NULL）：可见、不可改、可显式认领 ----
+                # 这类数据只能靠直接写库造出来（HTTP 接口创建的项目一定有属主），
+                # 因此这里显式插一行再删掉，模拟"接上登录之前的数据库"。
+                legacy_id = f"legacy{uuid.uuid4().hex[:6]}"
                 try:
-                    _http_json("DELETE", f"{API_BASE}/api/projects/{created_id}")
-                except Exception:  # noqa: BLE001 - 清理失败不该影响验证结论
-                    pass
+                    _insert_legacy_project(legacy_id, "遗留项目（verify 临时造）")
+                    visible = _http_json(
+                        "GET", f"{API_BASE}/api/projects", headers=alice_headers
+                    )
+                    legacy_row = next(
+                        (item for item in visible if item.get("id") == legacy_id), None
+                    ) if isinstance(visible, list) else None
+                    check(
+                        "无主项目对已登录用户可见，且仍标为未归属",
+                        legacy_row is not None and legacy_row.get("ownerId") is None,
+                        f"ownerId={legacy_row.get('ownerId') if legacy_row else '未找到'}",
+                    )
+                    check(
+                        "无主项目在认领前不可删（404）",
+                        _http_status(
+                            "DELETE", f"{API_BASE}/api/projects/{legacy_id}",
+                            headers=alice_headers,
+                        ) == 404,
+                        "应先认领再操作，避免任意用户改动遗留数据",
+                    )
+                    claimed = _http_json(
+                        "POST", f"{API_BASE}/api/projects/{legacy_id}/claim",
+                        None, headers=alice_headers,
+                    )
+                    check(
+                        "认领后归属变为当前用户",
+                        claimed.get("ownerId") == alice["user"]["id"],
+                        f"ownerId={claimed.get('ownerId')}",
+                    )
+                    check(
+                        "别人不能认领已经属于他人的项目（404）",
+                        _http_status(
+                            "POST", f"{API_BASE}/api/projects/{legacy_id}/claim",
+                            None, headers=bob_headers,
+                        ) == 404,
+                        "认领不能变成「任意项目过户」",
+                    )
+                    renamed_after_claim = _http_json(
+                        "PATCH", f"{API_BASE}/api/projects/{legacy_id}",
+                        {"title": "认领后可改名"}, headers=alice_headers,
+                    )
+                    check(
+                        "认领后可以正常改名",
+                        renamed_after_claim.get("title") == "认领后可改名",
+                        f"title={renamed_after_claim.get('title')}",
+                    )
+                except Exception as exc:
+                    import traceback
+
+                    traceback.print_exc()
+                    check("遗留项目与认领流程", False, f"{type(exc).__name__}: {exc}")
+                finally:
+                    _delete_legacy_project(legacy_id)
+            except Exception as exc:
+                import traceback
+
+                traceback.print_exc()
+                check("项目管理 CRUD 与隔离", False, f"{type(exc).__name__}: {exc}")
+            finally:
+                # 检查用的项目不要留在用户的数据库里
+                # （测试账号本身会留下，`verify_alice` / `verify_bob` 是可预期的）
+                if created_id and alice:
+                    try:
+                        _http_json(
+                            "DELETE", f"{API_BASE}/api/projects/{created_id}",
+                            headers=_bearer(alice["token"]),
+                        )
+                    except Exception:  # noqa: BLE001 - 清理失败不该影响验证结论
+                        pass
 
     failed = [name for name, passed, _ in checks if not passed]
     print()

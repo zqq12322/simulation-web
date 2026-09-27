@@ -15,6 +15,15 @@ export interface Project {
   createdAt: Date;
   simulationType?: 'CFD' | 'FEA' | 'Thermal' | 'General';
   isPrivate?: boolean;
+  /**
+   * 属主用户 id；`null` 表示**无主项目**（接上登录之前创建的遗留数据）。
+   *
+   * 无主项目对已登录用户可见但**不可改、不可删**，需要先调用
+   * `POST /api/projects/{id}/claim` 认领。理由见 `backend/project_store.py`：
+   * 初版做过"第一个注册的用户自动接管"，结果把开发者手工建的项目静默划给了
+   * 测试账号（`tools/tasks.py verify`），用户下次登录就发现项目不见了。
+   */
+  ownerId?: string | null;
 }
 
 export type ViewState = 'dashboard' | 'workbench';
