@@ -71,7 +71,7 @@ make dev                # 或 python3 tools/tasks.py dev
 | 命令（跨平台） | Windows 等价 | 验证什么 | 需要服务在跑吗 | 何时用 |
 |---|---|---|---|---|
 | `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**156** 个用例，约 3.6 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
-| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准（**24** 项） | 需要 | 提交前跑一次 |
+| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准（**27** 项） | 需要 | 提交前跑一次 |
 | `make build` | — | 前端类型检查 + 生产构建 | 不需要 | 改前端后 |
 | CI（`.github/workflows/ci.yml`） | — | 上面几项的自动化版本 | 不需要 | push / PR 时自动跑 |
 
@@ -102,6 +102,9 @@ Von Mises 放大 1e7 倍、云图不显示变形）**没有一个**是静态检�
    如果你发现自己写的断言失败了，先怀疑断言：本项目已经出现三次
    "测试写错了、代码是对的"（把 `λ+2μ` 误当 `E`、把频率缩放误当"应完全相同"、
    跨尺寸比较绝对幅度）——三次都在 `docs/03-修复记录.md` 里有记录。
+   但也别走向反面：**顺手加的边界值用例是有价值的**。项目里
+   `formatFrequency(null)` 曾返回 `0 Hz`（把"数据缺失"显示成"刚体模态"），
+   就是一条 `[null, '—']` 的边界断言抓到的。
 
 **要加新功能（边界条件/分析类型）之前，先读 [`docs/04-如何扩展求解器.md`](docs/04-如何扩展求解器.md)** ——
 里面有数据流、分步做法、验证判据表和已知陷阱。
