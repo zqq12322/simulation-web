@@ -30,6 +30,15 @@ export interface Project {
    * 注意这是**列表接口**给的标记，完整配置走 `GET /api/projects/{id}/setup`。
    */
   hasSetup?: boolean;
+  /**
+   * 当前用户对这个项目的角色：`owner`（自己的）/ `editor`（共享·可编辑）/
+   * `viewer`（共享·只读）/ `unowned`（无主，需认领）。
+   *
+   * 界面用它决定"能不能改、能不能删、要不要显示只读提示"——
+   * 口径必须与后端 `ProjectStore.can_edit/can_manage` 一致，
+   * 否则用户会先被允许操作、再被后端拒绝。
+   */
+  role?: 'owner' | 'editor' | 'viewer' | 'unowned' | null;
 }
 
 export type ViewState = 'dashboard' | 'workbench';

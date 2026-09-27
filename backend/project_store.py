@@ -77,6 +77,17 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS project_shares (
+    project_id TEXT NOT NULL,
+    user_id    TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    invited_by TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shares_user ON project_shares (user_id);
 """
 
 #: 后加的列：``owner_id``（接上登录时新增）、``setup``（仿真配置 JSON）。
@@ -85,6 +96,20 @@ _MIGRATIONS = {
     "owner_id": "TEXT",
     "setup": "TEXT",
 }
+
+#: 共享角色 → 能做什么。这是**唯一**的权限判据（见 `access_role`）。
+#:
+#: - ``viewer``：只读（能看配置、能求解看结果，但改不了配置）
+#: - ``editor``：可改配置（等价于"合作者"）
+#:
+#: 刻意**没有** ``admin`` 之类：管理共享与删除项目只属于属主。角色越少，
+#: "谁能做什么"越不容易说错——这也是为什么权限判断集中在一个函数里。
+SHARE_ROLES = ("viewer", "editor")
+
+#: 属主在响应里用的角色名（不是数据库里存的值，而是对外语义）
+ROLE_OWNER = "owner"
+#: 无主项目（接上登录之前创建的遗留数据）的对外语义：可见、不可改
+ROLE_UNOWNED = "unowned"
 
 
 def _now() -> str:
@@ -385,12 +410,171 @@ class ProjectStore(SqliteStore):
             )
             return cursor.rowcount > 0
 
+    # ------------------------------------------------------------- 共享与权限
+    def access_role(self, project_id: str, user_id: Optional[str]) -> Optional[str]:
+        """
+        **权限判定的唯一入口**：返回该用户对这个项目的角色，或 ``None``（无权访问）。
+
+        取值：``"owner"`` / ``"editor"`` / ``"viewer"`` / ``"unowned"`` / ``None``。
+
+        为什么集中在一个函数里：权限判断一旦散落在各个端点里，就一定会出现
+        "某处忘了判断"的漏洞。所有端点都问这一个问题，改规则时也只改这里。
+
+        ``"unowned"`` 表示项目没有属主（接上登录之前的遗留数据）：对所有已登录
+        用户可见但**不可改**。它不是一个"角色"，而是"没有属主"这一事实，
+        因此不能通过它获得任何写权限（见 `can_edit` / `can_manage`）。
+        """
+        if not user_id:
+            return None
+
+        with self._cursor() as connection:
+            row = connection.execute(
+                "SELECT owner_id FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            if row["owner_id"] == user_id:
+                return ROLE_OWNER
+            if row["owner_id"] is None:
+                return ROLE_UNOWNED
+
+            share = connection.execute(
+                "SELECT role FROM project_shares WHERE project_id = ? AND user_id = ?",
+                (project_id, user_id),
+            ).fetchone()
+        return share["role"] if share else None
+
+    @staticmethod
+    def can_read(role: Optional[str]) -> bool:
+        """能否看到项目内容（含共享给我的与无主的）。"""
+        return role in {ROLE_OWNER, "editor", "viewer", ROLE_UNOWNED}
+
+    @staticmethod
+    def can_edit(role: Optional[str]) -> bool:
+        """
+        能否修改项目内容（仿真配置）。
+
+        ``unowned`` **不可以**——遗留数据必须先显式认领。否则任何人都能改动
+        别人还没认领的数据，而"可见但不可改"正是当初引入认领机制要区分的东西。
+        """
+        return role in {ROLE_OWNER, "editor"}
+
+    @staticmethod
+    def can_manage(role: Optional[str]) -> bool:
+        """能否管理项目本身：改名、删除、共享。只属于属主。"""
+        return role == ROLE_OWNER
+
+    def list_visible(self, user_id: str) -> List[dict]:
+        """
+        该用户**能看到**的全部项目（自己的 + 共享给他的 + 无主的），
+        每条带 ``role``。排序：自己的在前，然后按创建时间倒序。
+        """
+        with self._cursor() as connection:
+            rows = connection.execute(
+                """
+                SELECT p.*,
+                       CASE
+                           WHEN p.owner_id = ? THEN 'owner'
+                           WHEN p.owner_id IS NULL THEN 'unowned'
+                           ELSE COALESCE(s.role, 'viewer')
+                       END AS role
+                FROM projects AS p
+                LEFT JOIN project_shares AS s
+                       ON s.project_id = p.id AND s.user_id = ?
+                WHERE p.owner_id = ?
+                   OR p.owner_id IS NULL
+                   OR s.user_id IS NOT NULL
+                ORDER BY (p.owner_id = ?) DESC, p.rowid DESC
+                """,
+                (user_id, user_id, user_id, user_id),
+            ).fetchall()
+        return [self._row_to_dict(row, role=row["role"]) for row in rows]
+
+    def get_visible(self, project_id: str, user_id: str) -> Optional[dict]:
+        """按权限取单个项目（带 ``role``）；无权访问返回 ``None``。"""
+        role = self.access_role(project_id, user_id)
+        if not self.can_read(role):
+            return None
+        with self._cursor() as connection:
+            row = connection.execute(
+                "SELECT * FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_dict(row, role=role)
+
+    # ---- 共享记录本身 ----
+
+    def list_shares(self, project_id: str) -> List[dict]:
+        """某个项目的全部共享记录（调用方应先确认请求者是属主）。"""
+        with self._cursor() as connection:
+            rows = connection.execute(
+                "SELECT user_id, role, invited_by, created_at FROM project_shares"
+                " WHERE project_id = ? ORDER BY created_at, user_id",
+                (project_id,),
+            ).fetchall()
+        return [
+            {
+                "userId": row["user_id"],
+                "role": row["role"],
+                "invitedBy": row["invited_by"],
+                "createdAt": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def share(
+        self, project_id: str, user_id: str, role: str, invited_by: Optional[str] = None
+    ) -> dict:
+        """
+        共享（或更新已有共享的角色），返回该条记录。
+
+        ``role`` 不合法时抛 ``ValueError``（由端点转 400）。
+        **同一个 (项目, 用户) 只有一条记录**（复合主键 + ON CONFLICT），所以再次
+        共享是"改角色"而不是堆出重复条目——重复条目会让"取消共享"说不清该删哪条。
+        """
+        if role not in SHARE_ROLES:
+            raise ValueError(
+                f"角色必须是 {' / '.join(SHARE_ROLES)} 之一，收到 {role!r}"
+            )
+        with self._cursor() as connection:
+            connection.execute(
+                "INSERT INTO project_shares (project_id, user_id, role, invited_by,"
+                " created_at) VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(project_id, user_id) DO UPDATE SET role = excluded.role",
+                (project_id, user_id, role, invited_by, _now()),
+            )
+            row = connection.execute(
+                "SELECT user_id, role, invited_by, created_at FROM project_shares"
+                " WHERE project_id = ? AND user_id = ?",
+                (project_id, user_id),
+            ).fetchone()
+        logger.info("项目 %s 已共享给 %s（%s）", project_id, user_id, role)
+        return {
+            "userId": row["user_id"],
+            "role": row["role"],
+            "invitedBy": row["invited_by"],
+            "createdAt": row["created_at"],
+        }
+
+    def unshare(self, project_id: str, user_id: str) -> bool:
+        """取消共享；返回是否真的删掉了。"""
+        with self._cursor() as connection:
+            cursor = connection.execute(
+                "DELETE FROM project_shares WHERE project_id = ? AND user_id = ?",
+                (project_id, user_id),
+            )
+            removed = cursor.rowcount > 0
+        if removed:
+            logger.info("项目 %s 已取消共享给 %s", project_id, user_id)
+        return removed
+
     # ------------------------------------------------------------- 工具
     @staticmethod
-    def _row_to_dict(row: sqlite3.Row) -> dict:
+    def _row_to_dict(row: sqlite3.Row, role: Optional[str] = None) -> dict:
         keys = row.keys()
         setup = row["setup"] if "setup" in keys else None
-        return {
+        result = {
             "id": row["id"],
             "title": row["title"],
             "description": row["description"],
@@ -405,6 +589,9 @@ class ProjectStore(SqliteStore):
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
+        if role is not None:
+            result["role"] = role
+        return result
 
 
 _default_store: Optional[ProjectStore] = None

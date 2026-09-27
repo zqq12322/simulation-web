@@ -43,6 +43,11 @@ import {
   setupSignature,
   type SaveStatus,
 } from '../utils/projectSetup';
+import {
+  canEditProject,
+  describePermissionNotice,
+  describeRole,
+} from '../utils/projectsApi';
 
 interface WorkbenchProps {
   project: Project;
@@ -104,6 +109,17 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   /** 上次落库的配置签名；用它判断"有没有真的变"，避免每次重渲染都写库 */
   const lastSavedSignature = React.useRef<string>('');
 
+  /**
+   * 当前用户对这个项目的权限。
+   *
+   * 口径必须与后端一致（`ProjectStore.can_edit`）：owner/editor 能改配置，
+   * viewer 与未认领的无主项目不能。界面用同一套规则决定"能不能编辑"，
+   * 否则用户会先被允许操作、再被后端 403——那是界面在骗人。
+   */
+  const canEdit = canEditProject(project);
+  const permissionNotice = describePermissionNotice(project);
+  const roleLabel = describeRole(project);
+
   const saveSetup = React.useCallback(async (
     overrides?: Partial<{
       modelName: string | null;
@@ -113,6 +129,12 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
       solverSettings: SolverSettings | null;
     }>
   ): Promise<boolean> => {
+    // 只读用户直接不保存，并且**明确说明原因**：
+    // 悄悄不发请求会让用户以为配置存下来了，下次打开才发现是空的。
+    if (!canEdit) {
+      setSetupStatus('readonly');
+      return false;
+    }
     const payload = buildSetupPayload({
       modelName: overrides?.modelName !== undefined ? overrides.modelName : modelName,
       selectedMaterial: overrides?.selectedMaterial !== undefined
@@ -152,7 +174,7 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     }
   }, [
     API_BASE_URL, project.id, modelName, selectedMaterial,
-    boundaryConditions, meshSettings, solverSettings,
+    boundaryConditions, meshSettings, solverSettings, canEdit,
   ]);
 
   // 打开项目时恢复配置。**只在项目 id 变化时加载一次**：否则自动保存触发的
@@ -227,6 +249,11 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   // 自动保存（防抖 1.5 秒）。配置改变时写回后端，状态条如实显示结果。
   React.useEffect(() => {
     if (setupLoading) return;
+    // 只读用户不自动保存（也不显示"未修改"，而是显示"只读 · 不会保存"）
+    if (!canEdit) {
+      setSetupStatus('readonly');
+      return;
+    }
     const payload = buildSetupPayload({
       modelName, selectedMaterial, boundaryConditions, meshSettings, solverSettings,
     });
@@ -235,7 +262,7 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     const timer = setTimeout(() => { void saveSetup(); }, 1500);
     return () => clearTimeout(timer);
   }, [
-    setupLoading, modelName, selectedMaterial, boundaryConditions,
+    setupLoading, canEdit, modelName, selectedMaterial, boundaryConditions,
     meshSettings, solverSettings, saveSetup,
   ]);
 
@@ -809,7 +836,9 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
           <div className="h-6 w-px bg-border mx-2"></div>
           <div className="flex flex-col">
              <span className="text-sm font-semibold text-white leading-tight">{project.title}</span>
-             <span className="text-xs text-text-secondary leading-tight">Geometries / 1</span>
+             <span className="text-xs text-text-secondary leading-tight">
+               {roleLabel ? roleLabel : 'Geometries / 1'}
+             </span>
           </div>
           {/* 配置保存状态。**必须如实**：保存失败不能显示成"已保存"，
               否则用户会以为配置存下来了，下次打开才发现全丢了。 */}
@@ -1107,7 +1136,28 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
 
         {/* 3D Viewport Area */}
         <main className="flex-1 relative bg-[#050505]">
-          
+
+          {/* 权限提示：只读/仅编辑时必须在**进来就**说清楚，
+              而不是等用户配了半小时才在保存时被拒绝 */}
+          {permissionNotice && (
+            <div className={`absolute top-4 left-1/2 -translate-x-1/2 z-20 max-w-2xl w-[90%] backdrop-blur rounded-md p-3 shadow-lg border ${
+              canEdit
+                ? 'bg-accent-purple/15 border-accent-purple/50'
+                : 'bg-orange-500/15 border-orange-500/50'
+            }`}>
+              <div className="flex items-start gap-2">
+                <i className={`fas ${canEdit ? 'fa-share-nodes' : 'fa-lock'} mt-0.5 ${
+                  canEdit ? 'text-purple-300' : 'text-orange-400'
+                }`}></i>
+                <div className={`flex-1 text-xs space-y-1 ${
+                  canEdit ? 'text-purple-100' : 'text-orange-100'
+                }`}>
+                  {permissionNotice.replace(/\*\*/g, '')}
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* 求解警告：被忽略/降级的边界条件必须让用户看见 */}
           {solverWarnings.length > 0 && (
             <div className="absolute top-4 left-1/2 -translate-x-1/2 z-20 max-w-2xl w-[90%] bg-yellow-500/15 border border-yellow-500/50 backdrop-blur rounded-md p-3 shadow-lg">

@@ -166,13 +166,14 @@ export function restoreSetup(raw: unknown): RestoredSetup {
 }
 
 /** 自动保存的状态机取值。 */
-export type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
+export type SaveStatus = 'idle' | 'saving' | 'saved' | 'error' | 'readonly';
 
 /**
  * 保存状态 → 界面文案。
  *
  * **必须如实**：`error` 不能显示成"已保存"——用户会以为配置存下来了，
- * 下次打开才发现全丢了。
+ * 下次打开才发现全丢了。`readonly` 同理：不能显示成"已保存"，
+ * 因为它**根本没保存**（当前用户对该项目只有只读权限）。
  */
 export function describeSaveStatus(
   status: SaveStatus,
@@ -188,6 +189,8 @@ export function describeSaveStatus(
     }
     case 'error':
       return detail?.error ? `保存失败：${detail.error}` : '保存失败';
+    case 'readonly':
+      return '只读 · 不会保存';
     default:
       return '未修改';
   }

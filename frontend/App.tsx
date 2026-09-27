@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Plus, Search, LayoutGrid, List, Info, Folder, History, Users, Settings, Lock, Globe, Trash2, RefreshCw, AlertTriangle, LogOut, UserPlus } from 'lucide-react';
+import { Plus, Search, LayoutGrid, List, Info, Folder, History, Users, Settings, Lock, Globe, Trash2, RefreshCw, AlertTriangle, LogOut, UserPlus, Share2 } from 'lucide-react';
 import axios from 'axios';
 import AuthPanel from './components/AuthPanel';
 import LandingPage from './components/LandingPage';
@@ -7,14 +7,19 @@ import NewProjectModal from './components/NewProjectModal';
 import Workbench from './components/Workbench';
 import { Project, ViewState } from './types';
 import {
+  canEditProject,
+  canManageProject,
   canModify,
   describeProjectError,
+  describeRole,
   formatCreatedAt,
   isUnowned,
+  roleOf,
   toProject,
   toProjectList,
 } from './utils/projectsApi';
 import { describeSetupBadge } from './utils/projectSetup';
+import ShareModal from './components/ShareModal';
 import {
   AuthSession,
   SESSION_EXPIRED_EVENT,
@@ -74,6 +79,10 @@ function App() {
   const [projectsError, setProjectsError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [claimingId, setClaimingId] = useState<string | null>(null);
+  /** 仪表盘过滤：全部 / 我的 / 共享给我 / 未归属 */
+  const [scope, setScope] = useState<'all' | 'owned' | 'shared' | 'unowned'>('all');
+  /** 正在管理共享的项目（null 表示弹窗关闭） */
+  const [sharingProject, setSharingProject] = useState<Project | null>(null);
 
   /** 带认证的请求头。没有会话时也会返回合法头（让后端回干净的 401）。 */
   const authHeaders = useCallback(
@@ -276,6 +285,27 @@ function App() {
   };
 
   /**
+   * 按角色过滤要显示的项目。
+   *
+   * "共享给我"以前在侧边栏是个占位链接——现在它是真的了（但项目本身还是
+   * 由后端按权限过滤的，这里只是显示层）。
+   */
+  const visibleProjects = projects.filter((project) => {
+    const role = roleOf(project);
+    if (scope === 'owned') return role === 'owner';
+    if (scope === 'shared') return role === 'editor' || role === 'viewer';
+    if (scope === 'unowned') return role === 'unowned';
+    return true;
+  });
+
+  const scopeCounts = {
+    all: projects.length,
+    owned: projects.filter((p) => roleOf(p) === 'owner').length,
+    shared: projects.filter((p) => ['editor', 'viewer'].includes(roleOf(p) as string)).length,
+    unowned: projects.filter((p) => roleOf(p) === 'unowned').length,
+  };
+
+  /**
    * 认领无主项目（接上登录之前创建的数据）。
    *
    * 这是**显式**操作：初版做的是"第一个注册的用户自动接管"，结果 `verify` 的
@@ -451,11 +481,34 @@ function App() {
           )}
 
           {/* Toolbar */}
-          <div className="flex justify-between items-center mb-6">
-            <span className="text-text-secondary text-sm">
-              {projectsLoading ? '加载中…' : `共 ${projects.length} 个项目`}
-              <span className="text-text-secondary/60"> · 按创建时间倒序</span>
-            </span>
+          <div className="flex justify-between items-center mb-6 gap-4 flex-wrap">
+            <div className="flex items-center gap-3">
+              {/* 过滤：让"共享给我"这个侧边栏占位变成真的 */}
+              <div className="flex bg-[#0a0e17] rounded-md border border-border p-1">
+                {([
+                  { id: 'all', label: '全部' },
+                  { id: 'owned', label: '我的' },
+                  { id: 'shared', label: '共享给我' },
+                  { id: 'unowned', label: '未归属' },
+                ] as const).map((option) => (
+                  <button
+                    key={option.id}
+                    onClick={() => setScope(option.id)}
+                    className={`px-3 py-1.5 rounded text-xs transition-colors ${
+                      scope === option.id
+                        ? 'bg-secondary text-white shadow-sm'
+                        : 'text-text-secondary hover:text-white'
+                    }`}
+                  >
+                    {option.label}
+                    <span className="ml-1 opacity-60">{scopeCounts[option.id]}</span>
+                  </button>
+                ))}
+              </div>
+              <span className="text-text-secondary text-sm">
+                {projectsLoading ? '加载中…' : `${visibleProjects.length} 个项目`}
+              </span>
+            </div>
             <div className="flex bg-[#0a0e17] rounded-md border border-border p-1">
                <button className="p-1.5 bg-secondary rounded text-white shadow-sm"><LayoutGrid size={16} /></button>
                <button className="p-1.5 text-text-secondary hover:text-white"><List size={16} /></button>
@@ -488,9 +541,11 @@ function App() {
             )}
 
             {/* Existing Projects */}
-            {projects.map((proj) => {
+            {visibleProjects.map((proj) => {
               const unowned = isUnowned(proj);
               const editable = canModify(proj, session.user.id);
+              const roleLabel = describeRole(proj);
+              const canShare = canManageProject(proj);
               return (
               <div key={proj.id} onClick={() => handleProjectClick(proj)} className="bg-secondary border border-border rounded-xl overflow-hidden hover:shadow-xl hover:shadow-black/50 hover:border-accent-blue/50 transition-all cursor-pointer group flex flex-col h-64">
                 <div className="h-36 bg-[#0a0e17] relative overflow-hidden flex items-center justify-center">
@@ -504,10 +559,14 @@ function App() {
                     </div>
                   )}
 
-                  {/* 无主标记：这些是接上登录之前创建的数据，可见但不可改 */}
-                  {unowned && (
-                    <div className="absolute top-3 left-3 px-2 py-0.5 bg-yellow-500/20 border border-yellow-500/40 rounded text-[10px] text-yellow-200">
-                      未归属
+                  {/* 角色标记：共享给我的项目必须一眼看出来（含能不能改） */}
+                  {roleLabel && (
+                    <div className={`absolute top-3 left-3 px-2 py-0.5 rounded text-[10px] border ${
+                      unowned
+                        ? 'bg-yellow-500/20 border-yellow-500/40 text-yellow-200'
+                        : 'bg-accent-purple/20 border-accent-purple/40 text-purple-200'
+                    }`}>
+                      {roleLabel}
                     </div>
                   )}
 
@@ -552,17 +611,32 @@ function App() {
                         认领
                       </button>
                     ) : (
-                      <button
-                        onClick={(event) => {
-                          event.stopPropagation(); // 不要顺带触发"打开项目"
-                          handleDeleteProject(proj);
-                        }}
-                        disabled={!editable || deletingId === proj.id}
-                        className="hover:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                        title={editable ? '删除项目' : '只能删除自己的项目'}
-                      >
-                        {deletingId === proj.id ? <RefreshCw size={14} className="animate-spin" /> : <Trash2 size={14} />}
-                      </button>
+                      <span className="flex items-center gap-2">
+                        {/* 共享：只有属主能管理 */}
+                        {canShare && (
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setSharingProject(proj);
+                            }}
+                            className="hover:text-accent-blue transition-colors flex items-center gap-1"
+                            title="把这个项目共享给别人"
+                          >
+                            <Share2 size={12} /> 共享
+                          </button>
+                        )}
+                        <button
+                          onClick={(event) => {
+                            event.stopPropagation(); // 不要顺带触发"打开项目"
+                            handleDeleteProject(proj);
+                          }}
+                          disabled={!editable || deletingId === proj.id}
+                          className="hover:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                          title={editable ? '删除项目' : '只能删除自己的项目'}
+                        >
+                          {deletingId === proj.id ? <RefreshCw size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                        </button>
+                      </span>
                     )}
                   </div>
                 </div>
@@ -581,6 +655,14 @@ function App() {
         onCreate={handleCreateProject}
         isSubmitting={isCreating}
         error={createError}
+      />
+
+      <ShareModal
+        isOpen={sharingProject !== null}
+        onClose={() => setSharingProject(null)}
+        projectId={sharingProject?.id || ''}
+        projectTitle={sharingProject?.title || ''}
+        onChanged={refreshProjects}
       />
 
     </div>

@@ -29,6 +29,7 @@ export interface ProjectRecord {
   isPrivate?: unknown;
   ownerId?: unknown;
   hasSetup?: unknown;
+  role?: unknown;
   createdAt?: unknown;
   updatedAt?: unknown;
 }
@@ -89,6 +90,8 @@ export function toProject(record: ProjectRecord | null | undefined): Project | n
     ownerId: typeof record.ownerId === 'string' && record.ownerId ? record.ownerId : null,
     // 列表接口只给"配过没有"的标记（完整配置走 /setup 子资源）
     hasSetup: record.hasSetup === true,
+    // 当前用户对这个项目的角色（决定能不能改、能不能删、要不要显示只读提示）
+    role: (typeof record.role === 'string' ? record.role : null) as Project['role'],
   };
 }
 
@@ -109,6 +112,74 @@ export function canModify(
 ): boolean {
   if (isUnowned(project)) return false;
   return !!currentUserId && project!.ownerId === currentUserId;
+}
+
+// --------------------------------------------------------------- 共享角色
+
+export type ProjectRole = 'owner' | 'editor' | 'viewer' | 'unowned';
+
+/** 归一化后端给的角色（未知值一律当成"没有权限"，宁严勿宽）。 */
+export function roleOf(
+  project: Pick<Project, 'role'> | null | undefined,
+): ProjectRole | null {
+  const role = project?.role;
+  return role === 'owner' || role === 'editor' || role === 'viewer'
+    || role === 'unowned'
+    ? role
+    : null;
+}
+
+/**
+ * 能否修改项目**内容**（仿真配置）。
+ *
+ * 权限判定的口径必须与后端一致：`owner`/`editor` 可以，`viewer` 与
+ * `unowned`（未认领的遗留项目）不可以。界面用同一套规则决定"能不能编辑"，
+ * 否则用户会先被允许操作、再被后端 403 —— 那是界面在骗人。
+ */
+export function canEditProject(
+  project: Pick<Project, 'role'> | null | undefined,
+): boolean {
+  const role = roleOf(project);
+  return role === 'owner' || role === 'editor';
+}
+
+/** 能否管理项目本身（改名、删除、共享、清空配置）。只属于属主。 */
+export function canManageProject(
+  project: Pick<Project, 'role'> | null | undefined,
+): boolean {
+  return roleOf(project) === 'owner';
+}
+
+/** 角色在界面上的说明。`null` 表示没有权限，不显示任何东西。 */
+export function describeRole(
+  project: Pick<Project, 'role'> | null | undefined,
+): string | null {
+  switch (roleOf(project)) {
+    case 'editor':
+      return '共享 · 可编辑';
+    case 'viewer':
+      return '共享 · 只读';
+    case 'unowned':
+      return '未归属';
+    default:
+      return null;
+  }
+}
+
+/** 只读/无管理权限时给用户的说明（用于工作台顶部的提示条）。 */
+export function describePermissionNotice(
+  project: Pick<Project, 'role'> | null | undefined,
+): string | null {
+  switch (roleOf(project)) {
+    case 'editor':
+      return '这是别人共享给你的项目：你可以修改仿真配置，但不能改名、删除或再分享给别人。';
+    case 'viewer':
+      return '这是别人共享给你的项目，**只读**：配置不会保存，求解结果也只是本地查看。';
+    case 'unowned':
+      return '这个项目还没有归属（接上登录之前创建的）。先点「认领」才能修改它。';
+    default:
+      return null;
+  }
 }
 
 /** 列表映射：过滤掉坏记录，而不是让整个列表渲染失败。 */

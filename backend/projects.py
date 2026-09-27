@@ -25,10 +25,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from auth import require_user
+from auth_store import get_store as get_auth_store
 from config import SIMULATION_SETUP_MAX_BCS, SIMULATION_SETUP_MAX_BYTES, resolve_upload_path
 from constraints import BoundaryCondition
 from logging_config import get_logger
-from project_store import SIMULATION_TYPES, get_store
+from project_store import ROLE_OWNER, SHARE_ROLES, SIMULATION_TYPES, get_store
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -110,9 +111,33 @@ class ProjectResponse(BaseModel):
     ownerId: Optional[str] = None
     #: 是否保存过仿真配置（完整内容走 /setup 子资源，列表里不带，避免响应过大）
     hasSetup: bool = False
+    #: 当前请求者对这个项目的角色：owner / editor / viewer / unowned。
+    #: 界面据此决定"能不能改、能不能删、要不要显示只读提示"。
+    role: Optional[Literal["owner", "editor", "viewer", "unowned"]] = None
     #: ISO-8601 UTC 字符串；前端用 new Date(...) 解析
     createdAt: str
     updatedAt: str
+
+
+# --------------------------------------------------------------- 共享
+
+class ShareInvite(BaseModel):
+    """按**用户名**共享（用户知道的是用户名，不是那串随机 id）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(..., max_length=64)
+    role: Literal["viewer", "editor"] = "viewer"
+
+
+class ShareResponse(BaseModel):
+    """一条共享记录。**不含任何口令相关字段**。"""
+
+    userId: str
+    username: str
+    displayName: str
+    role: Literal["viewer", "editor"]
+    createdAt: str
 
 
 # ------------------------------------------------------- 仿真配置（项目文档）
@@ -185,15 +210,17 @@ OwnedUser = Depends(require_user)
 @router.get("/projects", response_model=List[ProjectResponse])
 async def list_projects(user: dict = OwnedUser):
     """
-    列出**当前用户**的项目，最新建的在前。
+    列出**当前用户能看到**的项目，最新建的在前。
 
-    同时带上**无主项目**（``ownerId`` 为 ``null``，前端显示"未归属"）：它们是接上
-    登录之前创建的数据，对已登录用户可见（否则用户会以为项目丢了），
-    但**不可改**，需要显式调用 ``POST /api/projects/{id}/claim`` 认领。
+    包含三类，每条都带 ``role``：
+
+    - 自己的（``owner``）
+    - 共享给自己的（``editor`` / ``viewer``）——"Shared with me"
+    - **无主的**遗留项目（``unowned``）：接上登录之前创建的数据，对已登录用户
+      可见但不可改，需要显式调用 ``POST /api/projects/{id}/claim`` 认领
     """
     return [
-        ProjectResponse(**item)
-        for item in get_store().list_projects(user["id"], include_unowned=True)
+        ProjectResponse(**item) for item in get_store().list_visible(user["id"])
     ]
 
 
@@ -216,12 +243,12 @@ async def create_project(request: ProjectCreate, user: dict = OwnedUser):
 @router.get("/projects/{project_id}", response_model=ProjectResponse)
 async def get_project(project_id: str, user: dict = OwnedUser):
     """
-    取回自己的某个项目（无主项目也可读）。
+    取回一个项目——**自己有权限看到的都行**：自己的、共享给自己的、无主的。
 
-    不属于当前用户且不是无主项目时返回 **404**（而不是 403）：403 等于确认
-    "这个 id 存在，只是不是你的"，可以被用来探测别人有哪些项目。
+    无权访问时返回 **404**（而不是 403）：403 等于确认"这个 id 存在，
+    只是不是你的"，可以被用来探测别人有哪些项目。
     """
-    project = get_store().get_project(project_id, user["id"], include_unowned=True)
+    project = get_store().get_visible(project_id, user["id"])
     if project is None:
         raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
     return ProjectResponse(**project)
@@ -252,6 +279,9 @@ async def update_project(
 ):
     """
     局部更新项目（改名/改描述/改类型/改可见性）。
+
+    **只有属主**能改这些元信息：改名属于"管理项目"，与"改仿真配置"是两回事
+    （后者 editor 也能做）。存储层的 SQL 就是按属主限定的，所以非属主会拿到 404。
 
     Pydantic 已保证"未知字段 422"；这里再保证"一个字段都没给"是 400，
     而不是静默地只刷新一下 ``updatedAt``。
@@ -295,14 +325,34 @@ async def get_project_setup(project_id: str, user: dict = OwnedUser):
     """
     取项目的仿真配置。
 
-    项目不存在/不属于自己 → **404**；
-    项目存在但从未保存过配置 → **200 且 ``setup`` 为 ``null``**。
+    **有读权限就能取**：自己的、共享给自己的（viewer / editor）、无主的。
+    无权访问 → **404**；项目存在但从未保存过配置 → **200 且 ``setup`` 为 null**。
     两者必须分开：混起来前端会把"还没配过"当成"项目没了"。
     """
-    stored = get_store().get_setup(project_id, user["id"])
-    if stored is None:
+    store = get_store()
+    role = store.access_role(project_id, user["id"])
+    if not store.can_read(role):
+        raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+
+    stored = store.get_setup(project_id, store_owner_id(project_id))
+    if stored is None:  # pragma: no cover - 上面已确认项目存在
         raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
     return SimulationSetupResponse(**stored)
+
+
+def store_owner_id(project_id: str) -> Optional[str]:
+    """
+    取项目的属主 id（用于复用按属主限定的存储方法）。
+
+    读/写配置本来就只要求"有相应权限"，而存储层的 `get_setup`/`set_setup` 是按
+    属主限定的，因此权限通过后用属主身份调它们即可——这样"配置属于项目、
+    项目属于属主"这条关系在存储层保持一致，不必再造一套"按角色访问"的查询。
+    """
+    with get_store()._cursor() as connection:      # noqa: SLF001 - 同模块内的受控用法
+        row = connection.execute(
+            "SELECT owner_id FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+    return row["owner_id"] if row else None
 
 
 @router.put("/projects/{project_id}/setup", response_model=SimulationSetupResponse)
@@ -312,16 +362,27 @@ async def put_project_setup(
     """
     覆盖保存仿真配置（整份替换，不做局部合并）。
 
-    为什么整份覆盖：配置是一份**文档**，前端发来的本来就是完整状态。
-    局部合并反而表达不了"删掉一个边界条件"。
+    **属主与 editor 都能保存**——这正是"共享来一起做"的含义。viewer 与无主项目
+    的访问者会被拒（403）。
 
-    超过大小上限返回 **413**：配置是前端 UI 状态的快照，正常只有几 KB，
-    超限说明发来的东西不对（或者有人想拿它当文件存储用）。
+    为什么这里用 403 而不是 404：能走到这一步的人**已经知道项目存在**
+    （他在列表里看得见、也读得到配置），此时再返回 404 只会让人困惑。
+    404 是用来对"不知道存不存在"的人隐藏信息的。
     """
+    store = get_store()
+    role = store.access_role(project_id, user["id"])
+    if role is None:
+        raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+    if not store.can_edit(role):
+        raise HTTPException(
+            status_code=403,
+            detail=f"你对这个项目只有{'只读' if role == 'viewer' else '认领前'}权限，"
+                   "无法修改配置",
+        )
+
     # exclude_none=True：不存 None 值。它们与"没有这个字段"等价，但会让文档膨胀
     # ——每个边界条件会多出十来个 null（Pydantic 会把所有未填的可选字段补成 None）
     # ——并且让"存进去什么、读回来就是什么"不再成立。
-    # 实测：不用它时，前端发去 2 个边界条件，读回来每个都多了 10 个 null 字段。
     payload = request.model_dump(exclude_none=True)
     size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
     if size > SIMULATION_SETUP_MAX_BYTES:
@@ -332,8 +393,8 @@ async def put_project_setup(
             ),
         )
 
-    saved = get_store().set_setup(project_id, payload, user["id"])
-    if saved is None:
+    saved = store.set_setup(project_id, payload, store_owner_id(project_id))
+    if saved is None:  # pragma: no cover - 上面已确认项目存在
         raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
     return SimulationSetupResponse(**saved)
 
@@ -345,10 +406,107 @@ async def delete_project_setup(project_id: str, user: dict = OwnedUser):
 
     用途：把项目重置为空工作台。**不做成"删项目"**——用户想重配一遍，
     不该连项目名和描述一起丢掉。
+
+    **只有属主**能清空：清空是破坏性的（会丢掉别人配好的东西），
+    因此不因为"是 editor"就放行。
     """
-    if not get_store().clear_setup(project_id, user["id"]):
+    store = get_store()
+    role = store.access_role(project_id, user["id"])
+    if role is None:
+        raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+    if not store.can_manage(role):
+        raise HTTPException(status_code=403, detail="只有项目属主可以清空配置")
+
+    if not store.clear_setup(project_id, store_owner_id(project_id)):
         raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
     return {"cleared": True, "id": project_id}
+
+
+# --------------------------------------------------------------- 共享端点
+#
+# 权限规则：
+# - 管理共享（加人、改角色、踢人）**只属于属主**；
+# - 被共享者可以把自己**移除**（leave），否则他没法退出一个共享；
+# - 共享用**用户名**而不是用户 id：人知道的是用户名。
+
+
+def _resolve_share_target(username: str) -> dict:
+    """按用户名找用户；找不到返回 404（而不是 400——这是"没有人"而不是"参数错"）。"""
+    user = get_auth_store().get_user_by_username(username.strip().lower())
+    if user is None:
+        raise HTTPException(status_code=404, detail=f"用户不存在：{username}")
+    return user
+
+
+def _share_response(record: dict) -> ShareResponse:
+    """把存储记录补上用户名/显示名。**绝不带口令字段**。"""
+    target = get_auth_store().get_user(record["userId"])
+    return ShareResponse(
+        userId=record["userId"],
+        username=target["username"] if target else "（已注销）",
+        displayName=target["displayName"] if target else "（已注销）",
+        role=record["role"],
+        createdAt=record["createdAt"],
+    )
+
+
+@router.get("/projects/{project_id}/shares", response_model=List[ShareResponse])
+async def list_project_shares(project_id: str, user: dict = OwnedUser):
+    """列出共享名单。**只有属主**看得到（被共享者不需要知道还有谁）。"""
+    store = get_store()
+    role = store.access_role(project_id, user["id"])
+    if role is None:
+        raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+    if not store.can_manage(role):
+        raise HTTPException(status_code=403, detail="只有项目属主可以查看共享名单")
+    return [_share_response(item) for item in store.list_shares(project_id)]
+
+
+@router.post("/projects/{project_id}/shares", response_model=ShareResponse,
+             status_code=201)
+async def create_project_share(
+    project_id: str, request: ShareInvite, user: dict = OwnedUser
+):
+    """把项目共享给某个用户（按用户名）。重复共享会更新角色，不会堆出重复条目。"""
+    store = get_store()
+    role = store.access_role(project_id, user["id"])
+    if role is None:
+        raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+    if not store.can_manage(role):
+        raise HTTPException(status_code=403, detail="只有项目属主可以共享项目")
+
+    target = _resolve_share_target(request.username)
+    if target["id"] == user["id"]:
+        raise HTTPException(status_code=400, detail="不能共享给自己")
+
+    record = store.share(project_id, target["id"], request.role, invited_by=user["id"])
+    return _share_response(record)
+
+
+@router.delete("/projects/{project_id}/shares/{target_user_id}")
+async def delete_project_share(
+    project_id: str, target_user_id: str, user: dict = OwnedUser
+):
+    """
+    取消共享。
+
+    - 属主可以移除任何人；
+    - 被共享者可以**移除自己**（退出共享）——否则他没法退出一个共享。
+
+    既不是属主、又不是在移除自己 → 403。
+    """
+    store = get_store()
+    role = store.access_role(project_id, user["id"])
+    if role is None:
+        raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+
+    removing_self = target_user_id == user["id"]
+    if not (store.can_manage(role) or removing_self):
+        raise HTTPException(status_code=403, detail="只有项目属主可以移除其他协作者")
+
+    if not store.unshare(project_id, target_user_id):
+        raise HTTPException(status_code=404, detail="该用户没有被共享过这个项目")
+    return {"removed": True, "projectId": project_id, "userId": target_user_id}
 
 
 @router.get("/project-metadata")

@@ -857,8 +857,10 @@ def _check_frontend_modal_math(node: str) -> tuple[bool, str]:
 #: 声明为 `Date`。旧代码直接 `.toLocaleDateString()`，接上真实接口就抛
 #: TypeError —— 断言里显式证明了旧写法会炸、新写法不会。
 _PROJECTS_API_SELFTEST = r"""
-import { SIMULATION_TYPES, canModify, describeProjectError, formatCreatedAt,
-         isUnowned, parseTimestamp, toProject, toProjectList } from './projectsApi.ts';
+import { SIMULATION_TYPES, canEditProject, canManageProject, canModify,
+         describePermissionNotice, describeProjectError, describeRole,
+         formatCreatedAt, isUnowned, parseTimestamp, roleOf, toProject,
+         toProjectList } from './projectsApi.ts';
 
 let failures = [];
 const check = (name, ok, detail = '') => {
@@ -918,6 +920,31 @@ check('别人的项目不可改', !canModify({ ownerId: 'user-2' }, 'user-1'));
 check('无主项目不可改（必须先认领）', !canModify({ ownerId: null }, 'user-1'));
 check('未登录时不可改', !canModify({ ownerId: 'user-1' }, null)
       && !canModify({ ownerId: 'user-1' }, undefined));
+
+// 共享角色：界面判权限的口径必须与后端 ProjectStore.can_edit / can_manage 一致。
+// 不一致的后果是"界面允许操作、后端 403"——用户会以为系统坏了。
+check('角色归一化', roleOf({ role: 'editor' }) === 'editor'
+      && roleOf({ role: 'nonsense' }) === null && roleOf(null) === null
+      && roleOf({}) === null);
+check('owner 可编辑可管理',
+      canEditProject({ role: 'owner' }) && canManageProject({ role: 'owner' }));
+check('editor 可编辑但不可管理',
+      canEditProject({ role: 'editor' }) && !canManageProject({ role: 'editor' }));
+check('viewer 既不可编辑也不可管理',
+      !canEditProject({ role: 'viewer' }) && !canManageProject({ role: 'viewer' }));
+check('未认领的无主项目不可编辑',
+      !canEditProject({ role: 'unowned' }) && !canManageProject({ role: 'unowned' }));
+check('没有角色等于没有权限',
+      !canEditProject(null) && !canManageProject(undefined) && !canEditProject({}));
+check('角色说明只对非本人显示', describeRole({ role: 'owner' }) === null
+      && describeRole({ role: 'editor' }).includes('可编辑')
+      && describeRole({ role: 'viewer' }).includes('只读')
+      && describeRole({ role: 'unowned' }) === '未归属');
+check('权限提示覆盖三种受限情况',
+      describePermissionNotice({ role: 'editor' }).includes('不能改名')
+      && describePermissionNotice({ role: 'viewer' }).includes('只读')
+      && describePermissionNotice({ role: 'unowned' }).includes('认领')
+      && describePermissionNotice({ role: 'owner' }) === null);
 
 // 4) 列表映射：坏记录被过滤，而不是让整个列表渲染失败
 check('非数组返回空列表', toProjectList('x').length === 0
@@ -1979,6 +2006,161 @@ def task_verify(args: argparse.Namespace) -> int:
                 "清空配置后项目还在、配置为空",
                 cleared.get("cleared") is True and after_clear.get("setup") is None,
                 f"setup={after_clear.get('setup')}",
+            )
+
+            # ---- 共享与协作权限 ----
+            # 这是"可协作"三个字的核心：把项目交给别人一起做，且权限边界清楚。
+            shared = _http_json(
+                "POST", f"{API_BASE}/api/projects/{created_id}/shares",
+                {"username": "verify_bob", "role": "viewer"},
+                headers=alice_headers,
+            )
+            check(
+                "共享给另一个用户（按用户名）",
+                shared.get("username") == "verify_bob"
+                and shared.get("role") == "viewer"
+                and bool(shared.get("userId")),
+                f"username={shared.get('username')} role={shared.get('role')}",
+            )
+            check(
+                "共享响应不含任何口令字段",
+                "password" not in json.dumps(shared).lower(),
+                "响应里绝不能出现口令哈希",
+            )
+
+            bob_list = _http_json(
+                "GET", f"{API_BASE}/api/projects", headers=bob_headers
+            )
+            bob_entry = next(
+                (item for item in bob_list if item.get("id") == created_id), {}
+            ) if isinstance(bob_list, list) else {}
+            check(
+                "被共享者在列表里看到它，且带角色",
+                bob_entry.get("role") == "viewer",
+                f"role={bob_entry.get('role')}",
+            )
+            check(
+                "被共享者能读项目和配置",
+                _http_status(
+                    "GET", f"{API_BASE}/api/projects/{created_id}",
+                    headers=bob_headers,
+                ) == 200
+                and _http_status(
+                    "GET", f"{API_BASE}/api/projects/{created_id}/setup",
+                    headers=bob_headers,
+                ) == 200,
+                "只读也要能看内容",
+            )
+
+            viewer_put = _http_status(
+                "PUT", f"{API_BASE}/api/projects/{created_id}/setup",
+                setup_document, headers=bob_headers,
+            )
+            check(
+                "只读者改不了配置（403，而不是 404）",
+                viewer_put == 403,
+                f"PUT setup（viewer）-> HTTP {viewer_put}；"
+                "他知道项目存在，此时 403 比 404 更诚实",
+            )
+            check(
+                "只读者改不了元信息、删不掉项目（404）",
+                _http_status(
+                    "PATCH", f"{API_BASE}/api/projects/{created_id}",
+                    {"title": "我也来改"}, headers=bob_headers,
+                ) == 404
+                and _http_status(
+                    "DELETE", f"{API_BASE}/api/projects/{created_id}",
+                    headers=bob_headers,
+                ) == 404,
+                "改名/删除只属于属主",
+            )
+            check(
+                "只有属主能查看共享名单",
+                _http_status(
+                    "GET", f"{API_BASE}/api/projects/{created_id}/shares",
+                    headers=alice_headers,
+                ) == 200
+                and _http_status(
+                    "GET", f"{API_BASE}/api/projects/{created_id}/shares",
+                    headers=bob_headers,
+                ) == 403,
+                "被共享者不需要知道还有谁",
+            )
+
+            # 升级为 editor 之后就能改配置了——这才是"一起做"
+            upgraded = _http_json(
+                "POST", f"{API_BASE}/api/projects/{created_id}/shares",
+                {"username": "verify_bob", "role": "editor"},
+                headers=alice_headers,
+            )
+            shares_now = _http_json(
+                "GET", f"{API_BASE}/api/projects/{created_id}/shares",
+                headers=alice_headers,
+            )
+            check(
+                "重复共享是改角色，不会堆出重复条目",
+                upgraded.get("role") == "editor"
+                and len(shares_now) == 1,
+                f"名单长度={len(shares_now)}",
+            )
+            bob_saved = _http_status(
+                "PUT", f"{API_BASE}/api/projects/{created_id}/setup",
+                setup_document, headers=bob_headers,
+            )
+            check(
+                "可编辑协作者能保存配置（属主看得到）",
+                bob_saved == 200
+                and (
+                    _http_json(
+                        "GET", f"{API_BASE}/api/projects/{created_id}/setup",
+                        headers=alice_headers,
+                    ).get("setup", {}).get("materialId") == "structural_steel"
+                ),
+                f"PUT setup（editor）-> HTTP {bob_saved}",
+            )
+
+            check(
+                "共享给自己被拒（400）",
+                _http_status(
+                    "POST", f"{API_BASE}/api/projects/{created_id}/shares",
+                    {"username": "verify_alice", "role": "viewer"},
+                    headers=alice_headers,
+                ) == 400,
+                "共享给自己没有意义",
+            )
+            check(
+                "共享给不存在的用户是 404",
+                _http_status(
+                    "POST", f"{API_BASE}/api/projects/{created_id}/shares",
+                    {"username": "definitely_not_here", "role": "viewer"},
+                    headers=alice_headers,
+                ) == 404,
+                "是「没有这个人」而不是「参数错」",
+            )
+            check(
+                "非法角色是 422",
+                _http_status(
+                    "POST", f"{API_BASE}/api/projects/{created_id}/shares",
+                    {"username": "verify_bob", "role": "admin"},
+                    headers=alice_headers,
+                ) == 422,
+                "角色只有 viewer / editor",
+            )
+
+            # 被共享者可以自己退出（否则他没法退出一个共享）
+            left = _http_json(
+                "DELETE",
+                f"{API_BASE}/api/projects/{created_id}/shares/{shared['userId']}",
+                headers=bob_headers,
+            )
+            check(
+                "被共享者可以自己退出，退出后立即失去访问",
+                left.get("removed") is True
+                and _http_status(
+                    "GET", f"{API_BASE}/api/projects/{created_id}",
+                    headers=bob_headers,
+                ) == 404,
+                "退出后再读应为 404",
             )
 
             _http_json(
