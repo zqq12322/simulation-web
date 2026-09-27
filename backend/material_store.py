@@ -17,18 +17,21 @@
 
 之所以选 SQLite 而不是 JSON 文件：并发写入更安全（多人/多进程），
 且有主键约束能天然防止 ID 重复。
+
+连接/事务/关闭与"幂等加列迁移"由 `sqlite_store.SqliteStore` 提供——那段逻辑
+（尤其是"连接必须显式关闭"）曾经是踩过坑的，不应该有两份实现。
 """
 
 from __future__ import annotations
 
 import sqlite3
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
-from config import DB_PATH, ensure_data_dir
 from logging_config import get_logger
+from config import ensure_data_dir
+from sqlite_store import SqliteStore
 
 logger = get_logger(__name__)
 
@@ -47,63 +50,18 @@ CREATE TABLE IF NOT EXISTS custom_materials (
 );
 """
 
-#: 后加的列 → 列定义。SQLite 没有 "ADD COLUMN IF NOT EXISTS"，
-#: 所以启动时按 PRAGMA table_info 判断再补，老数据库也能平滑升级。
+#: 后加的列 → 列定义。基类会按 PRAGMA table_info 判断再补，老数据库平滑升级。
 _MIGRATIONS = {
     "thermal_conductivity": "REAL",
 }
 
 
-class MaterialStore:
+class MaterialStore(SqliteStore):
     """自定义材料的持久化存储。"""
 
-    def __init__(self, db_path: Optional[Path] = None) -> None:
-        self.db_path = Path(db_path) if db_path is not None else DB_PATH
-        if self.db_path.parent and str(self.db_path) != ":memory:":
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
-
-    # ------------------------------------------------------------- 内部
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self.db_path))
-        connection.row_factory = sqlite3.Row
-        return connection
-
-    @contextmanager
-    def _cursor(self):
-        """
-        打开连接 → 事务 → **关闭连接**。
-
-        注意：``with sqlite3.connect(...) as conn`` 是个常见的坑——连接对象作为
-        上下文管理器只负责提交/回滚事务，**不会关闭连接**。那样每次调用都会泄漏
-        一个句柄，在 Windows 上会一直锁住数据库文件（删除/移动都会失败）。
-        """
-        connection = self._connect()
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
-
-    def _init_schema(self) -> None:
-        with self._cursor() as connection:
-            connection.executescript(_SCHEMA)
-        self._apply_migrations()
-
-    def _apply_migrations(self) -> None:
-        """给老数据库补上后加的列（幂等）。"""
-        with self._cursor() as connection:
-            existing = {
-                row["name"]
-                for row in connection.execute("PRAGMA table_info(custom_materials)")
-            }
-            for column, definition in _MIGRATIONS.items():
-                if column in existing:
-                    continue
-                connection.execute(
-                    f"ALTER TABLE custom_materials ADD COLUMN {column} {definition}"
-                )
-                logger.info("材料库迁移：新增列 %s %s", column, definition)
+    table = "custom_materials"
+    schema = _SCHEMA
+    migrations = _MIGRATIONS
 
     # ------------------------------------------------------------- 读
     def list_custom(self) -> List[dict]:
@@ -242,3 +200,4 @@ def get_store() -> MaterialStore:
         logger.info("材料库数据库：%s（已存 %d 个自定义材料）",
                     _default_store.db_path, _default_store.count())
     return _default_store
+
