@@ -3619,6 +3619,21 @@ def task_verify(args: argparse.Namespace) -> int:
                 len(job_result.get("nodes", [])) == len(mesh["nodes"]),
                 f"async={len(job_result.get('nodes', []))} sync={len(mesh['nodes'])}",
             )
+            # 任务结果按**体积**保留（不只是条数），并且把占用**报出来**：
+            # 内存问题如果不可观测，就只能等它把进程吃掉才发现。
+            # 注意这几个字段在响应的 `stats` 子对象里，不在顶层。
+            overview = _http_json("GET", f"{API_BASE}/api/jobs", headers=api_headers)
+            job_stats = overview.get("stats") or {}
+            check(
+                "任务表自省：报出保留的字节数与丢弃计数",
+                isinstance(job_stats.get("retained_result_bytes"), int)
+                and isinstance(job_stats.get("max_retained_result_bytes"), int)
+                and job_stats["max_retained_result_bytes"] > 0
+                and isinstance(job_stats.get("results_dropped"), int),
+                f"已保留 {job_stats.get('retained_result_bytes')} / "
+                f"{job_stats.get('max_retained_result_bytes')} 字节，"
+                f"丢弃 {job_stats.get('results_dropped')} 条",
+            )
 
             # 稳态热传导：立方体两端定温、其余面绝热 ⇒ 温度精确线性、q = k·ΔT/L
             thermal_body = {

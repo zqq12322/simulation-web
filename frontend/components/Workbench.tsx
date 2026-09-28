@@ -494,7 +494,20 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
           ? '计算中…'
           : data.status
       );
-      if (data.status === 'succeeded') return data.result;
+      if (data.status === 'succeeded') {
+        // 服务端按**体积**保留结果（见 backend/jobs.py）：单条结果过大时不保留
+        // 内容，只留 `resultDropped`。**必须说出来**——否则用户看到的是
+        // "求解完成"却是空结果，会以为是自己看错了或者功能坏了。
+        if (data.resultDropped && data.result == null) {
+          const megabytes = Math.round((data.resultBytes || 0) / (1024 * 1024));
+          throw new Error(
+            `求解已完成，但结果约 ${megabytes} MB，超过服务端保留上限，未保留。`
+            + '请减小网格规模（或降低模态阶数）后重试。',
+          );
+        }
+        return data.result;
+      }
+
       if (data.status === 'failed') throw new Error(data.error || '任务失败');
       if (Date.now() > deadline) throw new Error('任务超时（超过 15 分钟）');
     }
