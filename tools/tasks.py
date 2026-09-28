@@ -4719,7 +4719,10 @@ def task_clone_verify(args: argparse.Namespace) -> int:
             cwd=str(clone / "backend"), capture_output=True, text=True,
             encoding="utf-8", errors="replace",
         )
-        tail = (unit.stdout or unit.stderr or "").strip().splitlines()
+        # 两个流都要看：gmsh 的 Info 走 stdout，unittest 的 "Ran N tests" 走 stderr。
+        # 用 `stdout or stderr` 会在 stdout 有 gmsh 噪声时把真正的统计行丢掉
+        # （第一版就是这样，打印出"通过（）"）。
+        tail = ((unit.stdout or "") + (unit.stderr or "")).strip().splitlines()
         for line in tail[-4:]:
             print(f"    {line}")
         if unit.returncode != 0:
@@ -4728,10 +4731,11 @@ def task_clone_verify(args: argparse.Namespace) -> int:
             for line in (unit.stderr or "").splitlines()[-12:]:
                 print(f"    ! {line}")
         else:
-            ok_line = next(
-                (line for line in reversed(tail) if line.startswith("Ran ")), ""
+            ran_line = next(
+                (line.strip() for line in reversed(tail) if line.startswith("Ran ")),
+                "",
             )
-            info(f"    通过（{ok_line.strip()}）")
+            info(f"    通过（{ran_line or '未取到统计行'}）")
 
         # --- 2) 启动克隆的后端 + 跑 verify ------------------------------------
         frontend_ready = _link_node_modules(clone)
