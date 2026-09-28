@@ -4716,6 +4716,24 @@ def task_verify(args: argparse.Namespace) -> int:
                 except Exception:  # noqa: BLE001 - 清理失败不该影响验证结论
                     pass
 
+    # --- CI 配置不许悄悄坏掉 ------------------------------------------------
+    # 离线能查的那部分（job 齐不齐、引用到的路径是否存在且进了版本库）放进
+    # verify，这样每次跑都盯着。需要联网/需要真 runner 的部分留给 `check-ci`。
+    try:
+        import check_ci
+
+        problems = check_ci.check_workflow()
+        check(
+            "CI workflow 引用的路径都存在且在版本库中",
+            not problems,
+            "；".join(problems) if problems else "job 齐全、关键命令齐全、引用路径都在",
+        )
+    except Exception as exc:  # noqa: BLE001 - 这个闸门自己不许把 verify 弄崩
+        check(
+            "CI workflow 引用的路径都存在且在版本库中", False,
+            f"{type(exc).__name__}: {exc}",
+        )
+
     # --- 任务脚本自己不能有未定义的名字 --------------------------------------
     # 放在计数闸门**之前**：闸门要数"检查项总数"，而总数包含这一条。
     try:
@@ -5058,6 +5076,19 @@ def task_clone_verify(args: argparse.Namespace) -> int:
     return 1
 
 
+def task_check_ci(args: argparse.Namespace) -> int:
+    """
+    推送前审计：把"CI 会在哪一步红"里**本地能查的部分**都查一遍。
+
+    为什么单独一个任务而不是塞进 verify：里面的 PyPI / npm 检查要联网，而
+    `verify` 必须能离线跑（CI 与本机都可能没网）。离线那部分已经进了 verify，
+    这个任务补上联网的三项，并**如实列出本地查不了的部分**。
+    """
+    script = ROOT / "tools" / "check_ci.py"
+    # 用当前解释器：这个脚本只用标准库，不依赖 venv
+    return subprocess.run([sys.executable, str(script)], cwd=str(ROOT)).returncode
+
+
 TASKS = {
     "setup": task_setup,
     "dev": task_dev,
@@ -5065,6 +5096,7 @@ TASKS = {
     "test": task_test,
     "verify": task_verify,
     "clone-verify": task_clone_verify,
+    "check-ci": task_check_ci,
     "build": task_build,
     "clean": task_clean,
     "doctor": task_doctor,
