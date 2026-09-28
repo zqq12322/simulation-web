@@ -71,15 +71,33 @@ make dev                # 或 python3 tools/tasks.py dev
 | 命令（跨平台） | Windows 等价 | 验证什么 | 需要服务在跑吗 | 何时用 |
 |---|---|---|---|---|
 | `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**481** 个用例，约 14 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
-| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准 + 认证/隔离/配置/共享（**84** 项） | 需要 | 提交前跑一次 |
+| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准 + 认证/隔离/配置/共享（**134** 项） | 需要 | 提交前跑一次 |
 | `make build` | — | 前端类型检查 + 生产构建 | 不需要 | 改前端后 |
 | CI（`.github/workflows/ci.yml`） | — | 上面几项的自动化版本 | 不需要 | push / PR 时自动跑 |
+
+**CI 跑三件事**（三个**并行** job，互不依赖）：后端单元测试；前端类型检查与构建；
+**端到端验证（`verify`）**。第三个是本项目主要证据的所在地——解析解物理校准、
+收敛阶、导出文件的逐位回读都在 `verify` 里，**不在**单元测试里。它需要 Node ≥ 23
+（`verify` 会用 node 直接执行前端的 `.ts` 纯函数），所以那个 job 单独装了 Node 24。
 
 **红线：改动 `backend/solver.py` 或 `backend/geometry.py` 后，必须让测试通过。**
 其中的回归测试用解析解 `FL/AE`、**解析应力场 `Von Mises = 2με`** 与支反力守恒来
 校验结果——这套仿真的价值全在"结果是对的"，破坏它比写出 bug 更糟。
 （历史上正因为只断言"应力有限"，漏掉了一个把应力放大 1e7 倍的错误，
 详见 `docs/03-修复记录.md` 第五节。）
+
+**另一条容易踩的：改动涉及"生成物"时先 `clean` 再 `test`。**
+
+```
+python3 tools/tasks.py clean    # 删掉 *.msh 等可再生缓存
+python3 tools/tasks.py test
+```
+
+`backend/uploads/*.msh` 是 gitignore 的可再生产物。本机跑测试时它们通常已经存在，
+于是测试可能**悄悄依赖**这些缓存——本地一直绿，干净检出里却直接
+`FileNotFoundError`。这个坑真的发生过一次（`test_convergence_study.py` 依赖
+`test_part.step.msh` 存在），是 CI 的干净检出第一次把它照出来的：
+**`clean` + `test` 就是最便宜的本地复现方式。**
 
 ### 4.1 提 PR 时请用模板
 

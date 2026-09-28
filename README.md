@@ -213,7 +213,7 @@ cd frontend && npm run dev
 
 - `tsc --noEmit` 无错误；`vite build` 成功；
 - **`python3 tools/tasks.py test`：481 个后端用例全部通过**（约 14 秒，无需启动服务器）；
-- **`python3 tools/tasks.py verify`：133 项端到端检查全部通过**；
+- **`python3 tools/tasks.py verify`：134 项端到端检查全部通过**；
 - 全流程跑通：上传 → 网格 → 求解 → 云图（含变形显示）；
 - 求解器物理正确性抽查：10×10×10 立方体轴向拉伸，加载面中心位移 `4.17e-10` vs 解析解 `FL/AE = 5e-10`（比值 0.835，全约束端略刚于自由杆，符合预期）；支反力合计与施加载荷精确抵消。
 

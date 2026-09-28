@@ -2760,8 +2760,76 @@ def _check_modal_display_chain(node: str, payload: dict) -> tuple[bool, str]:
                 f"取场与归一化均通过" if ok else detail)
 
 
+#: 文档里"**当前**总数"的写法。
+#:
+#: 为什么不能简单匹配 `\d+ 项` / `\d+ 个用例`：文档里有**大量历史数字**
+#: （"verify 新增 6 项"、"45 个用例、0.3 秒"…），那些是记录当时做了什么，
+#: 不该等于今天的总数。所以只匹配固定的"当前总数"措辞，每个 pattern 绑死一份
+#: 文件——这样漂移时能直接指出"是哪个文件的哪一句写了旧数字"。
+_DOC_COUNT_PATTERNS = {
+    "tests": (
+        (r"(\d+)\s*个后端用例", "README.md"),
+        (r"当前 \*\*(\d+)\*\* 个用例", "docs/01-开发流程与长期计划.md"),
+        (r"\*\*(\d+)\*\*\s*个用例", "CONTRIBUTING.md"),
+    ),
+    "checks": (
+        (r"(\d+)\s*项端到端检查", "README.md"),
+        (r"\*\*(\d+)\*\*\s*项", "CONTRIBUTING.md"),
+    ),
+}
+
+
+def documented_counts() -> dict:
+    """读出文档里声明的"当前"用例数与检查项数（找不到的记为缺失）。"""
+    import re
+
+    found: dict = {"tests": [], "checks": []}
+    for kind, entries in _DOC_COUNT_PATTERNS.items():
+        for pattern, name in entries:
+            path = ROOT / name
+            if not path.exists():  # pragma: no cover - 文档被删了才可能发生
+                found[kind].append((name, None))
+                continue
+            text = path.read_text(encoding="utf-8")
+            matches = re.findall(pattern, text)
+            if not matches:
+                found[kind].append((name, None))
+            else:
+                for value in matches:
+                    found[kind].append((name, int(value)))
+    return found
+
+
+def collect_test_count() -> int:
+    """
+    数一遍测试用例数，**只收集不执行**（收集只 import 模块，不跑测试体）。
+
+    用它来校验文档里的用例数：验证活动本身不跑测试套件，所以这是最便宜的
+    一致性检查手段。用 venv 的解释器；没有 venv（例如 CI）就用当前解释器——
+    CI 里依赖是装在系统 Python 上的。
+    """
+    python = venv_python()
+    if not python.exists():
+        python = Path(sys.executable)
+    completed = subprocess.run(
+        [
+            str(python), "-c",
+            "import unittest;"
+            "print(unittest.TestLoader().discover('tests', top_level_dir='.')"
+            ".countTestCases())",
+        ],
+        cwd=str(BACKEND), capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            (completed.stderr or completed.stdout or "").strip().splitlines()[-1]
+            if (completed.stderr or completed.stdout) else "收集用例失败"
+        )
+    return int(completed.stdout.strip().splitlines()[-1])
+
+
 def task_verify(args: argparse.Namespace) -> int:
-    """端到端验证 + 物理校准（当前 24 项，见 docs/01 的"三层验证"）。"""
     checks: list[tuple[str, bool, str]] = []
 
     def check(name: str, passed: bool, detail: str = "") -> None:
@@ -4329,6 +4397,44 @@ def task_verify(args: argparse.Namespace) -> int:
                     )
                 except Exception:  # noqa: BLE001 - 清理失败不该影响验证结论
                     pass
+
+    # --- 文档计数不能漂移 -----------------------------------------------------
+    # 三份文档都写着"当前多少个用例、多少项检查"，而它们漂移过好几次
+    # （CONTRIBUTING 里曾长期留着「84 项」，实际早已过百）。靠"记得同步"是
+    # 靠不住的，所以做成自动闸门：**所有声明值必须等于实测值**，不一致就列出
+    # 具体是哪个文件写了什么，而不是让人自己去找。
+    #
+    # 这个 check 是最后一条，因此"文档里的检查项数"应当等于 `len(checks) + 1`
+    # （把这条自己算进去）。
+    try:
+        expected_checks = len(checks) + 1
+        mismatches: list = []
+        documented_checks = documented_counts()["checks"]
+        for name, value in documented_checks:
+            if value != expected_checks:
+                mismatches.append(
+                    f"{name} 写的检查项数是 {value if value is not None else '（缺失）'}"
+                    f"，实际 {expected_checks}"
+                )
+        try:
+            measured_tests = collect_test_count()
+            for name, value in documented_counts()["tests"]:
+                if value != measured_tests:
+                    mismatches.append(
+                        f"{name} 写的用例数是 {value if value is not None else '（缺失）'}"
+                        f"，实际 {measured_tests}"
+                    )
+            tests_note = f"{measured_tests} 个用例"
+        except Exception as exc:  # noqa: BLE001 - 数不出来时只报检查项数
+            tests_note = f"用例数未能统计（{exc}）"
+        check(
+            "文档里的计数与实测一致",
+            not mismatches,
+            "；".join(mismatches) if mismatches
+            else f"{tests_note} / {expected_checks} 项检查",
+        )
+    except Exception as exc:  # noqa: BLE001 - 这个闸门自己不许把 verify 弄崩
+        check("文档里的计数与实测一致", False, f"{type(exc).__name__}: {exc}")
 
     failed = [name for name, passed, _ in checks if not passed]
     print()

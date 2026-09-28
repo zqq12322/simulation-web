@@ -60,3 +60,74 @@ jobs:
       - name: 生产构建
         working-directory: frontend
         run: npm run build
+
+  # 这个 job 才是本项目**主要证据**的所在地：`verify` 里那 133 项检查包含
+  # 解析解物理校准（支反力守恒、热流 `q=kΔT/L`、模态刚体模态与二阶收敛、
+  # 制造解收敛阶、导出文件的 Python 回读逐位比对）——它们**不在**单元测试里，
+  # 之前也从未在 CI 上跑过。没有这个 job，"已验证"就只存在于开发者本机。
+  #
+  # 与上面两个 job **并行**而不是 needs：出问题时能一眼看出是单元测试挂了
+  # 还是端到端挂了，而且不用排队等。
+  verify:
+    name: 端到端验证与物理校准
+    runs-on: ubuntu-latest
+    env:
+      # gmsh 默认往 stdout 打大量网格信息，会把 verify 的结论淹掉
+      GMSH_TERMINAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      # verify 里的"前端纯函数自检"是**用 node 直接执行 .ts 文件**的
+      # （类型擦除），需要 Node >= 23。上面的 frontend job 只做 tsc 与打包，
+      # Node 20 够用；这个 job 不够。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装 Gmsh 所需的系统库
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglu1-mesa libxrender1 libxcursor1 libxft2 libxinerama1
+
+      - name: 安装后端依赖
+        run: pip install -r backend/requirements.txt
+
+      # verify 的 1/7 会跑 tsc，所以前端依赖也要装
+      - name: 安装前端依赖
+        working-directory: frontend
+        run: npm ci
+
+      # 后端与 verify 放在**同一个 step** 里：跨 step 的后台进程能不能活下来
+      # 取决于 runner 怎么处理进程组，放在一起就不必赌这件事。
+      - name: 启动后端并跑端到端验证
+        run: |
+          cd backend
+          nohup python -m uvicorn main:app --host 127.0.0.1 --port 8000 \
+            > ci-backend.log 2>&1 &
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8000/api/health > /dev/null; then
+              echo "后端已就绪（第 ${attempt} 次探测）"
+              break
+            fi
+            if [ "${attempt}" = "60" ]; then
+              echo "后端未在 60 秒内就绪"
+              tail -100 ci-backend.log
+              exit 1
+            fi
+            sleep 1
+          done
+          cd ..
+          python tools/tasks.py verify
+
+      - name: 失败时输出后端日志
+        if: failure()
+        run: tail -200 backend/ci-backend.log || true

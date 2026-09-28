@@ -377,9 +377,20 @@ class RealStudyTest(unittest.TestCase):
         """
         检查跑的是几何副本，不能覆盖用户自己的 `<几何名>.msh`。
 
-        做法：记下修改时间与大小，再跑一次，比对。
+        做法：**先确保用户有一份网格**（`*.msh` 是 gitignore 的可再生产物，
+        干净检出里没有），记下修改时间与大小，再跑一次检查，比对。
+
+        第一版少了"先生成"这一步：本地跑得过去（缓存早就有了），但 CI 的干净
+        检出里必然 `FileNotFoundError`。**这就是"只在本机验证"的典型漏网方式**
+        ——测试依赖了一个不进版本库的生成物。
         """
+        from geometry import generate_mesh_impl
+
         target = str(resolve_upload_path(CUBE)) + ".msh"
+        if not os.path.exists(target):
+            asyncio.run(generate_mesh_impl(filename=CUBE, mesh_size=3.0))
+        self.assertTrue(os.path.exists(target), f"夹具网格没生成出来：{target}")
+
         before = os.stat(target)
         asyncio.run(study_impl(self.request))
         after = os.stat(target)
