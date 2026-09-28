@@ -1233,9 +1233,10 @@ def _check_frontend_auth_math(node: str) -> tuple[bool, str]:
 #: 重点锁三件事：组装只带该带的字段、**按键排序的稳定签名**（否则每次重渲染都会
 #: 写一次库）、以及恢复时对不认识的内容必须丢弃并报告。
 _PROJECT_SETUP_SELFTEST = r"""
-import { SETUP_VERSION, buildSetupPayload, describeSaveStatus,
-         describeSetupBadge, restoreSetup, setupDocumentVersion,
-         setupSignature, stableStringify } from './projectSetup.ts';
+import { SETUP_VERSION, buildSetupPayload, describeLastEditor,
+         describeSaveStatus, describeSetupBadge, restoreSetup,
+         setupDocumentVersion, setupSignature,
+         stableStringify } from './projectSetup.ts';
 
 let failures = [];
 const check = (name, ok, detail = '') => {
@@ -1357,6 +1358,15 @@ check('非法版本号是 null', setupDocumentVersion({ version: -1 }) === null
       && setupDocumentVersion({ version: 1.5 }) === null
       && setupDocumentVersion({ version: '3' }) === null
       && setupDocumentVersion('nonsense') === null);
+
+// 4d) 最后修改者：协作里必须能看出"是谁改的"
+check('署名文案', describeLastEditor('Alice') === '最后由 Alice 修改');
+check('署名前后空格被去掉', describeLastEditor('  Alice  ') === '最后由 Alice 修改');
+check('没人改过就不显示', describeLastEditor(null) === null
+      && describeLastEditor(undefined) === null && describeLastEditor('') === null
+      && describeLastEditor('   ') === null);
+check('不猜名字（不显示"未知用户"）',
+      describeLastEditor(null) === null && describeLastEditor(' ') === null);
 
 // 5) 仪表盘标记
 check('已配置标记', describeSetupBadge(true) === '已配置');
@@ -4203,6 +4213,38 @@ def task_verify(args: argparse.Namespace) -> int:
                     setup_document, headers=alice_headers,
                 ).get("version") == base_version + 3,
                 "无条件覆盖这条路不能被并发控制弄坏",
+            )
+
+            # ---- 署名：协作里必须知道"是谁改的" ----
+            # 「已被其他人修改」不可行动；「已被 Bob 于 10:31 修改」才能让人决定
+            # 是去找他，还是先重新加载看看。
+            signed = _http_json(
+                "GET", f"{API_BASE}/api/projects/{created_id}/setup",
+                headers=alice_headers,
+            )
+            check(
+                "配置带上最后修改者（id + 显示名）",
+                isinstance(signed.get("savedBy"), str) and signed["savedBy"]
+                and isinstance(signed.get("savedByName"), str)
+                and signed["savedByName"],
+                f"savedBy={signed.get('savedBy')} savedByName={signed.get('savedByName')}",
+            )
+            conflict_detail = ""
+            try:
+                _http_json(
+                    "PUT", f"{API_BASE}/api/projects/{created_id}/setup",
+                    setup_document,
+                    headers=_with_header(alice_headers, "If-Match", '"0"'),
+                )
+            except urllib.error.HTTPError as exc:
+                conflict_detail = json.loads(
+                    exc.read().decode("utf-8")
+                ).get("detail", "")
+            check(
+                "409 文案点名是谁改的（可行动）",
+                "最后修改" in conflict_detail
+                and signed["savedByName"] in conflict_detail,
+                conflict_detail or "（没有拿到 409 的说明）",
             )
             # 把配置恢复成后面检查用的样子
             _http_json(

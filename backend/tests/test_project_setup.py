@@ -75,10 +75,14 @@ class SetupStoreTest(unittest.TestCase):
 
     def test_new_project_has_no_setup(self):
         self.assertEqual(self.project["hasSetup"], False)
-        self.assertEqual(
-            self.store.get_setup(self.project["id"], "user-a"),
-            {"setup": None, "savedAt": None, "version": 0},
-        )
+        # 只断言**有意义的字段**，不钉死整个字典：这里的断言是"没配过"，而整个
+        # 字典比对已经因为"新增一个字段"碎过两次（version、savedBy），每次都要
+        # 来改这几处——那是噪声，不是保护。
+        stored = self.store.get_setup(self.project["id"], "user-a")
+        self.assertIsNone(stored["setup"])
+        self.assertIsNone(stored["savedAt"])
+        self.assertEqual(stored["version"], 0, "没保存过就是版本 0")
+        self.assertIsNone(stored["savedBy"], "没保存过就没人改过")
 
     def test_save_and_read_back(self):
         saved = self.store.set_setup(
@@ -150,10 +154,9 @@ class SetupStoreTest(unittest.TestCase):
                 "UPDATE projects SET setup = ? WHERE id = ?",
                 ("{ 这不是 JSON", self.project["id"]),
             )
-        self.assertEqual(
-            self.store.get_setup(self.project["id"], "user-a"),
-            {"setup": None, "savedAt": None, "version": 0},
-        )
+        stored = self.store.get_setup(self.project["id"], "user-a")
+        self.assertIsNone(stored["setup"], "坏 JSON 按空配置返回，而不是 500")
+        self.assertIsNone(stored["savedAt"])
         self.assertFalse(self.store.list_projects("user-a")[0]["hasSetup"])
 
 
@@ -554,6 +557,153 @@ class SetupConcurrencyTest(unittest.TestCase):
         self.assertEqual(saved.version, 1)
 
 
+class SetupAttributionTest(unittest.TestCase):
+    """
+    "是谁改的"：协作里这是必须的。
+
+    冲突发生时，"已被其他人修改"不可行动；"已被 **Bob** 于 10:31 修改"才能让人
+    决定是去找他，还是先重新加载看看。存的是 **user id**，显示名在响应时解析
+    （与共享列表同一套做法）——名字会变，存名字就会过期。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = ProjectStore(Path(self._tmp.name) / "who.db")
+        self._original = (
+            projects_module.get_store, project_store_module.get_store,
+        )
+        projects_module.get_store = lambda: self.store
+        project_store_module.get_store = lambda: self.store
+        self.project = self.store.create(title="署名", owner_id="alice-id")
+        self.request = projects_module.SimulationSetup(**_setup_payload())
+
+    def tearDown(self):
+        (projects_module.get_store, project_store_module.get_store) = self._original
+        self._tmp.cleanup()
+
+    def test_save_records_the_actor(self):
+        saved = self.store.set_setup(
+            self.project["id"], _setup_payload(), owner_id="alice-id",
+            actor_id="alice-id",
+        )
+        self.assertEqual(saved["savedBy"], "alice-id")
+
+    def test_actor_is_recorded_even_with_a_version(self):
+        first = self.store.set_setup(
+            self.project["id"], _setup_payload(), owner_id="alice-id",
+            actor_id="alice-id",
+        )
+        second = self.store.set_setup(
+            self.project["id"], _setup_payload(materialId="aluminum_6061"),
+            owner_id="alice-id", expected_version=first["version"],
+            actor_id="bob-id",
+        )
+        self.assertEqual(second["savedBy"], "bob-id", "谁改的就记谁")
+
+    def test_clear_records_the_actor(self):
+        """清空**最该**知道是谁干的。"""
+        self.store.set_setup(
+            self.project["id"], _setup_payload(), owner_id="alice-id",
+            actor_id="alice-id",
+        )
+        self.store.clear_setup(self.project["id"], "alice-id", actor_id="bob-id")
+        self.assertEqual(
+            self.store.get_setup(self.project["id"], "alice-id")["savedBy"], "bob-id"
+        )
+
+    def test_omitting_the_actor_leaves_it_empty(self):
+        """不传就不记（脚本/测试的老调用方式不能被弄坏）。"""
+        saved = self.store.set_setup(
+            self.project["id"], _setup_payload(), owner_id="alice-id"
+        )
+        self.assertIsNone(saved["savedBy"])
+
+    def test_conflict_carries_the_last_editor(self):
+        first = self.store.set_setup(
+            self.project["id"], _setup_payload(), owner_id="alice-id",
+            actor_id="alice-id",
+        )
+        self.store.set_setup(
+            self.project["id"], _setup_payload(), owner_id="alice-id",
+            expected_version=first["version"], actor_id="bob-id",
+        )
+        with self.assertRaises(SetupConflict) as ctx:
+            self.store.set_setup(
+                self.project["id"], _setup_payload(), owner_id="alice-id",
+                expected_version=first["version"],
+            )
+        self.assertEqual(ctx.exception.actor_id, "bob-id")
+        self.assertIsNotNone(ctx.exception.updated_at)
+
+    def test_endpoint_response_points_at_the_last_editor(self):
+        saved = asyncio.run(
+            projects_module.put_project_setup(
+                self.project["id"], self.request, user={"id": "alice-id"},
+            )
+        )
+        self.assertEqual(saved.savedBy, "alice-id")
+        # 测试库里没有这个用户 → 如实显示「（已注销）」，而不是崩溃或空白
+        self.assertEqual(saved.savedByName, "（已注销）")
+
+    def test_endpoint_resolves_the_display_name(self):
+        """有用户时应解析出显示名（用的是 auth 库，与共享列表同一套）。"""
+        class FakeAuth:
+            @staticmethod
+            def get_user(user_id):
+                # 属主是 alice-id；端点会先用 access_role 判权限，所以这里只能用属主
+                return {"username": "alice", "displayName": "Alice"} \
+                    if user_id == "alice-id" else None
+
+        original_auth = projects_module.get_auth_store
+        projects_module.get_auth_store = lambda: FakeAuth
+        try:
+            saved = asyncio.run(
+                projects_module.put_project_setup(
+                    self.project["id"], self.request, user={"id": "alice-id"},
+                )
+            )
+        finally:
+            projects_module.get_auth_store = original_auth
+        self.assertEqual(saved.savedBy, "alice-id")
+        self.assertEqual(saved.savedByName, "Alice")
+
+    def test_409_message_says_who_and_when(self):
+        """
+        冲突文案必须**可行动**：点名"是谁"比"已被其他人修改"有用得多。
+
+        时间戳是给人看的，转成 `2026-03-18 10:31` 这种形式；
+        不变的文件格式细节（时区后缀）由切片保证不带来噪声。
+        """
+        class FakeAuth:
+            @staticmethod
+            def get_user(user_id):
+                return {"username": "alice", "displayName": "Alice"}
+
+        original_auth = projects_module.get_auth_store
+        projects_module.get_auth_store = lambda: FakeAuth
+        try:
+            first = asyncio.run(
+                projects_module.put_project_setup(
+                    self.project["id"], self.request, user={"id": "alice-id"},
+                )
+            )
+            self.assertEqual(first.savedByName, "Alice")
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(
+                    projects_module.put_project_setup(
+                        self.project["id"], self.request, user={"id": "alice-id"},
+                        if_match='"0"',
+                    )
+                )
+        finally:
+            projects_module.get_auth_store = original_auth
+        self.assertEqual(ctx.exception.status_code, 409)
+        detail = ctx.exception.detail
+        self.assertIn("Alice", detail, detail)
+        self.assertIn("最后修改", detail, detail)
+        self.assertNotIn("T", detail.split("（")[1][:20], "时间不该带 ISO 的 T")
+
+
 class SetupMigrationTest(unittest.TestCase):
     """老库（没有 setup 列）打开时自动补列，且旧数据不丢。"""
 
@@ -590,9 +740,12 @@ class SetupMigrationTest(unittest.TestCase):
             row = store.get_project("legacy1", "user-a")
             self.assertEqual(row["title"], "老项目", "迁移后旧数据必须还在")
             self.assertFalse(row["hasSetup"])
-            self.assertEqual(
-                store.get_setup("legacy1", "user-a"), {"setup": None, "savedAt": None, "version": 0}
-            )
+            migrated = store.get_setup("legacy1", "user-a")
+            self.assertIsNone(migrated["setup"])
+            # 新列也要补上，且老数据不因此变成"有人改过"
+            self.assertIn("setup_updated_by", store.columns())
+            self.assertEqual(migrated["version"], 0)
+            self.assertIsNone(migrated["savedBy"])
             # 迁移后新保存也应正常
             store.set_setup("legacy1", _setup_payload(), owner_id="user-a")
             self.assertTrue(store.get_project("legacy1", "user-a")["hasSetup"])

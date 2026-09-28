@@ -193,6 +193,20 @@ export function setupDocumentVersion(raw: unknown): number | null {
 }
 
 /**
+ * 「最后由谁修改」的文案；没人改过时返回 
+ull。
+ *
+ * 协作里这是必须的：看到配置变了却不知道是谁改的，只能去群里问一圈。
+ * 服务端存的是 user id，显示名由它解析（用户已注销时为「（已注销）」）——
+ * 这里只负责把名字变成一句话，**不猜**（没名字就不显示，而不是显示「未知用户」）。
+ */
+export function describeLastEditor(name?: string | null): string | null {
+  const trimmed = typeof name === 'string' ? name.trim() : '';
+  if (!trimmed) return null;
+  return `最后由 ${trimmed} 修改`;
+}
+
+/**
  * 保存状态 → 界面文案。
  *
  * **必须如实**：`error` 不能显示成"已保存"——用户会以为配置存下来了，

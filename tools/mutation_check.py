@@ -83,6 +83,12 @@ MUTATIONS = [
         "    return null;\n  }\n  return value;",
         "    return 0;\n  }\n  return value;",
     ),
+    (
+        "frontend/utils/projectSetup.ts", "_PROJECT_SETUP_SELFTEST",
+        "没人改过时也显示署名（凭空说「最后由  修改」）",
+        "  if (!trimmed) return null;",
+        "  if (false) return null;",
+    ),
 ]
 
 

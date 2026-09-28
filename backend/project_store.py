@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS projects (
     owner_id        TEXT,
     setup           TEXT,
     setup_version   INTEGER NOT NULL DEFAULT 0,
+    setup_updated_by TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -100,6 +101,9 @@ _MIGRATIONS = {
     # 老项目的初始版本为 0（默认值）——于是它们第一次保存仍然是"无条件写入"，
     # 不会因为缺列而失败。
     "setup_version": "INTEGER NOT NULL DEFAULT 0",
+    # 最后一次修改配置的人（user id）。存 id 而不存名字：
+    # 名字会变，响应时用 auth 库解析（与共享列表同一套做法）。
+    "setup_updated_by": "TEXT",
 }
 
 #: 共享角色 → 能做什么。这是**唯一**的权限判据（见 `access_role`）。
@@ -125,13 +129,24 @@ class SetupConflict(Exception):
     冲突**不允许被顺手忽略**——返回 `None` 太容易被和"项目不存在"一起处理掉
     （现有调用方就是 `if result is None: 404`），于是冲突会悄悄变成 404。
     抛异常强迫调用方显式决定怎么回应。
+
+    除了当前版本，还带上**最后修改人**与时间：协作场景里，
+    "已被其他人修改"远不如"已被 **Bob** 于 10:31 修改"可行动。
     """
 
-    def __init__(self, current_version: int) -> None:
+    def __init__(
+        self,
+        current_version: int,
+        actor_id: Optional[str] = None,
+        updated_at: Optional[str] = None,
+    ) -> None:
         super().__init__(
             f"配置已被其他人修改（当前版本 {current_version}）"
         )
         self.current_version = int(current_version)
+        #: 最后一次修改者的 user id（未知为 None）；显示名由调用方解析
+        self.actor_id = actor_id
+        self.updated_at = updated_at
 
 
 def _now() -> str:
@@ -388,7 +403,7 @@ class ProjectStore(SqliteStore):
         """
         with self._cursor() as connection:
             row = connection.execute(
-                "SELECT setup, setup_version, updated_at FROM projects"
+                "SELECT setup, setup_version, setup_updated_by, updated_at FROM projects"
                 " WHERE id = ? AND owner_id IS ?",
                 (project_id, owner_id),
             ).fetchone()
@@ -403,11 +418,15 @@ class ProjectStore(SqliteStore):
             logger.warning("项目 %s 的仿真配置无法解析，已按空处理", project_id)
         version = int(row["setup_version"] or 0)
         if parsed is None:
-            return {"setup": None, "savedAt": None, "version": version}
+            return {
+                "setup": None, "savedAt": None, "version": version,
+                "savedBy": row["setup_updated_by"],
+            }
         return {
             "setup": parsed,
             "savedAt": row["updated_at"],
             "version": version,
+            "savedBy": row["setup_updated_by"],
         }
 
     def set_setup(
@@ -416,6 +435,7 @@ class ProjectStore(SqliteStore):
         setup: dict,
         owner_id: Optional[str] = None,
         expected_version: Optional[int] = None,
+        actor_id: Optional[str] = None,
     ) -> Optional[dict]:
         """
         覆盖保存仿真配置；项目不存在或不属于该属主时返回 ``None``。
@@ -430,6 +450,9 @@ class ProjectStore(SqliteStore):
         一起处理掉（现有的 `if result is None: 404` 就是这么写的），于是冲突会
         悄悄变成 404；而抛异常强迫调用方显式决定怎么回应它。
 
+        `actor_id` 记下"是**谁**改的"。协作里这是必须的：冲突发生时，
+        "已被其他人修改"远不如"已被 **Bob** 于 10:31 修改"可行动。
+
         不用"锁"的理由：把项目锁住需要过期/续租/崩溃回收，是另一套要维护的状态；
         而配置是一份**小文档**，整份覆盖 + 版本检查就足以让"并发写"从
         "静默丢数据"变成"显式冲突"。
@@ -439,47 +462,63 @@ class ProjectStore(SqliteStore):
             if expected_version is None:
                 cursor = connection.execute(
                     "UPDATE projects"
-                    " SET setup = ?, setup_version = setup_version + 1, updated_at = ?"
+                    " SET setup = ?, setup_version = setup_version + 1,"
+                    "     setup_updated_by = ?, updated_at = ?"
                     " WHERE id = ? AND owner_id IS ?",
-                    (payload, _now(), project_id, owner_id),
+                    (payload, actor_id, _now(), project_id, owner_id),
                 )
             else:
                 cursor = connection.execute(
                     "UPDATE projects"
-                    " SET setup = ?, setup_version = setup_version + 1, updated_at = ?"
+                    " SET setup = ?, setup_version = setup_version + 1,"
+                    "     setup_updated_by = ?, updated_at = ?"
                     " WHERE id = ? AND owner_id IS ? AND setup_version = ?",
-                    (payload, _now(), project_id, owner_id, int(expected_version)),
+                    (payload, actor_id, _now(), project_id, owner_id,
+                     int(expected_version)),
                 )
             if cursor.rowcount == 0:
                 # 分清"项目不在/不属于我"与"版本对不上"：前者 404，后者 409。
-                # 查一次当前版本即可——同一条连接上，不存在并发窗口问题。
+                # 查一次当前版本与最后修改人即可——同一条连接上，没有并发窗口问题。
                 row = connection.execute(
-                    "SELECT setup_version FROM projects WHERE id = ? AND owner_id IS ?",
+                    "SELECT setup_version, setup_updated_by, updated_at"
+                    " FROM projects WHERE id = ? AND owner_id IS ?",
                     (project_id, owner_id),
                 ).fetchone()
                 if row is None:
                     return None
-                raise SetupConflict(int(row["setup_version"] or 0))
+                raise SetupConflict(
+                    int(row["setup_version"] or 0),
+                    actor_id=row["setup_updated_by"],
+                    updated_at=row["updated_at"],
+                )
         logger.info(
-            "已保存项目 %s 的仿真配置（%d 字节，expected_version=%s）",
-            project_id, len(payload), expected_version,
+            "已保存项目 %s 的仿真配置（%d 字节，expected_version=%s，actor=%s）",
+            project_id, len(payload), expected_version, actor_id,
         )
         return self.get_setup(project_id, owner_id)
 
-    def clear_setup(self, project_id: str, owner_id: Optional[str] = None) -> bool:
+    def clear_setup(
+        self,
+        project_id: str,
+        owner_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+    ) -> bool:
         """
         清空仿真配置（保留项目本身）。
 
         **同样把版本号 +1**：清空也是一次对配置的修改。不 +1 的话，正在编辑的人
         （手里拿着旧版本号）会在清空之后成功保存，把清空这件事悄悄抹掉——
         那正是这一轮要消除的静默覆盖。
+
+        `actor_id` 同样记下来：清空**是最该知道是谁干的**那种操作。
         """
         with self._cursor() as connection:
             cursor = connection.execute(
                 "UPDATE projects"
-                " SET setup = NULL, setup_version = setup_version + 1, updated_at = ?"
+                " SET setup = NULL, setup_version = setup_version + 1,"
+                "     setup_updated_by = ?, updated_at = ?"
                 " WHERE id = ? AND owner_id IS ?",
-                (_now(), project_id, owner_id),
+                (actor_id, _now(), project_id, owner_id),
             )
             return cursor.rowcount > 0
 

@@ -210,6 +210,10 @@ class SimulationSetupResponse(BaseModel):
     #: 乐观并发控制用的版本号：保存时把它作为 `If-Match` 回传，
     #: 与库里不一致就说明期间有人改过（保存会被 409 拒绝，而不是静默覆盖）
     version: int = 0
+    #: 最后一次修改者的 user id（从未保存过为 None）
+    savedBy: Optional[str] = None
+    #: 最后一次修改者的显示名；用户已注销时为「（已注销）」
+    savedByName: Optional[str] = None
 
 
 #: 所有项目端点都必须登录。**按属主过滤**（而不是"先查出来再判断"）：
@@ -352,6 +356,8 @@ async def get_project_setup(project_id: str, user: dict = OwnedUser):
     stored = store.get_setup(project_id, store_owner_id(project_id))
     if stored is None:  # pragma: no cover - 上面已确认项目存在
         raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+    # 存的是 user id，显示名在这里解析（与共享列表同一套做法）
+    stored["savedByName"] = display_name_for(stored.get("savedBy"))
     return SimulationSetupResponse(**stored)
 
 
@@ -463,18 +469,28 @@ async def put_project_setup(
         saved = store.set_setup(
             project_id, payload, store_owner_id(project_id),
             expected_version=expected_version,
+            actor_id=user["id"],
         )
     except SetupConflict as conflict:
         # 409 而不是 403/404：请求本身完全合法，只是**基线过期了**。
         # 把当前版本放进 ETag，客户端就能立刻重试（或者先看清差异再说）。
+        #
+        # 文案里带上**是谁、什么时候**改的：协作场景里"已被其他人修改"不可行动，
+        # "已被 Bob 于 10:31 修改"才能让人决定是去找他，还是先重新加载看看。
+        who = display_name_for(conflict.actor_id)
+        when = (conflict.updated_at or "").replace("T", " ")[:16]
+        detail = str(conflict)
+        if who:
+            detail += f"；最后修改：{who}{f'（{when}）' if when else ''}"
         raise HTTPException(
             status_code=409,
-            detail=str(conflict),
+            detail=detail,
             headers={"ETag": f'"{conflict.current_version}"'},
         )
     if saved is None:  # pragma: no cover - 上面已确认项目存在
         raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
     # 新版本号随响应体返回（见 docstring 里"为什么不发 ETag 头"）
+    saved["savedByName"] = display_name_for(saved.get("savedBy"))
     return SimulationSetupResponse(**saved)
 
 
@@ -496,7 +512,9 @@ async def delete_project_setup(project_id: str, user: dict = OwnedUser):
     if not store.can_manage(role):
         raise HTTPException(status_code=403, detail="只有项目属主可以清空配置")
 
-    if not store.clear_setup(project_id, store_owner_id(project_id)):
+    if not store.clear_setup(
+        project_id, store_owner_id(project_id), actor_id=user["id"]
+    ):
         raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
     return {"cleared": True, "id": project_id}
 
@@ -515,6 +533,19 @@ def _resolve_share_target(username: str) -> dict:
     if user is None:
         raise HTTPException(status_code=404, detail=f"用户不存在：{username}")
     return user
+
+
+def display_name_for(user_id: Optional[str]) -> Optional[str]:
+    """
+    把 user id 解析成显示名；未知为 None，已注销为「（已注销）」。
+
+    与共享列表**同一套做法**（存 id、响应时解析）：名字会变，存名字就会过期；
+    而「（已注销）」这个兜底让界面不必区分「没人改过」和「改的人不在了」。
+    """
+    if not user_id:
+        return None
+    target = get_auth_store().get_user(user_id)
+    return target["displayName"] if target else "（已注销）"
 
 
 def _share_response(record: dict) -> ShareResponse:

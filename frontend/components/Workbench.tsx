@@ -40,6 +40,7 @@ import { Project, Material, AnyBoundaryCondition, MeshSettings, SolverSettings }
 import { formatFrequency, modeDisplayField, firstElasticFrequency } from '../utils/modalModes';
 import {
   buildSetupPayload,
+  describeLastEditor,
   describeSaveStatus,
   restoreSetup,
   setupDocumentVersion,
@@ -246,6 +247,8 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   const [setupVersion, setSetupVersion] = useState<number | null>(null);
   const setupVersionRef = React.useRef<number | null>(null);
   const [setupConflict, setSetupConflict] = useState<string | null>(null);
+  // 最后一次修改者（协作里必须知道「是谁改的」，否则只能去群里问一圈）
+  const [setupSavedBy, setSetupSavedBy] = useState<string | null>(null);
   /** 递增即可让下面的加载 effect 重跑（冲突后重新加载用） */
   const [setupReloadKey, setSetupReloadKey] = useState(0);
   const [setupLoading, setSetupLoading] = useState(true);
@@ -314,6 +317,7 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
       if (setupVersionRef.current !== null) setSetupVersion(setupVersionRef.current);
       lastSavedSignature.current = setupSignature(data?.setup ?? payload);
       setSetupSavedAt(data?.savedAt ?? null);
+      setSetupSavedBy(data?.savedByName ?? null);
       setSetupConflict(null);
       setSetupStatus('saved');
       return true;
@@ -365,6 +369,7 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
         setModelName(restored.geometryFilename);
         setSetupWarnings(restored.warnings);
         setSetupSavedAt(data?.savedAt ?? null);
+        setSetupSavedBy(data?.savedByName ?? null);
         const loadedVersion = setupDocumentVersion(data);
         setupVersionRef.current = loadedVersion;
         setSetupVersion(loadedVersion);
@@ -1440,6 +1445,12 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
               </button>
             )}
           </div>
+          {/* 谁最后改的：配置变了却不知道是谁改的，只能去问一圈 */}
+          {describeLastEditor(setupSavedBy) && (
+            <div className="mt-1 text-[11px] text-gray-400">
+              {describeLastEditor(setupSavedBy)}
+            </div>
+          )}
           {/* 冲突必须显式说出来，并说明"你的改动没有保存"。
               只显示一个红色状态码不够——用户会以为已经被保存了。 */}
           {setupConflict && (
