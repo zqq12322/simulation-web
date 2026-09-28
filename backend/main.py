@@ -12,6 +12,7 @@ from mesh_quality import router as mesh_quality_router
 from convergence import router as convergence_router
 from convergence_study import router as convergence_study_router
 from projects import router as projects_router
+from runs import router as runs_router
 from auth import router as auth_router
 
 # 集中配置：上传目录为绝对路径，CORS 来源可用环境变量覆盖
@@ -61,6 +62,7 @@ app.include_router(mesh_quality_router, prefix="/api")
 app.include_router(convergence_router, prefix="/api")
 app.include_router(convergence_study_router, prefix="/api")
 app.include_router(projects_router, prefix="/api")
+app.include_router(runs_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 
 @app.get("/")

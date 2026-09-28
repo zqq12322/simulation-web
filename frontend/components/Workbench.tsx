@@ -37,7 +37,7 @@ import MeshSettingsModal from './MeshSettingsModal';
 import SolverSettingsModal from './SolverSettingsModal';
 import AIAssistantPanel, { AIAssistantPanelRef } from './AIAssistantPanel';
 import { Project, Material, AnyBoundaryCondition, MeshSettings, SolverSettings } from '../types';
-import { formatFrequency, modeDisplayField } from '../utils/modalModes';
+import { formatFrequency, modeDisplayField, firstElasticFrequency } from '../utils/modalModes';
 import {
   buildSetupPayload,
   describeSaveStatus,
@@ -59,6 +59,8 @@ import { MeshQuality, toMeshQuality } from '../utils/meshQuality';
 import MeshQualityPanel from './MeshQualityPanel';
 import { ConvergenceStudy, toConvergenceStudy } from '../utils/convergenceStudy';
 import ConvergencePanel from './ConvergencePanel';
+import { RunList, RunRecord, toRunList } from '../utils/runsApi';
+import RunHistoryPanel from './RunHistoryPanel';
 import {
   buildLegacyVtk,
   buildResultCsv,
@@ -114,6 +116,13 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   const [isStudying, setIsStudying] = useState(false);
   const [studyJobStatus, setStudyJobStatus] = useState<string>('');
   const [studyError, setStudyError] = useState<string | null>(null);
+  // 求解记录：这个项目跑过哪些算例、各自什么网格、结果多少。
+  // 存在后端（SQLite），所以共享给别人的项目里对方也能看到——这正是"协作"
+  // 缺的那一块：在此之前被共享者只能看到配置，看不到任何算过的数值。
+  const [runs, setRuns] = useState<RunList | null>(null);
+  const [runsLoading, setRunsLoading] = useState(false);
+  const [runsError, setRunsError] = useState<string | null>(null);
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
 
   /**
    * 导出结果用的网格与场。
@@ -359,6 +368,10 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
         ) {
           void loadMeshQuality(restored.geometryFilename);
         }
+
+        // 求解记录与项目绑定，打开项目时一并读取（被共享的人也能看到属主
+        // 算过什么、什么网格、结果多少——这正是共享缺的那一块）。
+        void loadRuns();
 
         // 记下"刚加载时的样子"：之后只有真正改动才会触发自动保存
         lastSavedSignature.current = setupSignature(
@@ -1025,6 +1038,116 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     }
   };
 
+  /**
+   * 读取项目的求解记录。
+   *
+   * 404 表示"项目没了/我无权看"——不是本面板要解决的问题（工作台会因为项目
+   * 加载失败而整体报错），所以这里安静地不显示。401 交给 App 统一处理。
+   */
+  const loadRuns = React.useCallback(async () => {
+    setRunsLoading(true);
+    setRunsError(null);
+    try {
+      const { data } = await axios.get(
+        `${API_BASE_URL}/api/projects/${project.id}/runs`,
+        { headers: currentAuthHeaders() },
+      );
+      setRuns(toRunList(data));
+    } catch (error) {
+      if (isUnauthorized(error)) {
+        notifySessionExpired('登录已失效，请重新登录后再查看求解记录。');
+        return;
+      }
+      const status = errorStatus(error);
+      if (status === 404) {
+        setRuns(null);
+        return;
+      }
+      setRuns(null);
+      setRunsError(
+        status === null
+          ? '无法连接后端，求解记录未读取。'
+          : `读取求解记录失败（HTTP ${status}）。`,
+      );
+    } finally {
+      setRunsLoading(false);
+    }
+  }, [API_BASE_URL, project.id]);
+
+  /**
+   * 记一条求解记录。
+   *
+   * **只提交标量**（不提交位移/应力数组）：那些数组是 MB 级的，而记录只需要
+   * 几个数（见 backend/run_store.py 的说明）。考察量按分析类型取，模态取
+   * **第一阶弹性频率**——刚体模态恒为 0，记下来等于没记。
+   *
+   * 记录失败**不影响求解结果**（结果已经在界面上），所以这里只提示、不抛出。
+   */
+  const recordRun = async (
+    analysisType: string,
+    solveResult: any,
+    meshSize: unknown,
+  ) => {
+    const quantities: Record<string, number> = {};
+    if (analysisType === 'thermal') {
+      quantities.max_heat_flux = Number(solveResult?.max_heat_flux);
+      quantities.max_temperature = Number(solveResult?.max_temperature);
+    } else if (analysisType === 'modal') {
+      const frequency = firstElasticFrequency(
+        solveResult?.frequencies,
+        solveResult?.rigid_body_modes ?? 0,
+      );
+      if (frequency === null) return;      // 取不到就别记一条空记录
+      quantities.first_elastic_frequency = frequency;
+    } else {
+      quantities.max_stress = Number(solveResult?.max_stress);
+      quantities.max_displacement = Number(solveResult?.max_displacement);
+    }
+
+    try {
+      await axios.post(
+        `${API_BASE_URL}/api/projects/${project.id}/runs`,
+        {
+          analysisType,
+          quantities,
+          meshSize: Number.isFinite(Number(meshSize)) ? Number(meshSize) : undefined,
+          elements: Array.isArray(meshData?.elements) ? meshData.elements.length : undefined,
+          nodes: Array.isArray(meshData?.nodes) ? meshData.nodes.length : undefined,
+          warnings: Array.isArray(solveResult?.warnings) ? solveResult.warnings : [],
+        },
+        { headers: currentAuthHeaders() },
+      );
+      await loadRuns();
+    } catch (error) {
+      // 401 已经由求解流程处理；这里只记日志，不打断用户
+      console.warn('记录求解历史失败（不影响本次结果）:', error);
+    }
+  };
+
+  const handleDeleteRun = async (runId: string) => {
+    setDeletingRunId(runId);
+    try {
+      await axios.delete(
+        `${API_BASE_URL}/api/projects/${project.id}/runs/${runId}`,
+        { headers: currentAuthHeaders() },
+      );
+      await loadRuns();
+    } catch (error) {
+      if (isUnauthorized(error)) {
+        notifySessionExpired('登录已失效，请重新登录。');
+        return;
+      }
+      const status = errorStatus(error);
+      setRunsError(
+        status === null
+          ? '无法连接后端，删除未执行。'
+          : `删除求解记录失败（HTTP ${status}）。`,
+      );
+    } finally {
+      setDeletingRunId(null);
+    }
+  };
+
   const handleSolve = async () => {
     if (!modelName) {
       alert("请先导入几何模型。");
@@ -1151,6 +1274,10 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
 
         // Update status to solved
         setSolverSettings(prev => prev ? { ...prev, status: 'solved' } : null);
+
+        // 记一条求解历史（存在后端，共享给别人的项目里对方也看得到）。
+        // 失败只提示、不影响本次结果——结果已经在界面上了。
+        void recordRun(analysisType, solveResult, meshSettings?.meshSize);
         
       } catch (error: any) {
         console.error("Solver failed:", error);
@@ -1481,7 +1608,10 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
                       </div>
 
                       {/* Simulation Runs */}
-                      <div className="flex items-center py-1 cursor-pointer hover:text-white text-sm group -ml-4 mt-2">
+                      <div
+                        className="flex items-center py-1 cursor-pointer hover:text-white text-sm group -ml-4 mt-2"
+                        onClick={() => toggleNode('simulation')}
+                      >
                         <div className="w-4 border-b border-dashed border-[#333844] mr-1"></div>
                         {expandedNodes['simulation'] ? <ChevronDown size={14} className="mr-1 text-gray-400" /> : <ChevronRight size={14} className="mr-1 text-gray-400" />}
                         <Database size={14} className="mr-2 text-blue-400" />
@@ -1514,6 +1644,18 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
                           <Play size={12} fill="currentColor" />
                         </button>
                       </div>
+                      {/* 求解记录：跑过哪些算例、什么网格、结果多少。
+                          存在后端，所以被共享的人也能看到属主算过什么。 */}
+                      {expandedNodes['simulation'] && (
+                        <RunHistoryPanel
+                          list={runs}
+                          loading={runsLoading}
+                          error={runsError}
+                          canEdit={canEditProject(project)}
+                          onDelete={handleDeleteRun}
+                          deletingId={deletingRunId}
+                        />
+                      )}
 
                     </div>
                   )}

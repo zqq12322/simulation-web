@@ -1772,7 +1772,12 @@ check('缺失的量显示破折号', formatQuantity(null, 'max_stress') === '—
 
 check('考察量显示名用后端的', quantityLabel(study, 'max_stress') === '最大 von Mises 应力');
 check('没有名字时回落到键名', quantityLabel(study, 'unknown_q') === 'unknown_q');
-check('没有数据时也能取标签', quantityLabel(null, 'max_stress') === 'max_stress');
+// 没有 study（例如求解记录那条路径）时用本地兜底表，而不是把英文键名丢给用户
+check('没有数据时用本地兜底标签',
+      quantityLabel(null, 'max_stress') === '最大 von Mises 应力',
+      quantityLabel(null, 'max_stress'));
+check('兜底表里没有的量仍然原样返回',
+      quantityLabel(null, 'something_new') === 'something_new');
 
 // --- 逐级数表 -----------------------------------------------------------------
 const rows = studyRows(study);
@@ -2041,6 +2046,142 @@ check('扩展名里的非法字符被去掉',
 check('时间戳格式固定',
       filenameStamp(new Date(2026, 2, 18, 14, 25, 30)) === '20260318-142530',
       filenameStamp(new Date(2026, 2, 18, 14, 25, 30)));
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+def _check_frontend_runs_math(node: str) -> tuple[bool, str]:
+    """用 node 执行 `frontend/utils/runsApi.ts` 里的纯逻辑并断言其行为。"""
+    ok, detail = _run_node_module_selftest(node, _RUNS_API_SELFTEST)
+    return ok, ("列表映射 / 坏记录隔离 / 缺失≠0 / 网格与警告描述 均符合断言"
+                if ok else detail)
+
+
+#: 求解记录的读取与归一化（纯函数）。
+#:
+#: 重点钉三件事：
+#:   1. **坏记录逐条丢弃**，不是整份失败——一条坏数据不该让"历史记录"整块消失，
+#:      那正是用户最需要看到的证据；
+#:   2. **缺失 ≠ 0**：应力真的可以是 0，所以非有限值必须被丢掉而不是写成 0；
+#:   3. **摘要损坏要能标出来**：后端会返回 `summaryParseError`，界面据此提示，
+#:      否则用户会把"空摘要"读成"这次什么都没算出来"。
+_RUNS_API_SELFTEST = r"""
+import { describeAnalysisType, describeRunMesh, describeRunWarnings,
+         historyIsTrimmed, runQuantityNames, toRun, toRunList } from './runsApi.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+const raw = {
+  runs: [
+    {
+      id: 'run-1', projectId: 'p1', analysisType: 'structural', createdBy: 'alice',
+      createdAt: '2026-03-18T06:00:00+00:00',
+      summary: {
+        quantities: { max_stress: 6.5e7, max_displacement: 2.2e-6 },
+        mesh: { meshSize: 1.25, elements: 2735, nodes: 832 },
+        warnings: ['忽略了一个约束'], warningCount: 1,
+      },
+      summaryParseError: false,
+    },
+    {
+      id: 'run-2', projectId: 'p1', analysisType: 'modal', createdBy: null,
+      createdAt: '2026-03-18T06:05:00+00:00',
+      summary: {
+        quantities: { first_elastic_frequency: 1234.5 },
+        mesh: { elements: 100 }, warnings: [], warningCount: 0,
+      },
+      summaryParseError: false,
+    },
+  ],
+  total: 2,
+  limit: 50,
+};
+
+const list = toRunList(raw);
+check('列表能解析', list.runs.length === 2 && list.total === 2 && list.limit === 50,
+      JSON.stringify({ n: list.runs.length, total: list.total }));
+check('数值原样保留',
+      list.runs[0].summary.quantities.max_stress === 6.5e7
+      && list.runs[0].summary.mesh.elements === 2735);
+check('createdBy 可为 null', list.runs[1].createdBy === null);
+check('考察量名字排序稳定',
+      runQuantityNames(list.runs[0]).join(',') === 'max_displacement,max_stress',
+      runQuantityNames(list.runs[0]).join(','));
+
+// --- 坏记录逐条丢弃，不是整份失败 ---------------------------------------------
+check('缺 id 的记录被丢弃', toRun({ createdAt: 'x' }) === null);
+check('缺 createdAt 的记录被丢弃', toRun({ id: 'x' }) === null);
+check('null / 非对象被丢弃',
+      toRun(null) === null && toRun('x') === null && toRun(7) === null);
+const mixed = toRunList({ ...raw, runs: [raw.runs[0], null, { id: 'bad' }, raw.runs[1]] });
+check('坏记录被过滤，好记录保留', mixed.runs.length === 2,
+      String(mixed.runs.length));
+check('非数组 runs 得到空列表', toRunList({ runs: 'x' }).runs.length === 0);
+check('垃圾输入得到空列表',
+      toRunList(null).runs.length === 0 && toRunList('x').total === 0);
+
+// --- 缺失 ≠ 0 -----------------------------------------------------------------
+const dirty = toRun({
+  id: 'r', createdAt: 'x',
+  summary: { quantities: { max_stress: NaN, max_displacement: 0, bad: 'x', inf: Infinity } },
+});
+check('NaN / 字符串 / Infinity 被丢掉而不是写成 0',
+      !('max_stress' in dirty.summary.quantities)
+      && !('bad' in dirty.summary.quantities)
+      && !('inf' in dirty.summary.quantities),
+      JSON.stringify(dirty.summary.quantities));
+check('真的是 0 的数值保留下来（0 是有意义的）',
+      dirty.summary.quantities.max_displacement === 0,
+      JSON.stringify(dirty.summary.quantities));
+check('缺 summary 时不崩', toRun({ id: 'r', createdAt: 'x' }).summary.quantities
+      && Object.keys(toRun({ id: 'r', createdAt: 'x' }).summary.quantities).length === 0);
+
+// --- 摘要损坏要能标出来 -------------------------------------------------------
+const corrupt = toRun({ id: 'r', createdAt: 'x', summaryParseError: true, summary: {} });
+check('summaryParseError 透传', corrupt.summaryParseError === true);
+check('默认不是损坏', toRun({ id: 'r', createdAt: 'x' }).summaryParseError === false);
+
+// --- 描述文本 -----------------------------------------------------------------
+check('网格信息三种都给',
+      describeRunMesh(list.runs[0]) === '网格 1.25 · 2735 单元 · 832 节点',
+      describeRunMesh(list.runs[0]));
+check('缺网格字段时只显示有的',
+      describeRunMesh(list.runs[1]) === '100 单元', describeRunMesh(list.runs[1]));
+check('没有网格信息时返回空串',
+      describeRunMesh(toRun({ id: 'r', createdAt: 'x' })) === '');
+check('没有记录时描述为空', describeRunMesh(null) === '');
+
+check('分析类型中文名',
+      describeAnalysisType('structural') === '结构静力'
+      && describeAnalysisType('thermal') === '稳态热传导'
+      && describeAnalysisType('modal') === '模态',
+      describeAnalysisType('structural'));
+check('未知分析类型原样返回（不编造）',
+      describeAnalysisType('cfd') === 'cfd' && describeAnalysisType(null) === '未知类型');
+
+check('单条警告的措辞', describeRunWarnings(list.runs[0]).includes('1 条警告'),
+      describeRunWarnings(list.runs[0]));
+const manyWarnings = toRun({
+  id: 'r', createdAt: 'x',
+  summary: { quantities: {}, warnings: [], warningCount: 3 },
+});
+check('多条警告给出条数', describeRunWarnings(manyWarnings).includes('3 条警告'),
+      describeRunWarnings(manyWarnings));
+check('没有警告时不提示', describeRunWarnings(list.runs[1]) === null);
+check('没有记录时不提示', describeRunWarnings(null) === null);
+
+check('未达上限时不提示裁剪', historyIsTrimmed(list) === false);
+check('达到上限时提示裁剪',
+      historyIsTrimmed({ runs: [], total: 50, limit: 50 }) === true);
+check('没有数据时不算裁剪', historyIsTrimmed(null) === false);
 
 if (failures.length) {
   console.error('FAIL: ' + failures.join(' | '));
@@ -2488,6 +2629,9 @@ def task_verify(args: argparse.Namespace) -> int:
 
             passed, detail = _check_frontend_result_export(node_bin)
             check("结果导出（CSV/VTK 结构与精度，node 执行前端纯函数）", passed, detail)
+
+            passed, detail = _check_frontend_runs_math(node_bin)
+            check("求解记录显示逻辑（坏记录隔离，node 执行前端纯函数）", passed, detail)
         else:
             check("TypeScript 类型检查", False, "未找到 node")
 
@@ -3611,6 +3755,124 @@ def task_verify(args: argparse.Namespace) -> int:
                     headers=bob_headers,
                 ) == 403,
                 "被共享者不需要知道还有谁",
+            )
+
+            # --- 求解记录（run history）---------------------------------------
+            # 它服务两件事：被共享的人能看到"属主算过什么、什么网格、结果多少"，
+            # 以及跨网格/跨参数对比结果（收敛检查的自然下一步）。
+            # 权限沿用项目那一套：读 = can_read，写 = can_edit。
+            recorded = _http_json(
+                "POST",
+                f"{API_BASE}/api/projects/{created_id}/runs",
+                {
+                    "analysisType": "structural",
+                    "quantities": {"max_stress": 6.5e7, "max_displacement": 2.2e-6},
+                    "meshSize": 1.25,
+                    "elements": 2735,
+                    "nodes": 832,
+                    "warnings": [],
+                },
+                headers=alice_headers,
+            )
+            check(
+                "记录一次运行（属主）",
+                recorded.get("id")
+                and recorded.get("projectId") == created_id
+                and recorded.get("summary", {}).get("quantities", {}).get("max_stress")
+                == 6.5e7,
+                f"id={recorded.get('id')} createdAt={recorded.get('createdAt')}",
+            )
+            history = _http_json(
+                "GET", f"{API_BASE}/api/projects/{created_id}/runs",
+                headers=alice_headers,
+            )
+            check(
+                "历史记录里能读回同一条数值",
+                history.get("total") == 1
+                and history["runs"][0]["id"] == recorded["id"]
+                and history["runs"][0]["summary"]["quantities"]["max_displacement"]
+                == 2.2e-6,
+                f"total={history.get('total')}",
+            )
+            check(
+                "被共享者能看到历史（这正是共享的意义）",
+                _http_status(
+                    "GET", f"{API_BASE}/api/projects/{created_id}/runs",
+                    headers=bob_headers,
+                ) == 200,
+                "只读也要能看属主算过什么",
+            )
+            check(
+                "只读者不能记也不能删（403）",
+                _http_status(
+                    "POST", f"{API_BASE}/api/projects/{created_id}/runs",
+                    {"analysisType": "structural",
+                     "quantities": {"max_stress": 1.0, "max_displacement": 1.0}},
+                    headers=bob_headers,
+                ) == 403
+                and _http_status(
+                    "DELETE",
+                    f"{API_BASE}/api/projects/{created_id}/runs/{recorded['id']}",
+                    headers=bob_headers,
+                ) == 403,
+                "记录属于项目内容，写权与配置一致",
+            )
+            check(
+                "不存在的项目：读与写都是 404",
+                _http_status(
+                    "GET", f"{API_BASE}/api/projects/no-such-project/runs",
+                    headers=alice_headers,
+                ) == 404
+                and _http_status(
+                    "POST", f"{API_BASE}/api/projects/no-such-project/runs",
+                    {"analysisType": "structural",
+                     "quantities": {"max_stress": 1.0, "max_displacement": 1.0}},
+                    headers=alice_headers,
+                ) == 404,
+                "不存在与无权一律 404，不泄露存在性",
+            )
+            check(
+                "未登录访问运行记录被拒（401）",
+                _http_status(
+                    "GET", f"{API_BASE}/api/projects/{created_id}/runs"
+                ) == 401,
+                "与其它计算类端点一致",
+            )
+            # 拼错的考察量必须被拒：静默接受会变成"历史里这一项一直是空的"
+            check(
+                "拼错的考察量被拒（400，而不是静默存下来）",
+                _http_status(
+                    "POST", f"{API_BASE}/api/projects/{created_id}/runs",
+                    {"analysisType": "structural",
+                     "quantities": {"max_stress": 1.0, "max_displacement": 1.0,
+                                    "max_strss": 9.9}},
+                    headers=alice_headers,
+                ) == 400,
+                "多余/缺失的键都会被拒",
+            )
+            # NaN 不是合法 JSON：前端 JSON.parse 会直接抛错、整个列表打不开
+            check(
+                "非有限值被拒（400）",
+                _http_status(
+                    "POST", f"{API_BASE}/api/projects/{created_id}/runs",
+                    {"analysisType": "structural",
+                     "quantities": {"max_stress": float("nan"), "max_displacement": 1.0}},
+                    headers=alice_headers,
+                ) == 400,
+                "NaN 写进 JSON 会让浏览器解析失败",
+            )
+            check(
+                "删除记录（属主）",
+                _http_status(
+                    "DELETE",
+                    f"{API_BASE}/api/projects/{created_id}/runs/{recorded['id']}",
+                    headers=alice_headers,
+                ) == 204
+                and _http_json(
+                    "GET", f"{API_BASE}/api/projects/{created_id}/runs",
+                    headers=alice_headers,
+                ).get("total") == 0,
+                "删完 total 归零",
             )
 
             # 升级为 editor 之后就能改配置了——这才是"一起做"

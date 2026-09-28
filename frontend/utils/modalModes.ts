@@ -63,6 +63,27 @@ export function formatFrequency(hz: unknown): string {
 }
 
 /**
+ * 第一阶**弹性**模态的频率（Hz）；取不到时返回 `null`。
+ *
+ * 为什么不直接取 `frequencies[0]`：自由-自由结构的前若干阶是**刚体模态**
+ * （频率恒为 0，且与网格无关）。拿第 0 阶去记录或比较，会得到一个永远为 0
+ * 的"结果"——看着像算出来了，其实什么都没测。
+ *
+ * 这里与 `buildModeList` 共用同一份"哪些是刚体模态"的规则（都是
+ * `index < rigidBodyModes`），所以界面上的阶次标注与记录下来的频率不会打架。
+ */
+export function firstElasticFrequency(
+  frequencies: ArrayLike<number> | null | undefined,
+  rigidBodyModes = 0,
+): number | null {
+  if (!frequencies || frequencies.length === 0) return null;
+  const rigidCount = Math.max(0, Math.floor(Number(rigidBodyModes)) || 0);
+  const index = Math.min(rigidCount, frequencies.length - 1);
+  const value = Number(frequencies[index]);
+  return Number.isFinite(value) ? value : null;
+}
+
+/**
  * 生成模态列表。`rigidBodyModes` 来自后端（`rigid_body_modes`），
  * 表示前多少阶是频率≈0 的刚体模态。
  */

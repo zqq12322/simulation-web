@@ -199,6 +199,9 @@ cd frontend && npm run dev
 | GET | `/api/jobs/{job_id}` | 查询任务状态与结果（`queued`/`running`/`succeeded`/`failed`） |
 | GET | `/api/jobs` | 列出最近的任务与队列状态 |
 | POST | `/api/validate-setup` | 求解前校验（材料、约束、载荷是否齐全） |
+| GET | `/api/projects/{id}/runs` | **求解记录**：这个项目跑过哪些算例、各自什么网格、结果多少（**有读权限就能看**，所以被共享者能看到属主算过什么） |
+| POST | `/api/projects/{id}/runs` | 记一条求解记录（**属主 / editor**；只提交标量，不提交位移/应力数组） |
+| DELETE | `/api/projects/{id}/runs/{run_id}` | 删除一条记录（属主 / editor） |
 | POST | `/api/ai/chat` | AI 问答 |
 | POST | `/api/ai/diagnose` | AI 诊断仿真设置/报错 |
 | POST | `/api/ai/configure` | 自然语言 → 结构化仿真参数 JSON |
@@ -208,8 +211,8 @@ cd frontend && npm run dev
 已验证通过：
 
 - `tsc --noEmit` 无错误；`vite build` 成功；
-- **`python3 tools/tasks.py test`：424 个后端用例全部通过**（约 14 秒，无需启动服务器）；
-- **`python3 tools/tasks.py verify`：117 项端到端检查全部通过**；
+- **`python3 tools/tasks.py test`：467 个后端用例全部通过**（约 14 秒，无需启动服务器）；
+- **`python3 tools/tasks.py verify`：127 项端到端检查全部通过**；
 - 全流程跑通：上传 → 网格 → 求解 → 云图（含变形显示）；
 - 求解器物理正确性抽查：10×10×10 立方体轴向拉伸，加载面中心位移 `4.17e-10` vs 解析解 `FL/AE = 5e-10`（比值 0.835，全约束端略刚于自由杆，符合预期）；支反力合计与施加载荷精确抵消。
 

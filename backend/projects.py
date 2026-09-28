@@ -30,6 +30,7 @@ from config import SIMULATION_SETUP_MAX_BCS, SIMULATION_SETUP_MAX_BYTES, resolve
 from constraints import BoundaryCondition
 from logging_config import get_logger
 from project_store import ROLE_OWNER, SHARE_ROLES, SIMULATION_TYPES, get_store
+from runs import get_run_store
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -309,6 +310,11 @@ async def delete_project(project_id: str, user: dict = OwnedUser):
     """删除自己的项目；不存在或不属于自己时返回 404。"""
     if not get_store().delete(project_id, user["id"]):
         raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+    # 求解记录跟着一起删：留着就是孤儿行，会一直占空间且再也无人能访问
+    # （运行记录端点第一步就要查项目权限，项目没了就永远是 404）。
+    removed = get_run_store().delete_for_project(project_id)
+    if removed:
+        logger.info("删除项目 %s 时一并清掉 %d 条运行记录", project_id, removed)
     return {"deleted": True, "id": project_id}
 
 

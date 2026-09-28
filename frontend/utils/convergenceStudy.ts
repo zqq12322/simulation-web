@@ -230,11 +230,20 @@ export function formatOrder(value: unknown): string {
 }
 
 /** 考察量的显示名（后端给了就用后端的）。 */
+export const QUANTITY_LABELS: Record<string, string> = {
+  max_stress: '最大 von Mises 应力',
+  max_displacement: '最大位移',
+  max_heat_flux: '最大热流密度',
+  max_temperature: '最高温度',
+  first_elastic_frequency: '第一阶弹性频率',
+};
+
+/** 考察量的显示名：优先用后端给的，其次用本地的兜底表，最后原样返回键名。 */
 export function quantityLabel(study: ConvergenceStudy | null, name: string): string {
   if (study && study.labels && typeof study.labels[name] === 'string') {
     return study.labels[name];
   }
-  return name;
+  return QUANTITY_LABELS[name] || name;
 }
 
 /** 状态徽标的文案与色调（四态，**不能**压成两种）。 */
