@@ -775,8 +775,8 @@ console.log('OK');
 
 def _check_frontend_deformation_math(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/deformation.ts` 里的纯函数并断言其行为。"""
-    ok, detail = _run_node_module_selftest(node, _DEFORMATION_SELFTEST)
-    return ok, ("放大系数 / 属性长度 / 退化输入 均符合断言" if ok else detail)
+    passed, detail = _run_node_module_selftest(node, _DEFORMATION_SELFTEST)
+    return passed, ("放大系数 / 属性长度 / 退化输入 均符合断言" if passed else detail)
 
 
 #: 模态阶次列表 / 频率格式化 / 振型取场的断言（纯函数，喂构造数据）。
@@ -928,8 +928,8 @@ console.log('OK');
 
 def _check_frontend_modal_math(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/modalModes.ts` 里的纯函数并断言其行为。"""
-    ok, detail = _run_node_module_selftest(node, _MODAL_MODES_SELFTEST)
-    return ok, ("阶次列表 / 频率格式化 / 振型取场 均符合断言" if ok else detail)
+    passed, detail = _run_node_module_selftest(node, _MODAL_MODES_SELFTEST)
+    return passed, ("阶次列表 / 频率格式化 / 振型取场 均符合断言" if passed else detail)
 
 
 #: 项目列表的"接口 → 界面"映射断言。
@@ -1065,8 +1065,8 @@ console.log('OK');
 
 def _check_frontend_projects_math(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/projectsApi.ts` 里的纯函数并断言其行为。"""
-    ok, detail = _run_node_module_selftest(node, _PROJECTS_API_SELFTEST)
-    return ok, ("记录映射 / 时间戳解析 / 错误翻译 均符合断言" if ok else detail)
+    passed, detail = _run_node_module_selftest(node, _PROJECTS_API_SELFTEST)
+    return passed, ("记录映射 / 时间戳解析 / 错误翻译 均符合断言" if passed else detail)
 
 
 #: 认证工具的断言：令牌存取、字段映射、请求头、401 与"连不上"的区分。
@@ -1218,8 +1218,8 @@ console.log('OK');
 
 def _check_frontend_auth_math(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/authApi.ts` 里的纯函数并断言其行为。"""
-    ok, detail = _run_node_module_selftest(node, _AUTH_API_SELFTEST)
-    return ok, ("令牌存取 / 请求头 / 错误区分 均符合断言" if ok else detail)
+    passed, detail = _run_node_module_selftest(node, _AUTH_API_SELFTEST)
+    return passed, ("令牌存取 / 请求头 / 错误区分 均符合断言" if passed else detail)
 
 
 #: 项目配置（自动保存）的纯逻辑断言。
@@ -1346,8 +1346,8 @@ console.log('OK');
 
 def _check_frontend_project_setup_math(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/projectSetup.ts` 里的纯函数并断言其行为。"""
-    ok, detail = _run_node_module_selftest(node, _PROJECT_SETUP_SELFTEST)
-    return ok, ("组装 / 稳定签名 / 恢复校验 / 状态文案 均符合断言" if ok else detail)
+    passed, detail = _run_node_module_selftest(node, _PROJECT_SETUP_SELFTEST)
+    return passed, ("组装 / 稳定签名 / 恢复校验 / 状态文案 均符合断言" if passed else detail)
 
 
 #: 几何取用逻辑（带认证的 blob 加载）断言。
@@ -1498,8 +1498,8 @@ console.log('OK');
 
 def _check_frontend_model_source_math(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/modelSource.ts` 里的纯逻辑并断言其行为。"""
-    ok, detail = _run_node_module_selftest(node, _MODEL_SOURCE_SELFTEST)
-    return ok, ("下载地址 / 预览名规则 / 失败路径 均符合断言" if ok else detail)
+    passed, detail = _run_node_module_selftest(node, _MODEL_SOURCE_SELFTEST)
+    return passed, ("下载地址 / 预览名规则 / 失败路径 均符合断言" if passed else detail)
 
 
 #: 网格质量的显示逻辑（纯函数）。
@@ -1654,8 +1654,8 @@ console.log('OK');
 
 def _check_frontend_mesh_quality_math(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/meshQuality.ts` 里的纯逻辑并断言其行为。"""
-    ok, detail = _run_node_module_selftest(node, _MESH_QUALITY_SELFTEST)
-    return ok, ("缺失≠0 / 完整映射 / 直方图自洽性 均符合断言" if ok else detail)
+    passed, detail = _run_node_module_selftest(node, _MESH_QUALITY_SELFTEST)
+    return passed, ("缺失≠0 / 完整映射 / 直方图自洽性 均符合断言" if passed else detail)
 
 
 #: 收敛检查的显示逻辑（纯函数）。
@@ -1853,8 +1853,8 @@ console.log('OK');
 
 def _check_frontend_convergence_study_math(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/convergenceStudy.ts` 里的纯逻辑并断言其行为。"""
-    ok, detail = _run_node_module_selftest(node, _CONVERGENCE_STUDY_SELFTEST)
-    return ok, ("四态区分 / 缺失≠0 / 单位换算 / 趋势图横轴 均符合断言" if ok else detail)
+    passed, detail = _run_node_module_selftest(node, _CONVERGENCE_STUDY_SELFTEST)
+    return passed, ("四态区分 / 缺失≠0 / 单位换算 / 趋势图横轴 均符合断言" if passed else detail)
 
 
 #: 结果导出（CSV / VTK）的纯逻辑。
@@ -2057,9 +2057,9 @@ console.log('OK');
 
 def _check_frontend_clip_plane(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/clipPlane.ts` 里的纯逻辑并断言其行为。"""
-    ok, detail = _run_node_module_selftest(node, _CLIP_PLANE_SELFTEST)
-    return ok, ("平面方程符号 / 节点分类精确值 / 退化与非法输入 均符合断言"
-                if ok else detail)
+    passed, detail = _run_node_module_selftest(node, _CLIP_PLANE_SELFTEST)
+    return passed, ("平面方程符号 / 节点分类精确值 / 退化与非法输入 均符合断言"
+                if passed else detail)
 
 
 #: 剖切面的几何（纯函数）。
@@ -2192,9 +2192,9 @@ console.log('OK');
 
 def _check_frontend_runs_math(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/runsApi.ts` 里的纯逻辑并断言其行为。"""
-    ok, detail = _run_node_module_selftest(node, _RUNS_API_SELFTEST)
-    return ok, ("列表映射 / 坏记录隔离 / 缺失≠0 / 网格与警告描述 均符合断言"
-                if ok else detail)
+    passed, detail = _run_node_module_selftest(node, _RUNS_API_SELFTEST)
+    return passed, ("列表映射 / 坏记录隔离 / 缺失≠0 / 网格与警告描述 均符合断言"
+                if passed else detail)
 
 
 #: 求解记录的读取与归一化（纯函数）。
@@ -2378,9 +2378,9 @@ console.log('OK');
 
 def _check_frontend_result_export(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/resultExport.ts` 里的纯逻辑并断言其行为。"""
-    ok, detail = _run_node_module_selftest(node, _RESULT_EXPORT_SELFTEST)
-    return ok, ("CSV/VTK 结构 / 精确往返 / 不自洽时拒绝导出 / 文件名清洗 均符合断言"
-                if ok else detail)
+    passed, detail = _run_node_module_selftest(node, _RESULT_EXPORT_SELFTEST)
+    return passed, ("CSV/VTK 结构 / 精确往返 / 不自洽时拒绝导出 / 文件名清洗 均符合断言"
+                if passed else detail)
 
 
 #: 用 node 把**真实求解结果**写成 CSV/VTK 文件（路径由环境变量给出）。
@@ -2524,7 +2524,7 @@ def _check_result_export_roundtrip(
         with open(payload_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
 
-        ok, detail = _run_node_module_selftest(
+        passed, detail = _run_node_module_selftest(
             node,
             _EXPORT_REAL_RESULT_SCRIPT,
             {
@@ -2691,7 +2691,7 @@ def _check_convergence_study_display_chain(node: str, payload: dict) -> tuple[bo
         path = handle.name
 
     try:
-        ok, detail = _run_node_module_selftest(
+        passed, detail = _run_node_module_selftest(
             node,
             _CONVERGENCE_STUDY_DISPLAY_CHAIN_SELFTEST,
             {"SIMCLOUD_STUDY_PAYLOAD": path},
@@ -2699,10 +2699,10 @@ def _check_convergence_study_display_chain(node: str, payload: dict) -> tuple[bo
     finally:
         os.unlink(path)
 
-    return ok, (
+    return passed, (
         f"{payload.get('status')}，{len(payload.get('levels') or [])} 级 × "
         f"{len(payload.get('quantities') or [])} 个考察量，解析与作图均通过"
-        if ok else detail
+        if passed else detail
     )
 
 
@@ -2717,7 +2717,7 @@ def _check_mesh_quality_display_chain(node: str, payload: dict) -> tuple[bool, s
         path = handle.name
 
     try:
-        ok, detail = _run_node_module_selftest(
+        passed, detail = _run_node_module_selftest(
             node,
             _MESH_QUALITY_DISPLAY_CHAIN_SELFTEST,
             {"SIMCLOUD_MESH_QUALITY_PAYLOAD": path},
@@ -2726,8 +2726,8 @@ def _check_mesh_quality_display_chain(node: str, payload: dict) -> tuple[bool, s
         os.unlink(path)
 
     stats = payload.get("quality") or {}
-    return ok, (f"{payload.get('elements', 0)} 单元，最低质量 {stats.get('min')}，"
-                f"直方图与解析链均通过" if ok else detail)
+    return passed, (f"{payload.get('elements', 0)} 单元，最低质量 {stats.get('min')}，"
+                f"直方图与解析链均通过" if passed else detail)
 
 
 
@@ -2748,7 +2748,7 @@ def _check_modal_display_chain(node: str, payload: dict) -> tuple[bool, str]:
         path = handle.name
 
     try:
-        ok, detail = _run_node_module_selftest(
+        passed, detail = _run_node_module_selftest(
             node,
             _MODAL_DISPLAY_CHAIN_SELFTEST,
             {"SIMCLOUD_MODAL_PAYLOAD": path},
@@ -2756,8 +2756,8 @@ def _check_modal_display_chain(node: str, payload: dict) -> tuple[bool, str]:
     finally:
         os.unlink(path)
 
-    return ok, (f"{payload.get('nodes', 0)} 节点 × {len(payload.get('frequencies') or [])} 阶，"
-                f"取场与归一化均通过" if ok else detail)
+    return passed, (f"{payload.get('nodes', 0)} 节点 × {len(payload.get('frequencies') or [])} 阶，"
+                f"取场与归一化均通过" if passed else detail)
 
 
 #: 文档里"**当前**总数"的写法。
@@ -2857,6 +2857,55 @@ def check_undefined_names(paths: list) -> tuple:
     if completed.returncode != 0 or lines:
         return False, "；".join(line.split(":", 1)[-1].strip() for line in lines[:5])
     return True, f"{len(paths)} 个文件没有未定义名字或未使用导入"
+
+
+def check_helper_shadowing(path: Path) -> tuple:
+    """
+    模块级的助手函数不能在函数体里被同名局部变量/参数覆盖。
+
+    这一类错误 **pyflakes 查不出来**（语法完全合法），而后果这一轮真实发生了：
+    `task_clone_verify` 里写了个局部 `ok = True`，把模块级的 `ok()` 助手遮住，
+    于是任务把单元测试与 verify 全部跑完、打印"全部通过"，最后在 `ok("…")` 上
+    抛 `TypeError: 'bool' object is not callable`，**以非零退出码汇报成功**。
+
+    一个验证工具用错误的退出码汇报结果，比它直接报错更危险——所以这里用标准库
+    `ast` 做一次针对性检查（不依赖 pyflakes，因此任何环境都生效）。
+
+    只做"模块级函数名 vs 函数体内赋值/参数"这一层，不做完整的遮蔽分析：
+    目标是把踩过的这个坑钉住，不是重写一个 linter。
+    """
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    helpers = {
+        node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    clashes = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        arguments = [
+            argument.arg
+            for argument in (
+                node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+            )
+        ]
+        targets = []
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Assign):
+                targets.extend(inner.targets)
+            elif isinstance(inner, (ast.AnnAssign, ast.AugAssign)):
+                targets.append(inner.target)
+        names = set(arguments)
+        for target in targets:
+            names.update(
+                sub.id for sub in ast.walk(target) if isinstance(sub, ast.Name)
+            )
+        for name in sorted(names & helpers):
+            clashes.append(f"{node.name}() 里的 {name}")
+    if clashes:
+        return False, "；".join(sorted(set(clashes))[:5])
+    return True, f"{len(helpers)} 个模块级助手没有被局部变量遮蔽"
 
 
 def task_verify(args: argparse.Namespace) -> int:
@@ -4436,6 +4485,14 @@ def task_verify(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 - 这个闸门自己不许把 verify 弄崩
         check("任务脚本无未定义名字（pyflakes）", False, f"{type(exc).__name__}: {exc}")
 
+    # 模块级助手被同名局部变量遮住——pyflakes 查不出来，但会让任务**用错误的
+    # 退出码汇报结果**（本轮真实踩到）。这条只用标准库，任何环境都生效。
+    try:
+        passed, detail = check_helper_shadowing(ROOT / "tools" / "tasks.py")
+        check("任务脚本的助手没有被局部变量遮蔽", passed, detail)
+    except Exception as exc:  # noqa: BLE001
+        check("任务脚本的助手没有被局部变量遮蔽", False, f"{type(exc).__name__}: {exc}")
+
     # --- 验证工具自己也会撒谎 ------------------------------------------------
     # `clone-verify` 靠 `summarise_verify` 判断克隆里到底过没过。这个解析一旦
     # 写错（比如把 FAIL 漏掉），它会**谎报成功**——一个验证工具谎报验证结果，
@@ -4638,7 +4695,7 @@ def task_clone_verify(args: argparse.Namespace) -> int:
     workdir = Path(tempfile.mkdtemp(prefix="dsh-clone-verify-"))
     clone = workdir / "repo"
     server = None
-    ok = True
+    all_good = True
     try:
         info(f"克隆到 {clone} …")
         completed = subprocess.run(
@@ -4666,7 +4723,7 @@ def task_clone_verify(args: argparse.Namespace) -> int:
         for line in tail[-4:]:
             print(f"    {line}")
         if unit.returncode != 0:
-            ok = False
+            all_good = False
             fail("克隆里的后端测试**失败**——有测试依赖了不进版本库的生成物？")
             for line in (unit.stderr or "").splitlines()[-12:]:
                 print(f"    ! {line}")
@@ -4708,7 +4765,7 @@ def task_clone_verify(args: argparse.Namespace) -> int:
             except (urllib.error.URLError, OSError):
                 time.sleep(1)
         if not healthy:
-            ok = False
+            all_good = False
             fail("克隆的后端没起来，日志尾部：")
             print(log_path.read_text(encoding="utf-8", errors="replace")[-1500:])
         else:
@@ -4727,7 +4784,7 @@ def task_clone_verify(args: argparse.Namespace) -> int:
             for line in text.splitlines()[-4:]:
                 print(f"    {line}")
             if verified.returncode != 0 or summary["failed"]:
-                ok = False
+                all_good = False
                 fail(
                     f"克隆里的 verify 失败：PASS {summary['passed']} / "
                     f"FAIL {summary['failed']}"
@@ -4751,7 +4808,7 @@ def task_clone_verify(args: argparse.Namespace) -> int:
             shutil.rmtree(workdir, ignore_errors=True)
 
     print()
-    if ok:
+    if all_good:
         ok("干净检出可以跑通：单元测试 + 端到端验证")
         return 0
     fail("干净检出**跑不通**——上面列出的失败项在别人 clone 之后同样会失败")
