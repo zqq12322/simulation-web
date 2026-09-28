@@ -1658,6 +1658,302 @@ def _check_frontend_mesh_quality_math(node: str) -> tuple[bool, str]:
     return ok, ("缺失≠0 / 完整映射 / 直方图自洽性 均符合断言" if ok else detail)
 
 
+#: 收敛检查的显示逻辑（纯函数）。
+#:
+#: 重点钉三件事：
+#:   1. **四态不能压成两种**——`marginal`（在趋稳但没到阈值）既不是通过也
+#:      不是失败，而它恰恰是最常见的状态；
+#:   2. **缺失 ≠ 0**——收敛检查里的 0 有意义（"最后一级变化 0%"），
+#:      所以 `null` / 非数字必须显示成 `—`；
+#:   3. **趋势图的横轴用实测单元数折算的 h**，不用"第几级"——各级实际加密
+#:      幅度并不相等，按级数画会把不等距的点画成等距，看着像漂亮的收敛曲线。
+_CONVERGENCE_STUDY_SELFTEST = r"""
+import { describeStudyStatus, describeStudySummary, formatNumber, formatOrder,
+         formatPercent, formatQuantity, quantityLabel, studyRows,
+         toConvergenceStudy, trendPoints } from './convergenceStudy.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+// 一份与后端响应同形的数据（字段名照抄 /api/convergence/study）
+const raw = {
+  status: 'marginal',
+  analysis_type: 'structural',
+  primary: 'max_stress',
+  quantities: ['max_stress', 'max_displacement'],
+  labels: { max_stress: '最大 von Mises 应力', max_displacement: '最大位移' },
+  levels: [
+    { label: 'mesh_size=3', mesh_size: 3, elements: 426, nodes: 145,
+      quantities: { max_stress: 29.02e6, max_displacement: 1.084e-9 } },
+    { label: 'mesh_size=1.5', mesh_size: 1.5, elements: 1366, nodes: 467,
+      quantities: { max_stress: 39.80e6, max_displacement: 1.264e-9 } },
+    { label: 'mesh_size=0.75', mesh_size: 0.75, elements: 9462, nodes: 2430,
+      quantities: { max_stress: 55.65e6, max_displacement: 1.617e-9 } },
+    { label: 'mesh_size=0.375', mesh_size: 0.375, elements: 66837, nodes: 12000,
+      quantities: { max_stress: 68.87e6, max_displacement: 1.826e-9 } },
+  ],
+  assessments: {
+    max_stress: {
+      label: '最大 von Mises 应力', values: [29.02e6, 39.80e6, 55.65e6, 68.87e6],
+      differences: [10.78e6, 15.85e6, 13.22e6], levels: 4, monotone: true,
+      observed_order: 0.295, order_estimator: 'generalized',
+      extrapolated_limit: 131.2e6, last_relative_change: 0.1919687,
+      converged: true, verdict: '…', mode: null,
+    },
+    max_displacement: {
+      label: '最大位移', values: [1.084e-9, 1.264e-9, 1.617e-9, 1.826e-9],
+      differences: [1.80e-10, 3.53e-10, 2.09e-10], levels: 4, monotone: true,
+      observed_order: 0.822, order_estimator: 'generalized',
+      extrapolated_limit: 2.12e-9, last_relative_change: 0.11456,
+      converged: true, verdict: '…', mode: null,
+    },
+  },
+  tolerance: 0.05,
+  verdict: '所有考察量都在单调趋稳，但最大 von Mises 应力最后一级仍变化 19.20%…',
+  notes: ['本检查是**自收敛**：…', '…应力奇异…', '…临时副本…'],
+  warnings: [],
+};
+
+const study = toConvergenceStudy(raw);
+check('能解析后端响应', study !== null);
+check('字段名映射（snake_case -> camelCase）',
+      study.primary === 'max_stress' && study.tolerance === 0.05
+      && study.levels[3].meshSize === 0.375 && study.levels[3].elements === 66837,
+      JSON.stringify({ primary: study.primary, tol: study.tolerance }));
+check('考察量顺序保留', study.quantities.join(',') === 'max_stress,max_displacement');
+check('判定被解析并映射',
+      study.assessments.max_stress.orderEstimator === 'generalized'
+      && study.assessments.max_stress.observedOrder === 0.295
+      && study.assessments.max_stress.lastRelativeChange === 0.1919687);
+check('说明与警告数组保留',
+      study.notes.length === 3 && study.warnings.length === 0);
+
+// --- 四态不能压成两种 ---------------------------------------------------------
+const states = ['converged', 'marginal', 'not-converged', 'insufficient']
+  .map(status => describeStudyStatus(status));
+check('四态各有文案', new Set(states.map(item => item.label)).size === 4,
+      JSON.stringify(states.map(item => item.label)));
+check('marginal 既不是绿也不是红',
+      describeStudyStatus('marginal').tone === 'warn',
+      describeStudyStatus('marginal').tone);
+check('not-converged 是坏', describeStudyStatus('not-converged').tone === 'bad');
+check('级数不足单独一态（不当作失败）',
+      describeStudyStatus('insufficient').tone === 'info'
+      && describeStudyStatus('insufficient').label.includes('无法判断'));
+check('未知状态有兜底', describeStudyStatus('nonsense').tone === 'info');
+
+// --- 缺失 ≠ 0 -----------------------------------------------------------------
+check('数值 0 显示成 0', formatNumber(0) === '0', formatNumber(0));
+check('缺失显示破折号',
+      formatNumber(null) === '—' && formatNumber(undefined) === '—'
+      && formatNumber('1') === '—' && formatNumber(NaN) === '—');
+check('百分比 0 显示成 0.00%', formatPercent(0) === '0.00%', formatPercent(0));
+check('百分比缺失显示破折号', formatPercent(null) === '—' && formatPercent('x') === '—');
+check('收敛阶 0 与「无法判断」分开',
+      formatOrder(0) === '0.00' && formatOrder(null) === '无法判断'
+      && formatOrder(undefined) === '无法判断',
+      `${formatOrder(0)} / ${formatOrder(null)}`);
+
+// --- 单位换算（后端一律 SI） ---------------------------------------------------
+check('应力 Pa -> MPa', formatQuantity(29.02e6, 'max_stress').endsWith('MPa'),
+      formatQuantity(29.02e6, 'max_stress'));
+check('应力换算数值正确',
+      formatQuantity(1e6, 'max_stress') === '1.000 MPa',
+      formatQuantity(1e6, 'max_stress'));
+check('位移 m -> mm', formatQuantity(1e-3, 'max_displacement') === '1.000 mm',
+      formatQuantity(1e-3, 'max_displacement'));
+check('温度用 K（与结论里的相对变化口径一致）',
+      formatQuantity(373.15, 'max_temperature') === '373.1 K',
+      formatQuantity(373.15, 'max_temperature'));
+check('未知量走通用格式', formatQuantity(3.5, 'something_else') === '3.500');
+check('缺失的量显示破折号', formatQuantity(null, 'max_stress') === '—');
+
+check('考察量显示名用后端的', quantityLabel(study, 'max_stress') === '最大 von Mises 应力');
+check('没有名字时回落到键名', quantityLabel(study, 'unknown_q') === 'unknown_q');
+check('没有数据时也能取标签', quantityLabel(null, 'max_stress') === 'max_stress');
+
+// --- 逐级数表 -----------------------------------------------------------------
+const rows = studyRows(study);
+check('表行数与级别数一致', rows.length === 4, String(rows.length));
+check('表里带格式化后的数值（SI -> 显示单位）',
+      rows[0].formatted.max_stress === '29.02 MPa'
+      && rows[0].formatted.max_displacement === '1.08e-6 mm',
+      JSON.stringify(rows[0].formatted));
+check('没有数据时表为空', studyRows(null).length === 0);
+
+// --- 趋势图 -------------------------------------------------------------------
+const points = trendPoints(study, 'max_stress');
+check('趋势图有 4 个点', points.length === 4, String(points.length));
+check('横轴最粗为 0、最细为 1',
+      Math.abs(points[0].x) < 1e-12 && Math.abs(points[points.length - 1].x - 1) < 1e-12,
+      points.map(point => point.x.toFixed(3)).join(','));
+check('横轴按单元数（不是按第几级）排列',
+      points.every((point, index) => index === 0 || point.x > points[index - 1].x),
+      points.map(point => point.x.toFixed(3)).join(','));
+// 各级实际加密幅度不等 ⇒ 横轴**不是**等距的。这条把"按级数画"钉死：
+// 若误用级数下标归一化，第二个点会是 0.333，而按单元数应是 0.230。
+check('横轴不等距（证明用的是单元数而不是级数下标）',
+      Math.abs(points[1].x - 1 / 3) > 0.05,
+      `x[1]=${points[1].x.toFixed(4)}（等距应为 0.3333）`);
+check('纵轴归一化到 [0.1, 0.9] 之内',
+      points.every(point => point.y >= 0.1 - 1e-12 && point.y <= 0.9 + 1e-12),
+      points.map(point => point.y.toFixed(3)).join(','));
+check('数值最大的点画在最上方',
+      points[3].y > points[0].y && Math.abs(points[3].y - 0.9) < 1e-12,
+      String(points[3].y));
+check('全部相同时不画成斜线（返回平的中线）',
+      trendPoints({ ...study, levels: study.levels.map(level => ({
+        ...level, quantities: { max_stress: 5, max_displacement: 1 },
+      })) }, 'max_stress').every(point => Math.abs(point.y - 0.5) < 1e-12));
+check('只有一个点时不给图', trendPoints({ ...study, levels: [study.levels[0]] },
+      'max_stress').length === 0);
+check('缺数据时不给图', trendPoints(null, 'max_stress').length === 0);
+
+// --- 摘要 ---------------------------------------------------------------------
+const summary = describeStudySummary(study);
+check('摘要给出级数', summary.includes('4 级网格'), summary);
+check('摘要给出最后一级变化', summary.includes('19.20%'), summary);
+check('没有数据时的摘要不说「已收敛」',
+      describeStudySummary(null) === '尚未检查', describeStudySummary(null));
+check('零级时说明没取到级别',
+      describeStudySummary({ ...study, levels: [] }).includes('没有取得'),
+      describeStudySummary({ ...study, levels: [] }));
+
+// --- 不可用输入一律返回 null（宁可什么都不显示，也不要显示编造的结论）---------
+check('null / 非对象返回 null',
+      toConvergenceStudy(null) === null && toConvergenceStudy('x') === null
+      && toConvergenceStudy(7) === null);
+check('没有 status 返回 null', toConvergenceStudy({ ...raw, status: undefined }) === null);
+check('failed 返回 null', toConvergenceStudy({ ...raw, status: 'failed' }) === null);
+check('缺 levels 返回 null', toConvergenceStudy({ ...raw, levels: undefined }) === null);
+check('缺 assessments 返回 null',
+      toConvergenceStudy({ ...raw, assessments: undefined }) === null);
+check('非 insufficient 却没有级别时返回 null',
+      toConvergenceStudy({ ...raw, levels: [] }) === null);
+check('insufficient 允许零级（第一级就超上限时确实可能是 0 级）',
+      toConvergenceStudy({ ...raw, status: 'insufficient', levels: [], assessments: {} })
+      !== null);
+check('级别里缺 elements 视为坏数据',
+      toConvergenceStudy({ ...raw, levels: [{ label: 'x', mesh_size: 1 }] }) === null);
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+def _check_frontend_convergence_study_math(node: str) -> tuple[bool, str]:
+    """用 node 执行 `frontend/utils/convergenceStudy.ts` 里的纯逻辑并断言其行为。"""
+    ok, detail = _run_node_module_selftest(node, _CONVERGENCE_STUDY_SELFTEST)
+    return ok, ("四态区分 / 缺失≠0 / 单位换算 / 趋势图横轴 均符合断言" if ok else detail)
+
+
+#: 把**后端真实返回**的收敛检查结果喂给前端解析逻辑。
+#:
+#: 与网格质量、模态那两条同理：后端字段一旦改名（`last_relative_change` →
+#: `lastRelativeChange`），界面只会静默地少显示一项，不报错、不影响任何数值。
+#: 只有拿真实响应跑一遍前端的解析才能发现。
+_CONVERGENCE_STUDY_DISPLAY_CHAIN_SELFTEST = r"""
+import { readFileSync } from 'node:fs';
+import { describeStudyStatus, describeStudySummary, studyRows,
+         toConvergenceStudy, trendPoints } from './convergenceStudy.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+const raw = JSON.parse(readFileSync(process.env.SIMCLOUD_STUDY_PAYLOAD, 'utf8'));
+const study = toConvergenceStudy(raw);
+
+check('真实响应能被前端解析（否则界面什么都不显示）', study !== null);
+if (study) {
+  check('分析类型一致', study.analysisType === raw.analysis_type, study.analysisType);
+  check('级数一致', study.levels.length === raw.levels.length,
+        `${study.levels.length} vs ${raw.levels.length}`);
+  check('单元数逐级一致',
+        study.levels.every((level, index) => level.elements === raw.levels[index].elements));
+  check('主考察量在主考察量列表里', study.quantities.includes(study.primary),
+        `${study.primary} in ${study.quantities}`);
+  check('每个考察量都有判定',
+        study.quantities.every(name => study.assessments[name] !== undefined),
+        JSON.stringify(Object.keys(study.assessments)));
+  check('逐级数值个数与级数一致',
+        study.quantities.every(
+          name => study.assessments[name].values.length === study.levels.length));
+  check('四态之一是已知状态',
+        ['converged', 'marginal', 'not-converged', 'insufficient']
+          .includes(study.status) || study.status === 'insufficient',
+        study.status);
+  check('状态能翻译成界面文案',
+        describeStudyStatus(study.status).label.length > 0);
+  check('结论非空', study.verdict.length > 0);
+  check('摘要能直接显示',
+        describeStudySummary(study).includes(`${study.levels.length} 级网格`)
+        || study.levels.length === 0,
+        describeStudySummary(study));
+  check('说明里带着「自收敛」这条限定',
+        study.notes.some(note => note.includes('自收敛')),
+        `${study.notes.length} 条说明`);
+  check('说明里点出应力奇异',
+        study.notes.some(note => note.includes('应力奇异')));
+  check('每级的每个考察量都能格式化出非空文本',
+        studyRows(study).every(row =>
+          study.quantities.every(name => {
+            const text = row.formatted[name];
+            return typeof text === 'string' && text.length > 0;
+          })));
+  // 趋势图：有 2 级以上就应该能画，且横轴从 0 递增到 1
+  if (study.levels.length >= 2) {
+    const points = trendPoints(study, study.primary);
+    check('趋势图点数与级数一致', points.length === study.levels.length,
+          `${points.length} vs ${study.levels.length}`);
+    check('趋势图横轴从 0 递增到 1',
+          Math.abs(points[0].x) < 1e-9
+          && Math.abs(points[points.length - 1].x - 1) < 1e-9
+          && points.every((point, index) => index === 0 || point.x > points[index - 1].x),
+          points.map(point => point.x.toFixed(3)).join(','));
+  }
+}
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+def _check_convergence_study_display_chain(node: str, payload: dict) -> tuple[bool, str]:
+    """把后端真实返回的收敛检查结果喂给前端解析逻辑（字段改名会在这里暴露）。"""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".json", delete=False, encoding="utf-8"
+    ) as handle:
+        json.dump(payload, handle)
+        path = handle.name
+
+    try:
+        ok, detail = _run_node_module_selftest(
+            node,
+            _CONVERGENCE_STUDY_DISPLAY_CHAIN_SELFTEST,
+            {"SIMCLOUD_STUDY_PAYLOAD": path},
+        )
+    finally:
+        os.unlink(path)
+
+    return ok, (
+        f"{payload.get('status')}，{len(payload.get('levels') or [])} 级 × "
+        f"{len(payload.get('quantities') or [])} 个考察量，解析与作图均通过"
+        if ok else detail
+    )
+
+
 def _check_mesh_quality_display_chain(node: str, payload: dict) -> tuple[bool, str]:
     """把后端真实返回的网格质量喂给前端解析逻辑（字段改名会在这里暴露）。"""
     import tempfile
@@ -1760,6 +2056,9 @@ def task_verify(args: argparse.Namespace) -> int:
 
             passed, detail = _check_frontend_mesh_quality_math(node_bin)
             check("网格质量显示逻辑（缺失≠0，node 执行前端纯函数）", passed, detail)
+
+            passed, detail = _check_frontend_convergence_study_math(node_bin)
+            check("收敛检查显示逻辑（四态区分，node 执行前端纯函数）", passed, detail)
         else:
             check("TypeScript 类型检查", False, "未找到 node")
 
@@ -2256,6 +2555,11 @@ def task_verify(args: argparse.Namespace) -> int:
                 too_few == 400,
                 "两级结果接近可能是收敛，也可能是两处错得一样",
             )
+            # 真实响应 -> 前端解析：字段改名只会让界面"静默地少显示一项"，
+            # 造一份假数据是测不出来的（与网格质量、模态那两条同理）。
+            if node_bin:
+                passed, detail = _check_convergence_study_display_chain(node_bin, study)
+                check("收敛检查前端契约（真实响应对接解析与作图）", passed, detail)
 
             # 异步路径：这个接口要跑 3~4 次"划网格 + 求解"，同步实现对大模型
             # 必然超时，所以必须能用 /api/jobs/convergence 提交并轮询到结果。

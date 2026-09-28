@@ -23,7 +23,8 @@ import {
   BarChart2,
   FileBox,
   Save,
-  RefreshCw
+  RefreshCw,
+  TrendingUp
 } from 'lucide-react';
 import axios from 'axios';
 import { currentAuthHeaders, errorStatus, isUnauthorized, notifySessionExpired } from '../utils/authApi';
@@ -55,6 +56,8 @@ import {
 } from '../utils/modelSource';
 import { MeshQuality, toMeshQuality } from '../utils/meshQuality';
 import MeshQualityPanel from './MeshQualityPanel';
+import { ConvergenceStudy, toConvergenceStudy } from '../utils/convergenceStudy';
+import ConvergencePanel from './ConvergencePanel';
 
 interface WorkbenchProps {
   project: Project;
@@ -96,6 +99,13 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   const [meshQualityError, setMeshQualityError] = useState<string | null>(null);
   /** 自增请求号：用来丢弃过期的网格质量响应（见 loadMeshQuality） */
   const meshQualityRequestRef = React.useRef(0);
+  // 收敛检查（逐级加密）：回答"网格够不够细"。
+  // 它是**自收敛**——你的模型没有精确解，所以结论只说明"离散误差在减小"，
+  // 不说明模型与边界条件正确（后端结论里始终带着这句限定，前端不改写）。
+  const [study, setStudy] = useState<ConvergenceStudy | null>(null);
+  const [isStudying, setIsStudying] = useState(false);
+  const [studyJobStatus, setStudyJobStatus] = useState<string>('');
+  const [studyError, setStudyError] = useState<string | null>(null);
   const [facesData, setFacesData] = useState<any[]>([]); // Store B-Rep faces data
   const [edgesData, setEdgesData] = useState<any[]>([]); // Store B-Rep edges data
   const [verticesData, setVerticesData] = useState<any[]>([]); // Store B-Rep vertices data
@@ -784,6 +794,145 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     });
   };
 
+  /**
+   * 组装求解请求体（结构 / 热 / 模态共用）。
+   *
+   * 抽出来是为了让「跑一次求解」和「跑收敛检查」用**同一份**配置：收敛检查的
+   * 全部意义就在于"各级之间只有网格不同"。两处各写一套的话，很容易在某一处
+   * 漏了温度换算或改了单位，于是收敛检查悄悄算的是另一个问题——结论看着
+   * 头头是道，其实毫无意义。
+   *
+   * 返回 `null` 表示前置条件不满足（几何/仿真设置缺失，或选了未实现的 CFD）。
+   * 提示用户是调用方的事，这里不做任何弹窗。
+   */
+  const buildSolverSetup = (): Record<string, any> | null => {
+    if (!modelName || !solverSettings) return null;
+    const analysisType = solverSettings.solverType;
+    if (analysisType === 'cfd') return null;
+
+    const isThermal = analysisType === 'thermal';
+    const isModal = analysisType === 'modal';
+
+    // Construct boundary conditions payload
+    // Filter out boundary conditions that are not valid
+    const validBCs = boundaryConditions.map(bc => {
+      // Ensure values are properly formatted
+      if (bc.type === 'force' && typeof bc.force === 'object') {
+        return { ...bc, force: bc.force };
+      }
+      if (isThermal && bc.type === 'temperature') {
+        // 前端 UI 用摄氏度，后端 API 用开尔文（见 thermal.py 的单位约定）
+        return {
+          ...bc,
+          temperature: (typeof bc.temperature === 'number' ? bc.temperature : 25) + 273.15,
+        };
+      }
+      return bc;
+    });
+
+    const setup: Record<string, any> = {
+      geometry_filename: modelName,
+      material_id: selectedMaterial?.id || 'structural_steel', // Default if not selected
+      boundary_conditions: validBCs,
+      faces: facesData, // Pass B-Rep face metadata to solver
+      // 几何坐标的长度单位。默认 mm：CAD 零件基本都是毫米，
+      // 后端会换算成米再求解，结果与输入单位无关（SI）。
+      length_unit: solverSettings?.lengthUnit || 'mm',
+    };
+    if (isModal) {
+      // 阶数来自 SolverSettingsModal 的 "Number of modes" 参数（默认 10）
+      const requested = Number(solverSettings?.parameters?.numModes);
+      setup.num_modes = Number.isFinite(requested) && requested > 0
+        ? Math.floor(requested)
+        : 6;
+    }
+    return setup;
+  };
+
+  /**
+   * 逐级加密的收敛检查（回答"我的网格够不够细"）。
+   *
+   * 与"跑一次求解"共用 `buildSolverSetup()`：收敛检查的全部意义就在于
+   * 各级之间**只有网格不同**。
+   *
+   * 走异步任务（3~4 次"划网格 + 求解"，同步接口在大模型上必然超时），并且
+   * 后端每一步都划在几何的**临时副本**上——不会覆盖你当前的网格。
+   */
+  const handleConvergenceStudy = async () => {
+    if (!modelName) {
+      alert("请先导入几何模型。");
+      return;
+    }
+    if (!solverSettings) {
+      alert("请先创建仿真设置（左侧 SIMULATIONS → + ）。\n收敛检查要用同一份配置逐级加密求解。");
+      setShowSolverSettingsModal(true);
+      return;
+    }
+    if (solverSettings.solverType === 'cfd') {
+      alert("Fluid Flow (CFD) 后端尚未实现，无法做收敛检查。");
+      return;
+    }
+    if (meshSettings?.status !== 'meshed') {
+      alert("请先生成网格（左侧 Mesh → 齿轮图标 → 生成网格）。\n收敛检查需要一个可用的基础网格尺寸作为起点。");
+      setShowMeshSettingsModal(true);
+      return;
+    }
+
+    const setup = buildSolverSetup();
+    if (!setup) {
+      alert("仿真配置不完整，无法开始收敛检查。");
+      return;
+    }
+
+    // 基础网格尺寸取**当前**网格设置：从"你现在用的网格"开始逐级加密，
+    // 结论才直接回答"我现在这个网格够不够细"。
+    const baseMeshSize = Number(meshSettings?.meshSize);
+    await saveSetup();
+
+    setIsStudying(true);
+    setStudyError(null);
+    setStudyJobStatus('');
+    try {
+      const { data: job } = await axios.post(
+        `${API_BASE_URL}/api/jobs/convergence`,
+        {
+          analysis_type: solverSettings.solverType,
+          setup,
+          levels: 4,
+          base_mesh_size: Number.isFinite(baseMeshSize) && baseMeshSize > 0
+            ? baseMeshSize
+            : 1.5,
+        },
+        { headers: currentAuthHeaders() },
+      );
+      const result = await pollJob(job.job_id, setStudyJobStatus);
+      const parsed = toConvergenceStudy(result);
+      setStudy(parsed);
+      if (!parsed) {
+        setStudyError('收敛检查返回的结果无法解析，请查看后端日志。');
+      }
+    } catch (error) {
+      if (isUnauthorized(error)) {
+        notifySessionExpired('登录已失效，请重新登录后再做收敛检查。');
+        return;
+      }
+      setStudy(null);
+      // 后端的 400 里带着可读原因（例如"级数不足"、"配置不合法"），原样透出
+      const detail = (error as any)?.response?.data?.detail;
+      const status = errorStatus(error);
+      setStudyError(
+        typeof detail === 'string' && detail
+          ? detail
+          : status === null
+            ? '无法连接后端，收敛检查未执行。'
+            : `收敛检查失败（HTTP ${status}）。`,
+      );
+    } finally {
+      setIsStudying(false);
+      setStudyJobStatus('');
+    }
+  };
+
   const handleSolve = async () => {
     if (!modelName) {
       alert("请先导入几何模型。");
@@ -838,39 +987,11 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
       setSolverSettings(prev => prev ? { ...prev, status: 'solving' } : null);
 
       try {
-        // Construct boundary conditions payload
-        // Filter out boundary conditions that are not valid
-        const validBCs = boundaryConditions.map(bc => {
-            // Ensure values are properly formatted
-            if (bc.type === 'force' && typeof bc.force === 'object') {
-                return { ...bc, force: bc.force };
-            }
-            if (isThermal && bc.type === 'temperature') {
-                // 前端 UI 用摄氏度，后端 API 用开尔文（见 thermal.py 的单位约定）
-                return {
-                    ...bc,
-                    temperature: (typeof bc.temperature === 'number' ? bc.temperature : 25) + 273.15,
-                };
-            }
-            return bc;
-        });
-
-        // 异步任务接口：提交后轮询（同网格划分的理由）
-        const requestBody: Record<string, any> = {
-            geometry_filename: modelName,
-            material_id: selectedMaterial?.id || 'structural_steel', // Default if not selected
-            boundary_conditions: validBCs,
-            faces: facesData, // Pass B-Rep face metadata to solver
-            // 几何坐标的长度单位。默认 mm：CAD 零件基本都是毫米，
-            // 后端会换算成米再求解，结果与输入单位无关（SI）。
-            length_unit: solverSettings?.lengthUnit || 'mm'
-        };
-        if (isModal) {
-            // 阶数来自 SolverSettingsModal 的 "Number of modes" 参数（默认 10）
-            const requested = Number(solverSettings?.parameters?.numModes);
-            requestBody.num_modes = Number.isFinite(requested) && requested > 0
-                ? Math.floor(requested)
-                : 6;
+        // 请求体与"跑一次求解"完全共用（见 buildSolverSetup 的注释）
+        const requestBody = buildSolverSetup();
+        if (!requestBody) {
+          console.error('求解配置不完整，无法组装请求体');
+          return;
         }
 
         const jobKind = isThermal ? 'thermal' : isModal ? 'modal' : 'solve';
@@ -1226,6 +1347,14 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
                               <Play size={12} fill="currentColor" />
                             </button>
                             <button 
+                              onClick={(e) => { e.stopPropagation(); handleConvergenceStudy(); }}
+                              disabled={isStudying || isMeshing}
+                              className="text-emerald-400 hover:text-emerald-300 disabled:opacity-40"
+                              title="收敛性检查（逐级加密，回答“网格够不够细”）"
+                            >
+                              <TrendingUp size={13} />
+                            </button>
+                            <button 
                               onClick={(e) => { e.stopPropagation(); setShowMeshSettingsModal(true); }}
                               className="text-blue-400 hover:text-blue-300"
                               title="网格设置"
@@ -1247,6 +1376,14 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
                             quality={meshQuality}
                             loading={meshQualityLoading}
                             error={meshQualityError}
+                          />
+                        )}
+                        {expandedNodes['mesh'] && (
+                          <ConvergencePanel
+                            study={study}
+                            loading={isStudying}
+                            progress={studyJobStatus}
+                            error={studyError}
                           />
                         )}
                       </div>
