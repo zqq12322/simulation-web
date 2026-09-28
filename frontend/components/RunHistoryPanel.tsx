@@ -1,11 +1,24 @@
 import React from 'react';
-import { AlertTriangle, Clock, Loader2, Trash2 } from 'lucide-react';
-import { RunList, RunRecord, describeAnalysisType, describeRunMesh, describeRunWarnings, historyIsTrimmed, runQuantityNames } from '../utils/runsApi';
+import { AlertTriangle, Clock, Loader2, Trash2, TrendingUp } from 'lucide-react';
+import {
+  RunAnalysis,
+  RunGroup,
+  RunList,
+  RunRecord,
+  describeAnalysisType,
+  describeRunMesh,
+  describeRunWarnings,
+  historyIsTrimmed,
+  runQuantityNames,
+  shouldShowGroup,
+} from '../utils/runsApi';
 import { QUANTITY_DISPLAY, formatQuantity, quantityLabel } from '../utils/convergenceStudy';
 import { formatCreatedAt } from '../utils/projectsApi';
 
 interface RunHistoryPanelProps {
   list: RunList | null;
+  /** 跨运行对比（按配置签名分组）。取不到时为 null，界面只是不显示这一段。 */
+  analysis?: RunAnalysis | null;
   loading?: boolean;
   error?: string | null;
   /** 能否删除（只有属主/editor 能写——与后端 `can_edit` 一致）。 */
@@ -30,6 +43,7 @@ interface RunHistoryPanelProps {
  */
 export default function RunHistoryPanel({
   list,
+  analysis = null,
   loading = false,
   error = null,
   canEdit = false,
@@ -64,6 +78,39 @@ export default function RunHistoryPanel({
 
   return (
     <div className="ml-10 py-1 pr-3 space-y-1">
+      {/* 跨运行对比：同一套配置下的几次运行，结果收敛了吗 */}
+      {(analysis?.groups || []).filter(shouldShowGroup).map((group: RunGroup) => (
+        <div
+          key={`${group.analysisType}-${group.setupSignature ?? 'none'}`}
+          className="rounded border border-[#2b3040] bg-[#151a24] px-2 py-1 space-y-0.5"
+        >
+          <div className="flex items-center text-[10px] text-gray-400">
+            <TrendingUp size={10} className="mr-1 flex-shrink-0" />
+            <span>
+              跨运行对比 · {describeAnalysisType(group.analysisType)} ·{' '}
+              {quantityLabel(null, group.quantity)} · {group.distinctMeshCount} 个网格
+            </span>
+          </div>
+          {group.comparable && group.values.length > 1 && (
+            <div className="text-[10px] text-gray-500">
+              粗 → 细：
+              {group.values
+                .map(value => formatQuantity(value, group.quantity))
+                .join('  →  ')}
+            </div>
+          )}
+          <div
+            className={`text-[10px] leading-snug ${
+              group.comparable === false
+                ? 'text-gray-500'
+                : group.converged ? 'text-green-500' : 'text-yellow-500'
+            }`}
+          >
+            {group.verdict}
+          </div>
+        </div>
+      ))}
+
       {list.runs.map((run: RunRecord) => {
         const meshLine = describeRunMesh(run);
         const warningLine = describeRunWarnings(run);

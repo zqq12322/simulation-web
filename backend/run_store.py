@@ -178,11 +178,16 @@ class RunStore(SqliteStore):
         created_by TEXT,
         analysis_type TEXT NOT NULL,
         summary TEXT NOT NULL,
+        setup_signature TEXT,
         created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_runs_project
         ON project_runs(project_id, created_at DESC);
     """
+
+    #: 给**已有老库**补列。SQLite 没有 `ADD COLUMN IF NOT EXISTS`，基类会先查
+    #: `PRAGMA table_info` 再加（幂等）。
+    migrations = {"setup_signature": "TEXT"}
 
     def record(
         self,
@@ -191,6 +196,7 @@ class RunStore(SqliteStore):
         summary: Dict[str, Any],
         created_by: Optional[str] = None,
         run_id: Optional[str] = None,
+        setup_signature: Optional[str] = None,
     ) -> Dict[str, Any]:
         """记一条运行；返回值与 `list_for_project` 的元素同形。"""
         if analysis_type not in RUN_ANALYSIS_TYPES:
@@ -202,9 +208,13 @@ class RunStore(SqliteStore):
         with self._cursor() as connection:
             connection.execute(
                 "INSERT INTO project_runs"
-                " (id, project_id, created_by, analysis_type, summary, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (identifier, project_id, created_by, analysis_type, payload, created_at),
+                " (id, project_id, created_by, analysis_type, summary,"
+                "  setup_signature, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    identifier, project_id, created_by, analysis_type, payload,
+                    setup_signature, created_at,
+                ),
             )
         # 裁掉最旧的：不设上限的表是那种"两年后才发现"的问题
         self.trim(project_id)
@@ -215,6 +225,7 @@ class RunStore(SqliteStore):
             "created_by": created_by,
             "analysis_type": analysis_type,
             "summary": summary,
+            "setup_signature": setup_signature,
             "created_at": created_at,
         }
 
@@ -305,6 +316,146 @@ class RunStore(SqliteStore):
             "created_by": row["created_by"],
             "analysis_type": row["analysis_type"],
             "summary": summary,
+            "setup_signature": row["setup_signature"],
             "created_at": row["created_at"],
             "summary_parse_error": parse_error,
         }
+
+
+# ---------------------------------------------------------------------------
+# 跨运行对比："同一套配置下，结果随加密稳定了吗"
+# ---------------------------------------------------------------------------
+
+#: 少于这么多次运行就不做收敛判断（两级结果接近可能是收敛，也可能是两处都错
+#: 得一样——这条规矩与收敛检查那轮一致）。
+MIN_RUNS_FOR_ASSESSMENT = 3
+
+
+def _mesh_measures(summary: Dict[str, Any]) -> tuple:
+    """
+    返回 ``(fineness, h)``：前者越大表示网格越**细**，后者是平均单元尺寸（估阶用）。
+
+    为什么要专门抽一个函数、并且返回**两个**数：有两种可得的信息，而它们的
+    单调方向**相反**——单元数越大越细，名义网格尺寸越大越粗。第一版直接拿
+    "单元数"当排序键、又拿它算 ``N^(-1/3)``，结果粗细分序搞反、估阶直接失效
+    （`generalized_order` 要求尺寸严格递减，拿到递增序列只能返回 None，
+    表现为"无法判断"）。
+
+    没有单元数时（老记录/手工填的）回退到名义尺寸，此时 ``fineness = 1/尺寸``
+    保证两种来源的"粗细"含义一致。
+    """
+    mesh = summary.get("mesh") or {}
+    elements = mesh.get("elements")
+    if isinstance(elements, int) and not isinstance(elements, bool) and elements > 0:
+        return float(elements), float(elements) ** (-1.0 / 3.0)
+    mesh_size = mesh.get("meshSize")
+    if (
+        isinstance(mesh_size, (int, float))
+        and not isinstance(mesh_size, bool)
+        and mesh_size > 0
+        and math.isfinite(float(mesh_size))
+    ):
+        size = float(mesh_size)
+        return 1.0 / size, size
+    return None, None
+
+
+def assess_run_history(runs: List[dict]) -> List[Dict[str, Any]]:
+    """
+    把项目的运行记录按"可比较"的组整理，并对每组做一次收敛判定。
+
+    **为什么必须先分组**：只有**配置相同、只有网格不同**的几次运行才能当成一条
+    收敛序列。材料变了、边界条件变了、几何换了，数值的变化就跟网格没关系，
+    把它们放在一起算"收敛阶"是编数字。所以按
+    ``(分析类型, 配置签名)`` 分组，签名不同的组各自独立。
+
+    没有签名的记录（本功能上线之前的旧数据）会被放在一个
+    ``comparable=False`` 的组里：**照实显示、但拒绝判定**，并说明原因。
+    对旧数据"猜它们配置相同"是不可接受的。
+
+    组内还会**按网格去重**（同一个网格跑两次只留最新的一次）：重复的网格尺寸
+    不是一次加密，留着会让密序不严格递减，判定直接失效。
+
+    返回的每组包含原始数值与平均单元尺寸（都是**粗 → 细**）、判定结果与结论。
+    这是**事后**对比，不是受控的加密实验——结论里会写明这一点。
+    """
+    from convergence import assess
+
+    grouped: Dict[tuple, List[dict]] = {}
+    order: List[tuple] = []
+    for run in runs:
+        signature = run.get("setup_signature")
+        key = (run.get("analysis_type") or "", signature)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(run)
+
+    groups: List[Dict[str, Any]] = []
+    for key in order:
+        analysis_type, signature = key
+        members = grouped[key]
+        quantities = RUN_QUANTITIES.get(analysis_type)
+        if not quantities:
+            continue
+        quantity = quantities[0]          # 每种分析类型的"主考察量"排在第一位
+
+        # 去重：同一个网格只留**最新**的一次（输入已按时间倒序）
+        seen: Dict[float, dict] = {}
+        for run in members:
+            fineness, h = _mesh_measures(run.get("summary") or {})
+            value = (run.get("summary") or {}).get("quantities", {}).get(quantity)
+            if fineness is None or not isinstance(value, (int, float)):
+                continue
+            if fineness not in seen:
+                seen[fineness] = {"run": run, "h": h, "value": float(value)}
+
+        # **粗 → 细**：按"细度"升序
+        entries = sorted(seen.values(), key=lambda item: item["h"], reverse=True)
+
+        group: Dict[str, Any] = {
+            "analysisType": analysis_type,
+            "setupSignature": signature,
+            "comparable": signature is not None,
+            "runCount": len(members),
+            "distinctMeshCount": len(entries),
+            "quantity": quantity,
+            "values": [item["value"] for item in entries],
+            "sizes": [item["h"] for item in entries],
+            "runIds": [item["run"]["id"] for item in entries],
+            "assessment": None,
+            "verdict": "",
+        }
+
+        if not group["comparable"]:
+            group["verdict"] = (
+                "这些运行没有记录配置签名（本功能上线前的旧记录），"
+                "无法确认它们只有网格不同，因此**不做收敛判断**。"
+                "重新跑一次求解即可带上签名。"
+            )
+            groups.append(group)
+            continue
+
+        if len(entries) < MIN_RUNS_FOR_ASSESSMENT:
+            group["verdict"] = (
+                f"同一套配置下只有 {len(entries)} 个不同的网格"
+                f"（需要 {MIN_RUNS_FOR_ASSESSMENT} 个才能判断），暂不做收敛判断。"
+                "改变网格尺寸多跑几次即可。"
+            )
+            groups.append(group)
+            continue
+
+        sizes = group["sizes"]
+        assessment = assess(
+            group["values"],
+            expected_order=None,
+            label=f"运行历史 · {quantity}",
+            sizes=sizes,
+        )
+        group["assessment"] = assessment
+        group["verdict"] = (
+            "【事后对比，不是受控加密实验】" + str(assessment.get("verdict", ""))
+        )
+        groups.append(group)
+
+    return groups

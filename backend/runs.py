@@ -21,15 +21,17 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from auth import require_user
 from logging_config import get_logger
 from project_store import get_store
 from run_store import (
     MAX_RUNS_PER_PROJECT,
+    MIN_RUNS_FOR_ASSESSMENT,
     RUN_ANALYSIS_TYPES,
     RunStore,
+    assess_run_history,
     validate_run_summary,
 )
 
@@ -62,6 +64,10 @@ class RunCreate(BaseModel):
     elements: Optional[int] = None
     nodes: Optional[int] = None
     warnings: List[str] = []
+    #: 仿真配置的指纹（由前端 `setupSignature` 产生，后端只当**不透明字符串**存）。
+    #: 用途是"跨运行对比"时确认几次运行**只有网格不同**——材料/边界条件一变，
+    #: 数值的变化就跟网格无关，混在一起算收敛阶是编数字。
+    setupSignature: Optional[str] = Field(default=None, max_length=128)
 
 
 class RunResponse(BaseModel):
@@ -71,6 +77,7 @@ class RunResponse(BaseModel):
     createdBy: Optional[str] = None
     createdAt: str
     summary: Dict[str, Any]
+    setupSignature: Optional[str] = None
     #: 库里那条摘要的 JSON 坏了（例如手工改过库）时为 true，界面据此提示，
     #: 而不是把"空摘要"当成"这次什么都没算出来"
     summaryParseError: bool = False
@@ -82,6 +89,30 @@ class RunListResponse(BaseModel):
     limit: int
 
 
+class RunGroupResponse(BaseModel):
+    """一组"可比较"的运行 + 事后收敛判定。"""
+
+    analysisType: str
+    setupSignature: Optional[str] = None
+    #: 配置签名齐备 ⇒ 可以判定；缺失 ⇒ 照实显示但**拒绝判定**
+    comparable: bool
+    runCount: int
+    distinctMeshCount: int
+    quantity: str
+    #: 粗 → 细
+    values: List[float]
+    #: 与 `values` 对应的平均单元尺寸（粗 → 细，严格递减）
+    sizes: List[float]
+    runIds: List[str]
+    assessment: Optional[Dict[str, Any]] = None
+    verdict: str
+
+
+class RunAnalysisResponse(BaseModel):
+    groups: List[RunGroupResponse]
+    minRuns: int
+
+
 def _to_response(record: dict) -> RunResponse:
     return RunResponse(
         id=record["id"],
@@ -90,6 +121,7 @@ def _to_response(record: dict) -> RunResponse:
         createdBy=record.get("created_by"),
         createdAt=record["created_at"],
         summary=record.get("summary") or {},
+        setupSignature=record.get("setup_signature"),
         summaryParseError=bool(record.get("summary_parse_error")),
     )
 
@@ -169,6 +201,7 @@ async def create_project_run(
         analysis_type=request.analysisType,
         summary=summary,
         created_by=user["id"],
+        setup_signature=request.setupSignature,
     )
     return _to_response(record)
 
@@ -182,3 +215,23 @@ async def delete_project_run(
     if not get_run_store().delete(run_id, project_id=project_id):
         raise HTTPException(status_code=404, detail=f"运行记录不存在：{run_id}")
     return None
+
+
+@router.get("/projects/{project_id}/runs/analysis", response_model=RunAnalysisResponse)
+async def analyse_project_runs(project_id: str, user: dict = OwnedUser):
+    """
+    跨运行对比：把记录按"配置签名"分组，对每组做一次**事后**收敛判定。
+
+    为什么不直接对全部记录算一次收敛阶：只有**配置相同、只有网格不同**的几次
+    运行才能当成一条收敛序列。材料、边界条件或几何一变，数值的变化就跟网格
+    无关，把它们混在一起算"收敛阶"是编数字。所以按签名分组；没有签名的旧记录
+    放在 `comparable=false` 的组里，**照实显示但拒绝判定**。
+
+    这是事后对比，不是受控的加密实验——结论里会写明这一点。
+    """
+    _require_access(project_id, user["id"], write=False)
+    records = get_run_store().list_for_project(project_id, limit=MAX_RUNS_PER_PROJECT)
+    return RunAnalysisResponse(
+        groups=assess_run_history(records),
+        minRuns=MIN_RUNS_FOR_ASSESSMENT,
+    )

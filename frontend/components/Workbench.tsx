@@ -59,7 +59,7 @@ import { MeshQuality, toMeshQuality } from '../utils/meshQuality';
 import MeshQualityPanel from './MeshQualityPanel';
 import { ConvergenceStudy, toConvergenceStudy } from '../utils/convergenceStudy';
 import ConvergencePanel from './ConvergencePanel';
-import { RunList, RunRecord, toRunList } from '../utils/runsApi';
+import { RunAnalysis, RunList, RunRecord, toRunAnalysis, toRunList } from '../utils/runsApi';
 import RunHistoryPanel from './RunHistoryPanel';
 import {
   buildLegacyVtk,
@@ -123,6 +123,8 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   const [runsLoading, setRunsLoading] = useState(false);
   const [runsError, setRunsError] = useState<string | null>(null);
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+  /** 跨运行对比（按配置签名分组后的收敛判定）。 */
+  const [runAnalysis, setRunAnalysis] = useState<RunAnalysis | null>(null);
 
   /**
    * 导出结果用的网格与场。
@@ -1053,6 +1055,19 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
         { headers: currentAuthHeaders() },
       );
       setRuns(toRunList(data));
+      // 跨运行对比与列表一起取：它回答"同一套配置下的几次运行收敛了吗"，
+      // 而那正是"跑了好几次"之后最想知道的事。
+      try {
+        const analysis = await axios.get(
+          `${API_BASE_URL}/api/projects/${project.id}/runs/analysis`,
+          { headers: currentAuthHeaders() },
+        );
+        setRunAnalysis(toRunAnalysis(analysis.data));
+      } catch (analysisError) {
+        // 对比失败不该让历史列表也看不见（列表是有用的，对比是附加信息）
+        console.warn('读取跨运行对比失败:', analysisError);
+        setRunAnalysis(null);
+      }
     } catch (error) {
       if (isUnauthorized(error)) {
         notifySessionExpired('登录已失效，请重新登录后再查看求解记录。');
@@ -1114,6 +1129,17 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
           elements: Array.isArray(meshData?.elements) ? meshData.elements.length : undefined,
           nodes: Array.isArray(meshData?.nodes) ? meshData.nodes.length : undefined,
           warnings: Array.isArray(solveResult?.warnings) ? solveResult.warnings : [],
+          // 配置指纹：跨运行对比时用它确认几次运行**只有网格不同**。
+          // 材料/边界条件一变，数值的变化就跟网格无关，混在一起算收敛阶是编数字。
+          setupSignature: setupSignature(
+            buildSetupPayload({
+              modelName,
+              selectedMaterial,
+              boundaryConditions,
+              meshSettings,
+              solverSettings,
+            }),
+          ),
         },
         { headers: currentAuthHeaders() },
       );
@@ -1649,6 +1675,7 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
                       {expandedNodes['simulation'] && (
                         <RunHistoryPanel
                           list={runs}
+                          analysis={runAnalysis}
                           loading={runsLoading}
                           error={runsError}
                           canEdit={canEditProject(project)}

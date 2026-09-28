@@ -171,3 +171,83 @@ export function historyIsTrimmed(list: RunList | null): boolean {
   if (!list) return false;
   return list.limit > 0 && list.total >= list.limit;
 }
+
+/** 一组"可比较"的运行 + 事后收敛判定。 */
+export interface RunGroup {
+  analysisType: string;
+  setupSignature: string | null;
+  /** 配置签名齐备 ⇒ 可判定；缺失 ⇒ 照实显示但**拒绝判定** */
+  comparable: boolean;
+  runCount: number;
+  distinctMeshCount: number;
+  quantity: string;
+  /** 粗 → 细 */
+  values: number[];
+  sizes: number[];
+  runIds: string[];
+  observedOrder: number | null;
+  extrapolatedLimit: number | null;
+  lastRelativeChange: number | null;
+  converged: boolean;
+  verdict: string;
+}
+
+export interface RunAnalysis {
+  groups: RunGroup[];
+  minRuns: number;
+}
+
+function parseRunGroup(raw: unknown): RunGroup | null {
+  if (raw === null || typeof raw !== 'object') return null;
+  const record = raw as Record<string, unknown>;
+  const values = Array.isArray(record.values)
+    ? record.values.filter((item): item is number => finiteNumber(item) !== null)
+    : [];
+  const sizes = Array.isArray(record.sizes)
+    ? record.sizes.filter((item): item is number => finiteNumber(item) !== null)
+    : [];
+  const assessment = (record.assessment ?? null) as Record<string, unknown> | null;
+  return {
+    analysisType: typeof record.analysisType === 'string' ? record.analysisType : '',
+    setupSignature: typeof record.setupSignature === 'string' ? record.setupSignature : null,
+    comparable: record.comparable === true,
+    runCount: finiteNumber(record.runCount) ?? 0,
+    distinctMeshCount: finiteNumber(record.distinctMeshCount) ?? 0,
+    quantity: typeof record.quantity === 'string' ? record.quantity : '',
+    values,
+    sizes,
+    runIds: Array.isArray(record.runIds)
+      ? record.runIds.filter((item): item is string => typeof item === 'string')
+      : [],
+    observedOrder: assessment ? finiteNumber(assessment.observed_order) : null,
+    extrapolatedLimit: assessment ? finiteNumber(assessment.extrapolated_limit) : null,
+    lastRelativeChange: assessment ? finiteNumber(assessment.last_relative_change) : null,
+    converged: assessment ? assessment.converged === true : false,
+    verdict: typeof record.verdict === 'string' ? record.verdict : '',
+  };
+}
+
+/**
+ * 归一化跨运行对比响应。
+ *
+ * 坏组逐条丢弃：一条坏数据不该让整个对比消失（与 `toRunList` 同一条原则）。
+ */
+export function toRunAnalysis(raw: unknown): RunAnalysis {
+  const empty: RunAnalysis = { groups: [], minRuns: 3 };
+  if (raw === null || typeof raw !== 'object') return empty;
+  const record = raw as Record<string, unknown>;
+  const groups = Array.isArray(record.groups)
+    ? record.groups.map(parseRunGroup).filter((item): item is RunGroup => item !== null)
+    : [];
+  return { groups, minRuns: finiteNumber(record.minRuns) ?? 3 };
+}
+
+/**
+ * 一组运行是否值得显示在界面上。
+ *
+ * 只有一次运行的组没有任何对比价值（就是历史列表里那一条），不显示。
+ */
+export function shouldShowGroup(group: RunGroup | null): boolean {
+  if (!group) return false;
+  return group.distinctMeshCount >= 2 || group.comparable === false;
+}

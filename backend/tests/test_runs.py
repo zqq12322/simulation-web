@@ -32,9 +32,11 @@ from convergence_study import extract_quantities
 from project_store import ProjectStore
 from run_store import (
     MAX_RUNS_PER_PROJECT,
+    MIN_RUNS_FOR_ASSESSMENT,
     RUN_ANALYSIS_TYPES,
     RUN_QUANTITIES,
     RunStore,
+    assess_run_history,
     validate_run_summary,
 )
 from runs import RunCreate
@@ -327,6 +329,233 @@ class RunStoreTest(unittest.TestCase):
         again = RunStore(Path(self._tmp.name) / "runs.db")
         self.assertEqual(again.count_for_project("p1"), 0)
         self.assertIn("project_id", again.columns())
+
+    def test_setup_signature_round_trips(self):
+        summary = validate_run_summary("structural", GOOD_STRUCTURAL)
+        record = self.store.record(
+            "p1", "structural", summary, created_by="alice",
+            setup_signature="sig-abc123",
+        )
+        self.assertEqual(record["setup_signature"], "sig-abc123")
+        self.assertEqual(
+            self.store.get(record["id"])["setup_signature"], "sig-abc123"
+        )
+
+    def test_signature_is_optional(self):
+        summary = validate_run_summary("structural", GOOD_STRUCTURAL)
+        record = self.store.record("p1", "structural", summary)
+        self.assertIsNone(record["setup_signature"])
+        self.assertIsNone(self.store.get(record["id"])["setup_signature"])
+
+    def test_old_database_gets_the_signature_column(self):
+        """
+        老库（建表时还没有 `setup_signature`）必须能被自动补列。
+
+        这一条比"新库能用"重要得多：开发机与别人的机器上都已经有旧库了。
+        SQLite 没有 `ADD COLUMN IF NOT EXISTS`，所以基类靠 `PRAGMA table_info`
+        先查再加；这里用一个**按老结构建好**的库来验它真的生效。
+        """
+        import sqlite3
+
+        old_path = Path(self._tmp.name) / "old_runs.db"
+        connection = sqlite3.connect(str(old_path))
+        with connection:
+            connection.execute(
+                "CREATE TABLE project_runs ("
+                " id TEXT PRIMARY KEY, project_id TEXT NOT NULL, created_by TEXT,"
+                " analysis_type TEXT NOT NULL, summary TEXT NOT NULL,"
+                " created_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO project_runs"
+                " (id, project_id, analysis_type, summary, created_at)"
+                " VALUES ('legacy', 'p1', 'structural', '{\"quantities\": {}}',"
+                " '2026-01-01')"
+            )
+        connection.close()
+
+        store = RunStore(old_path)
+        self.assertIn("setup_signature", store.columns())
+        # 老记录读得回来，签名是 None（而不是让整份列表失败）
+        listed = store.list_for_project("p1")
+        self.assertEqual(len(listed), 1)
+        self.assertIsNone(listed[0]["setup_signature"])
+
+
+class AssessRunHistoryTest(unittest.TestCase):
+    """
+    跨运行对比：**只有配置相同、只有网格不同**的几次运行才能当成一条收敛序列。
+
+    这一组测试的重点不是判定数学（那在 test_convergence.py 里已经用合成序列和
+    制造解钉过），而是**分组的正确性**：什么情况下必须拒绝判定。
+    """
+
+    @staticmethod
+    def _run(run_id, elements, max_stress, signature="sig-1", analysis_type="structural"):
+        return {
+            "id": run_id,
+            "project_id": "p1",
+            "analysis_type": analysis_type,
+            "summary": {
+                "quantities": {"max_stress": max_stress, "max_displacement": 1e-6},
+                "mesh": {"elements": elements, "meshSize": 1.0},
+            },
+            "setup_signature": signature,
+            "created_at": "2026-03-18T00:00:00+00:00",
+            "summary_parse_error": False,
+        }
+
+    def test_null_second_order_sequence_converges(self):
+        """`u = u* + C·N^(-2/3)`（h² ⇒ 单元数的 -2/3 次）应当被判为二阶收敛。"""
+        exact = 7.0e7
+        runs = [
+            self._run("a", 1000, exact + 3.0e7 * 1000 ** (-2 / 3)),
+            self._run("b", 8000, exact + 3.0e7 * 8000 ** (-2 / 3)),
+            self._run("c", 64000, exact + 3.0e7 * 64000 ** (-2 / 3)),
+        ]
+        groups = assess_run_history(runs)
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        self.assertTrue(group["comparable"])
+        self.assertEqual(group["distinctMeshCount"], 3)
+        self.assertIsNotNone(group["assessment"])
+        self.assertAlmostEqual(
+            group["assessment"]["observed_order"], 2.0, places=6
+        )
+        self.assertAlmostEqual(
+            group["assessment"]["extrapolated_limit"], exact, places=-3
+        )
+        # 数值必须按**粗 → 细**排列：平均单元尺寸严格递减
+        self.assertGreater(group["sizes"][0], group["sizes"][1])
+        self.assertGreater(group["sizes"][1], group["sizes"][2])
+        # 粗 => 单元数少 => h 大
+        self.assertAlmostEqual(group["sizes"][0], 1000 ** (-1 / 3), places=9)
+
+    def test_groups_are_split_by_signature(self):
+        """
+        配置签名不同的运行**不能**放在一起评分。
+
+        这一条是整组测试的核心：把材料/边界条件不同的运行混成一条"收敛序列"，
+        算出来的阶数看着很专业，其实毫无意义。
+        """
+        runs = [
+            self._run("a", 1000, 1.0e7, signature="sig-A"),
+            self._run("b", 8000, 2.0e7, signature="sig-A"),
+            self._run("c", 64000, 4.0e7, signature="sig-A"),
+            self._run("d", 1000, 9.0e7, signature="sig-B"),
+        ]
+        groups = assess_run_history(runs)
+        self.assertEqual(len(groups), 2)
+        by_signature = {group["setupSignature"]: group for group in groups}
+        self.assertEqual(set(by_signature), {"sig-A", "sig-B"})
+        self.assertEqual(by_signature["sig-A"]["distinctMeshCount"], 3)
+        self.assertEqual(by_signature["sig-B"]["distinctMeshCount"], 1)
+        # sig-B 只有 1 个网格 ⇒ 不判定
+        self.assertIsNone(by_signature["sig-B"]["assessment"])
+        self.assertIn("只有 1 个不同的网格", by_signature["sig-B"]["verdict"])
+
+    def test_missing_signature_refuses_to_judge(self):
+        """
+        没有签名的旧记录：照实显示，但**拒绝判定**。
+
+        猜"它们配置应该一样"是不可接受的——那正是这一轮要防的错误。
+        """
+        runs = [
+            self._run("a", 1000, 1.0e7, signature=None),
+            self._run("b", 8000, 2.0e7, signature=None),
+            self._run("c", 64000, 4.0e7, signature=None),
+        ]
+        groups = assess_run_history(runs)
+        self.assertEqual(len(groups), 1)
+        self.assertFalse(groups[0]["comparable"])
+        self.assertIsNone(groups[0]["assessment"])
+        self.assertIn("配置签名", groups[0]["verdict"])
+        self.assertIn("不做收敛判断", groups[0]["verdict"])
+
+    def test_duplicate_mesh_is_deduplicated(self):
+        """
+        同一个网格跑两次只算一次（保留最新）：重复的尺寸不是一次加密。
+
+        不去重的话密序不严格递减，判定会直接失效——用户会看到"无法判断"，
+        却不知道为什么（他只是把同一件事跑了两遍）。
+        """
+        runs = [
+            self._run("newest", 8000, 3.0e7),
+            self._run("older", 8000, 2.9e7),          # 同一个网格，更早
+            self._run("coarse", 1000, 1.0e7),
+            self._run("fine", 64000, 5.0e7),
+        ]
+        groups = assess_run_history(runs)
+        group = groups[0]
+        self.assertEqual(group["distinctMeshCount"], 3)
+        # 保留的是**输入顺序里第一条**（列表按时间倒序 ⇒ 最新的）
+        self.assertIn("newest", group["runIds"])
+        self.assertNotIn("older", group["runIds"])
+
+    def test_two_distinct_meshes_are_not_enough(self):
+        runs = [self._run("a", 1000, 1.0e7), self._run("b", 8000, 2.0e7)]
+        group = assess_run_history(runs)[0]
+        self.assertIsNone(group["assessment"])
+        self.assertIn("2 个不同的网格", group["verdict"])
+
+    def test_runs_without_mesh_or_value_are_skipped(self):
+        """缺网格信息或缺数值的记录无法参与对比，但也不该让整组失败。"""
+        missing_mesh = self._run("x", 1000, 1.0e7)
+        missing_mesh["summary"]["mesh"] = {}
+        missing_value = self._run("y", 8000, 1.0e7)
+        missing_value["summary"]["quantities"] = {}
+        runs = [
+            missing_mesh, missing_value,
+            self._run("a", 1000, 1.0e7),
+            self._run("b", 8000, 2.0e7),
+            self._run("c", 64000, 4.0e7),
+        ]
+        group = assess_run_history(runs)[0]
+        self.assertEqual(group["distinctMeshCount"], 3)
+        self.assertNotIn("x", group["runIds"])
+        self.assertNotIn("y", group["runIds"])
+
+    def test_verdict_says_it_is_a_retrospective_comparison(self):
+        """结论必须写明这是**事后**对比，不是受控的加密实验。"""
+        runs = [
+            self._run("a", 1000, 1.0e7),
+            self._run("b", 8000, 2.0e7),
+            self._run("c", 64000, 4.0e7),
+        ]
+        group = assess_run_history(runs)[0]
+        self.assertIn("事后对比", group["verdict"])
+
+    def test_mesh_size_is_used_when_element_count_is_missing(self):
+        """没有单元数时回退到名义网格尺寸（仍然可比，只是精度差些）。"""
+        runs = []
+        for index, (size, value) in enumerate(((2.0, 1.0e7), (1.0, 2.0e7), (0.5, 4.0e7))):
+            run = self._run(f"r{index}", 0, value)
+            run["summary"]["mesh"] = {"meshSize": size}
+            runs.append(run)
+        group = assess_run_history(runs)[0]
+        self.assertEqual(group["distinctMeshCount"], 3)
+        self.assertEqual(group["sizes"], [2.0, 1.0, 0.5])
+
+    def test_different_analysis_types_are_not_mixed(self):
+        """结构分析与热分析当然不能混在一起。"""
+        runs = [
+            self._run("s1", 1000, 1.0e7, signature="sig"),
+            self._run("s2", 8000, 2.0e7, signature="sig"),
+            self._run("t1", 1000, 5.0e5, signature="sig", analysis_type="thermal"),
+        ]
+        groups = assess_run_history(runs)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(
+            {group["analysisType"] for group in groups}, {"structural", "thermal"}
+        )
+
+    def test_unknown_analysis_type_is_ignored(self):
+        runs = [self._run("a", 1000, 1.0)]
+        runs[0]["analysis_type"] = "cfd"
+        self.assertEqual(assess_run_history(runs), [])
+
+    def test_empty_history_is_empty(self):
+        self.assertEqual(assess_run_history([]), [])
 
 
 class RunsApiTest(unittest.TestCase):

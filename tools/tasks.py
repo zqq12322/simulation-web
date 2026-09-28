@@ -2072,7 +2072,8 @@ def _check_frontend_runs_math(node: str) -> tuple[bool, str]:
 #:      否则用户会把"空摘要"读成"这次什么都没算出来"。
 _RUNS_API_SELFTEST = r"""
 import { describeAnalysisType, describeRunMesh, describeRunWarnings,
-         historyIsTrimmed, runQuantityNames, toRun, toRunList } from './runsApi.ts';
+         historyIsTrimmed, runQuantityNames, shouldShowGroup, toRun, toRunAnalysis,
+         toRunList } from './runsApi.ts';
 
 let failures = [];
 const check = (name, ok, detail = '') => {
@@ -2182,6 +2183,55 @@ check('未达上限时不提示裁剪', historyIsTrimmed(list) === false);
 check('达到上限时提示裁剪',
       historyIsTrimmed({ runs: [], total: 50, limit: 50 }) === true);
 check('没有数据时不算裁剪', historyIsTrimmed(null) === false);
+
+// --- 跨运行对比 ---------------------------------------------------------------
+const analysis = toRunAnalysis({
+  minRuns: 3,
+  groups: [
+    {
+      analysisType: 'structural', setupSignature: 'sig-A', comparable: true,
+      runCount: 4, distinctMeshCount: 3, quantity: 'max_stress',
+      values: [29.02e6, 39.8e6, 55.65e6], sizes: [0.1328, 0.0902, 0.0473],
+      runIds: ['a', 'b', 'c'],
+      assessment: {
+        observed_order: 0.31, extrapolated_limit: 1.31e8,
+        last_relative_change: 0.19, converged: true,
+      },
+      verdict: '【事后对比，不是受控加密实验】观测收敛阶 0.31…',
+    },
+    {
+      analysisType: 'structural', setupSignature: null, comparable: false,
+      runCount: 2, distinctMeshCount: 2, quantity: 'max_stress',
+      values: [1.0, 2.0], sizes: [1.0, 0.5], runIds: ['d', 'e'],
+      assessment: null,
+      verdict: '这些运行没有记录配置签名…不做收敛判断。',
+    },
+  ],
+});
+check('对比能解析', analysis.groups.length === 2 && analysis.minRuns === 3);
+check('组字段映射（snake_case -> camelCase）',
+      analysis.groups[0].observedOrder === 0.31
+      && analysis.groups[0].extrapolatedLimit === 1.31e8
+      && analysis.groups[0].lastRelativeChange === 0.19
+      && analysis.groups[0].converged === true,
+      JSON.stringify(analysis.groups[0]));
+check('没有签名的组被标成不可比',
+      analysis.groups[1].comparable === false
+      && analysis.groups[1].observedOrder === null
+      && analysis.groups[1].converged === false);
+check('缺 assessment 时不崩（拿不到判定而不是编一个）',
+      toRunAnalysis({ groups: [{ analysisType: 'x', values: [], sizes: [] }] })
+        .groups[0].observedOrder === null);
+check('坏组被丢弃，好组保留',
+      toRunAnalysis({ groups: [null, 'x', analysis.groups[0]] }).groups.length === 1);
+check('垃圾输入得到空对比',
+      toRunAnalysis(null).groups.length === 0 && toRunAnalysis('x').minRuns === 3);
+check('至少两个网格的组才值得显示', shouldShowGroup(analysis.groups[0]) === true);
+check('只有一个网格的组不显示',
+      shouldShowGroup({ ...analysis.groups[0], distinctMeshCount: 1 }) === false);
+check('不可比的组仍然显示（要照实告诉用户）',
+      shouldShowGroup(analysis.groups[1]) === true);
+check('没有组时不显示', shouldShowGroup(null) === false);
 
 if (failures.length) {
   console.error('FAIL: ' + failures.join(' | '));
@@ -3873,6 +3923,107 @@ def task_verify(args: argparse.Namespace) -> int:
                     headers=alice_headers,
                 ).get("total") == 0,
                 "删完 total 归零",
+            )
+
+            # --- 跨运行对比（配置签名是"可比较"的前提）-------------------------
+            # 同一套配置、逐级加密的三次运行：应当被认出来是一条收敛序列。
+            signature = "verify-signature-1"
+            # 真按二阶收敛的数值（u = u* + C·N^(-2/3)，h² 对应单元数的 -2/3 次），
+            # 这样打印出来的观测阶本身就是证据，而不是"能跑通"而已。
+            expected_stress = 7.0e7
+            for elements in (1000, 8000, 64000):
+                stress = expected_stress + 3.0e7 * elements ** (-2 / 3)
+                _http_json(
+                    "POST",
+                    f"{API_BASE}/api/projects/{created_id}/runs",
+                    {
+                        "analysisType": "structural",
+                        "quantities": {"max_stress": stress,
+                                       "max_displacement": 1.0e-6},
+                        "elements": elements,
+                        "setupSignature": signature,
+                    },
+                    headers=alice_headers,
+                )
+            # 另一套配置（不同签名）：**不能**混进上面那条序列
+            _http_json(
+                "POST",
+                f"{API_BASE}/api/projects/{created_id}/runs",
+                {
+                    "analysisType": "structural",
+                    "quantities": {"max_stress": 9.9e7, "max_displacement": 2.0e-6},
+                    "elements": 500,
+                    "setupSignature": "verify-signature-2",
+                },
+                headers=alice_headers,
+            )
+            comparison = _http_json(
+                "GET", f"{API_BASE}/api/projects/{created_id}/runs/analysis",
+                headers=alice_headers,
+            )
+            groups = comparison.get("groups") or []
+            by_signature = {group.get("setupSignature"): group for group in groups}
+            check(
+                "跨运行对比：按配置签名分成两组（不同配置不能混成一条序列）",
+                len(groups) == 2
+                and set(by_signature) == {signature, "verify-signature-2"},
+                f"{len(groups)} 组：{sorted(key for key in by_signature if key)}",
+            )
+            first = by_signature.get(signature) or {}
+            first_assessment = first.get("assessment") or {}
+            check(
+                "跨运行对比：同签名的 3 次运行被判为二阶收敛",
+                first.get("comparable") is True
+                and first.get("distinctMeshCount") == 3
+                and abs((first_assessment.get("observed_order") or 0.0) - 2.0) < 0.01
+                and first.get("sizes") == sorted(first["sizes"], reverse=True),
+                f"观测阶={first_assessment.get('observed_order')} "
+                f"外推极限={first_assessment.get('extrapolated_limit')} "
+                f"（真值 {expected_stress:.3g}）",
+            )
+            check(
+                "跨运行对比：数值按粗 → 细单调且逐级更接近真值",
+                len(first.get("values") or []) == 3
+                and first["values"][0] > first["values"][1] > first["values"][2]
+                and abs(first["values"][2] - expected_stress)
+                < abs(first["values"][0] - expected_stress)
+                and "事后对比" in (first.get("verdict") or ""),
+                f"values={['%.4g' % v for v in (first.get('values') or [])]}",
+            )
+            check(
+                "跨运行对比：只读也能看（被共享者需要看到这个结论）",
+                _http_status(
+                    "GET", f"{API_BASE}/api/projects/{created_id}/runs/analysis",
+                    headers=bob_headers,
+                ) == 200,
+                "对比是读操作",
+            )
+            # 没有签名的旧记录：照实显示，但**拒绝判定**（不猜配置相同）
+            legacy_id = _http_json(
+                "POST", f"{API_BASE}/api/projects/{created_id}/runs",
+                {
+                    "analysisType": "thermal",
+                    "quantities": {"max_heat_flux": 5.0e5, "max_temperature": 373.15},
+                    "elements": 1000,
+                },
+                headers=alice_headers,
+            )
+            legacy_groups = [
+                group for group in (
+                    _http_json(
+                        "GET", f"{API_BASE}/api/projects/{created_id}/runs/analysis",
+                        headers=alice_headers,
+                    ).get("groups") or []
+                )
+                if group.get("analysisType") == "thermal"
+            ]
+            check(
+                "跨运行对比：没有配置签名的记录拒绝判定（不猜）",
+                legacy_id.get("setupSignature") is None
+                and len(legacy_groups) == 1
+                and legacy_groups[0].get("comparable") is False
+                and "不做收敛判断" in legacy_groups[0].get("verdict", ""),
+                legacy_groups[0].get("verdict", "")[:40] if legacy_groups else "没有组",
             )
 
             # 升级为 editor 之后就能改配置了——这才是"一起做"
