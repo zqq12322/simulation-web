@@ -21,7 +21,7 @@ import json
 import re
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from auth import require_user
@@ -29,7 +29,13 @@ from auth_store import get_store as get_auth_store
 from config import SIMULATION_SETUP_MAX_BCS, SIMULATION_SETUP_MAX_BYTES, resolve_upload_path
 from constraints import BoundaryCondition
 from logging_config import get_logger
-from project_store import ROLE_OWNER, SHARE_ROLES, SIMULATION_TYPES, get_store
+from project_store import (
+    ROLE_OWNER,
+    SHARE_ROLES,
+    SIMULATION_TYPES,
+    SetupConflict,
+    get_store,
+)
 from runs import get_run_store
 
 logger = get_logger(__name__)
@@ -201,6 +207,9 @@ class SimulationSetupResponse(BaseModel):
     setup: Optional[SimulationSetup] = None
     #: 上次保存时间；从未保存过为 None
     savedAt: Optional[str] = None
+    #: 乐观并发控制用的版本号：保存时把它作为 `If-Match` 回传，
+    #: 与库里不一致就说明期间有人改过（保存会被 409 拒绝，而不是静默覆盖）
+    version: int = 0
 
 
 #: 所有项目端点都必须登录。**按属主过滤**（而不是"先查出来再判断"）：
@@ -361,9 +370,41 @@ def store_owner_id(project_id: str) -> Optional[str]:
     return row["owner_id"] if row else None
 
 
+def parse_if_match(value: Optional[str]) -> Optional[int]:
+    """
+    解析 `If-Match` 头里的版本号。
+
+    宽容一点：接受 `3`、`"3"`、`W/"3"`（引号与弱校验前缀是 HTTP 的标准写法，
+    而不同客户端会写不同形式）。空值返回 `None`（= 无条件保存）。
+    解析不出来返回 `-1`，由调用方转 400——**不能当成"没有条件"**，那会把一个
+    写错的头静默降级成"无条件覆盖"，正好丢掉这一轮要建立的安全保障。
+
+    **先判类型**：直接调用端点函数时（本仓库的测试就是这么做的）拿到的是
+    FastAPI 的 `Header` 标记对象而不是字符串。不判类型的话它会一路走到
+    `text.strip()` 上炸掉——那是测试装置的产物，不该变成端点的行为。
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.startswith("W/"):
+        text = text[2:].strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        text = text[1:-1]
+    try:
+        version = int(text)
+    except (TypeError, ValueError):
+        return -1
+    return version if version >= 0 else -1
+
+
 @router.put("/projects/{project_id}/setup", response_model=SimulationSetupResponse)
 async def put_project_setup(
-    project_id: str, request: SimulationSetup, user: dict = OwnedUser
+    project_id: str,
+    request: SimulationSetup,
+    user: dict = OwnedUser,
+    if_match: Optional[str] = Header(default=None, alias="If-Match"),
 ):
     """
     覆盖保存仿真配置（整份替换，不做局部合并）。
@@ -374,6 +415,18 @@ async def put_project_setup(
     为什么这里用 403 而不是 404：能走到这一步的人**已经知道项目存在**
     （他在列表里看得见、也读得到配置），此时再返回 404 只会让人困惑。
     404 是用来对"不知道存不存在"的人隐藏信息的。
+
+    **并发写**：带上 `If-Match: "<版本号>"` 时启用乐观并发控制——只有当库里的
+    版本与它相同才写入，否则返回 **409**。不带这个头就是无条件覆盖
+    （老客户端 / 脚本的兼容路径）。
+
+    为什么版本号放在**响应体**、而不是 200 的 `ETag` 头：发响应头要注入
+    `Response` 对象，而它会挤进端点的位置参数、破坏既有的直接调用方式
+    （测试就是直接调端点函数的）。版本号放进 JSON 一样够用——我们的客户端本来
+    就读 JSON——而 409 上仍然附 `ETag`，顺手照顾 curl 之类的用法。
+
+    为什么不加锁：这把"两个人同时改"从**静默丢数据**变成**显式冲突**，代价只是
+    一个整数。真正的锁需要过期、续租、崩溃回收，是另一套要长期维护的状态。
     """
     store = get_store()
     role = store.access_role(project_id, user["id"])
@@ -399,9 +452,29 @@ async def put_project_setup(
             ),
         )
 
-    saved = store.set_setup(project_id, payload, store_owner_id(project_id))
+    expected_version = parse_if_match(if_match)
+    if expected_version == -1:
+        raise HTTPException(
+            status_code=400,
+            detail="If-Match 必须是版本号（例如 \"3\"）；留空表示无条件保存",
+        )
+
+    try:
+        saved = store.set_setup(
+            project_id, payload, store_owner_id(project_id),
+            expected_version=expected_version,
+        )
+    except SetupConflict as conflict:
+        # 409 而不是 403/404：请求本身完全合法，只是**基线过期了**。
+        # 把当前版本放进 ETag，客户端就能立刻重试（或者先看清差异再说）。
+        raise HTTPException(
+            status_code=409,
+            detail=str(conflict),
+            headers={"ETag": f'"{conflict.current_version}"'},
+        )
     if saved is None:  # pragma: no cover - 上面已确认项目存在
         raise HTTPException(status_code=404, detail=f"项目不存在：{project_id}")
+    # 新版本号随响应体返回（见 docstring 里"为什么不发 ETag 头"）
     return SimulationSetupResponse(**saved)
 
 

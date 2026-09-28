@@ -5,12 +5,14 @@
 设置**全在浏览器内存里**，关掉页面就没了。于是"项目"这个概念的承诺（下次接着做）
 实际上是空的：重新打开项目是一个空白工作台。
 
-这组测试覆盖四层：
+这组测试覆盖五层：
 1. `SetupStoreTest`——存储：往返、覆盖、清空、**属主隔离**、坏 JSON 的兜底；
 2. `SetupValidationTest`——校验策略是**分级**的（后端要消费的字段从严，
    纯界面设置从宽但有界），每一条都要有明确的理由；
 3. `SetupApiTest`——端点语义：404（项目不属于你）与 200+null（还没配过）必须分开；
-4. `SetupMigrationTest`——老库自动补 `setup` 列且旧数据不丢。
+4. `SetupConcurrencyTest`——**乐观并发控制**：过期保存必须被拒绝，而且
+   **不能改动库里的内容**（这是"不再静默丢数据"的全部意义）；
+5. `SetupMigrationTest`——老库自动补 `setup` / `setup_version` 列且旧数据不丢。
 """
 
 import asyncio
@@ -25,7 +27,7 @@ from pydantic import ValidationError
 
 import project_store as project_store_module
 import projects as projects_module
-from project_store import ProjectStore
+from project_store import ProjectStore, SetupConflict
 
 
 def _setup_payload(**overrides):
@@ -75,7 +77,7 @@ class SetupStoreTest(unittest.TestCase):
         self.assertEqual(self.project["hasSetup"], False)
         self.assertEqual(
             self.store.get_setup(self.project["id"], "user-a"),
-            {"setup": None, "savedAt": None},
+            {"setup": None, "savedAt": None, "version": 0},
         )
 
     def test_save_and_read_back(self):
@@ -150,7 +152,7 @@ class SetupStoreTest(unittest.TestCase):
             )
         self.assertEqual(
             self.store.get_setup(self.project["id"], "user-a"),
-            {"setup": None, "savedAt": None},
+            {"setup": None, "savedAt": None, "version": 0},
         )
         self.assertFalse(self.store.list_projects("user-a")[0]["hasSetup"])
 
@@ -347,6 +349,211 @@ class SetupApiTest(unittest.TestCase):
         self.assertTrue(dumped["hasSetup"])
 
 
+class SetupConcurrencyTest(unittest.TestCase):
+    """
+    乐观并发控制：把"两个人同时改"从**静默丢数据**变成**显式冲突**。
+
+    最要紧的一条断言不是"返回 409"，而是"**冲突时库里的内容没变**"——
+    409 只是手段，"先保存的人的工作没被抹掉"才是目的。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = ProjectStore(Path(self._tmp.name) / "concurrency.db")
+        # 端点用的是**模块级**的 get_store()，而 `from … import get_store` 是导入时
+        # 绑定函数对象的，所以 projects_module 与 project_store_module 两份引用都要
+        # 替换——只换一份的话端点会去开真实库，表现为莫名其妙的 404。
+        self._original = (
+            projects_module.get_store, project_store_module.get_store,
+        )
+        projects_module.get_store = lambda: self.store
+        project_store_module.get_store = lambda: self.store
+        self.project = self.store.create(title="并发", owner_id="owner-1")
+
+    def tearDown(self):
+        (projects_module.get_store, project_store_module.get_store) = self._original
+        self._tmp.cleanup()
+
+    # ------------------------------------------------------------- 版本号
+    def test_version_starts_at_zero_and_increments(self):
+        self.assertEqual(
+            self.store.get_setup(self.project["id"], "owner-1")["version"], 0
+        )
+        first = self.store.set_setup(
+            self.project["id"], _setup_payload(), owner_id="owner-1"
+        )
+        self.assertEqual(first["version"], 1)
+        second = self.store.set_setup(
+            self.project["id"], _setup_payload(), owner_id="owner-1"
+        )
+        self.assertEqual(second["version"], 2)
+
+    def test_unconditional_save_ignores_version(self):
+        """不带版本号 = 无条件覆盖（老客户端/脚本的兼容路径）。"""
+        self.store.set_setup(self.project["id"], _setup_payload(), owner_id="owner-1")
+        saved = self.store.set_setup(
+            self.project["id"], _setup_payload(), owner_id="owner-1",
+            expected_version=None,
+        )
+        self.assertEqual(saved["version"], 2)
+
+    # ------------------------------------------------------------- 冲突
+    def test_matching_version_is_accepted(self):
+        first = self.store.set_setup(
+            self.project["id"], _setup_payload(), owner_id="owner-1"
+        )
+        saved = self.store.set_setup(
+            self.project["id"], _setup_payload(materialId="aluminum_6061"),
+            owner_id="owner-1", expected_version=first["version"],
+        )
+        self.assertEqual(saved["version"], 2)
+        self.assertEqual(saved["setup"]["materialId"], "aluminum_6061")
+
+    def test_stale_version_is_rejected_and_storage_is_untouched(self):
+        """
+        过期保存必须被拒，**而且库里的内容一个字都不能改**。
+
+        这是这一轮的全部意义：在此之前，后保存的人会静默覆盖先保存的人。
+        """
+        first = self.store.set_setup(
+            self.project["id"], _setup_payload(materialId="structural_steel"),
+            owner_id="owner-1",
+        )
+        # 另一个人（editor）在同一基线上改了一次
+        self.store.set_setup(
+            self.project["id"], _setup_payload(materialId="aluminum_6061"),
+            owner_id="owner-1", expected_version=first["version"],
+        )
+
+        with self.assertRaises(SetupConflict) as ctx:
+            self.store.set_setup(
+                self.project["id"], _setup_payload(materialId="titanium"),
+                owner_id="owner-1", expected_version=first["version"],
+            )
+        self.assertEqual(ctx.exception.current_version, 2)
+
+        # ★ 关键：内容仍然是别人写进去的那一份，titanium 没有被写进去
+        stored = self.store.get_setup(self.project["id"], "owner-1")
+        self.assertEqual(stored["setup"]["materialId"], "aluminum_6061")
+        self.assertEqual(stored["version"], 2)
+
+    def test_conflict_reports_the_current_version(self):
+        self.store.set_setup(self.project["id"], _setup_payload(), owner_id="owner-1")
+        with self.assertRaises(SetupConflict) as ctx:
+            self.store.set_setup(
+                self.project["id"], _setup_payload(), owner_id="owner-1",
+                expected_version=0,
+            )
+        # 客户端据此立刻重试（或者先看清差异）
+        self.assertEqual(ctx.exception.current_version, 1)
+
+    def test_unknown_project_is_not_a_conflict(self):
+        """项目不存在 / 不属于该属主时仍是 `None`（404），不是冲突（409）。"""
+        result = self.store.set_setup(
+            "nope", _setup_payload(), owner_id="owner-1", expected_version=0
+        )
+        self.assertIsNone(result)
+        result = self.store.set_setup(
+            self.project["id"], _setup_payload(), owner_id="someone-else",
+            expected_version=0,
+        )
+        self.assertIsNone(result)
+
+    def test_clear_also_bumps_the_version(self):
+        """
+        清空也是一次修改，必须 +1。
+
+        不 +1 的话，正在编辑的人（拿着旧版本号）会在清空之后成功保存，
+        把"清空"这件事悄悄抹掉——那正是本轮要消除的静默覆盖。
+        """
+        self.store.set_setup(self.project["id"], _setup_payload(), owner_id="owner-1")
+        self.assertTrue(self.store.clear_setup(self.project["id"], "owner-1"))
+        after_clear = self.store.get_setup(self.project["id"], "owner-1")
+        self.assertIsNone(after_clear["setup"])
+        self.assertEqual(after_clear["version"], 2)
+        with self.assertRaises(SetupConflict):
+            self.store.set_setup(
+                self.project["id"], _setup_payload(), owner_id="owner-1",
+                expected_version=1,
+            )
+
+    # ------------------------------------------------------------- 端点
+    def test_parse_if_match_accepts_the_usual_spellings(self):
+        """`3`、`"3"`、`W/"3"` 都要认（不同客户端写法不同）。"""
+        for raw in ("3", '"3"', 'W/"3"', " 3 ", 'W/"3" '):
+            with self.subTest(raw=raw):
+                self.assertEqual(projects_module.parse_if_match(raw), 3)
+        self.assertIsNone(projects_module.parse_if_match(None))
+        self.assertIsNone(projects_module.parse_if_match(""))
+        self.assertIsNone(projects_module.parse_if_match("   "))
+        # 直接调用端点函数时拿到的是 FastAPI 的 Header 标记对象，不是字符串
+        self.assertIsNone(projects_module.parse_if_match(object()))
+
+    def test_parse_if_match_rejects_garbage_instead_of_ignoring_it(self):
+        """
+        解析不出来必须返回 `-1`（调用方转 400），**不能当成"没有条件"**。
+
+        当成"没有条件"会把一个写错的头静默降级成无条件覆盖——正好丢掉这一轮
+        要建立的安全保障。
+        """
+        for raw in ("abc", "1.5", "-1", "3x", '"'):
+            with self.subTest(raw=raw):
+                self.assertEqual(projects_module.parse_if_match(raw), -1)
+
+    def test_endpoint_saves_and_returns_the_new_version(self):
+        request = projects_module.SimulationSetup(**_setup_payload())
+        saved = asyncio.run(
+            projects_module.put_project_setup(
+                self.project["id"], request, user={"id": "owner-1"},
+                if_match='"0"',
+            )
+        )
+        self.assertEqual(saved.version, 1)
+
+    def test_endpoint_rejects_a_stale_write_with_409(self):
+        request = projects_module.SimulationSetup(**_setup_payload())
+        asyncio.run(
+            projects_module.put_project_setup(
+                self.project["id"], request, user={"id": "owner-1"}, if_match='"0"',
+            )
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(
+                projects_module.put_project_setup(
+                    self.project["id"], request, user={"id": "owner-1"},
+                    if_match='"0"',
+                )
+            )
+        self.assertEqual(ctx.exception.status_code, 409)
+        # 冲突响应带上当前版本，客户端据此重试
+        self.assertEqual(ctx.exception.headers.get("ETag"), '"1"')
+
+    def test_endpoint_rejects_a_malformed_header_with_400(self):
+        request = projects_module.SimulationSetup(**_setup_payload())
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(
+                projects_module.put_project_setup(
+                    self.project["id"], request, user={"id": "owner-1"},
+                    if_match="not-a-version",
+                )
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+        # 400 而不是"当成无条件写入"：内容必须原封不动
+        self.assertEqual(
+            self.store.get_setup(self.project["id"], "owner-1")["version"], 0
+        )
+
+    def test_endpoint_without_if_match_still_works(self):
+        """老客户端不带这个头：无条件保存（不能因为加了并发控制就把它弄坏）。"""
+        request = projects_module.SimulationSetup(**_setup_payload())
+        saved = asyncio.run(
+            projects_module.put_project_setup(
+                self.project["id"], request, user={"id": "owner-1"}
+            )
+        )
+        self.assertEqual(saved.version, 1)
+
+
 class SetupMigrationTest(unittest.TestCase):
     """老库（没有 setup 列）打开时自动补列，且旧数据不丢。"""
 
@@ -384,7 +591,7 @@ class SetupMigrationTest(unittest.TestCase):
             self.assertEqual(row["title"], "老项目", "迁移后旧数据必须还在")
             self.assertFalse(row["hasSetup"])
             self.assertEqual(
-                store.get_setup("legacy1", "user-a"), {"setup": None, "savedAt": None}
+                store.get_setup("legacy1", "user-a"), {"setup": None, "savedAt": None, "version": 0}
             )
             # 迁移后新保存也应正常
             store.set_setup("legacy1", _setup_payload(), owner_id="user-a")

@@ -42,6 +42,7 @@ import {
   buildSetupPayload,
   describeSaveStatus,
   restoreSetup,
+  setupDocumentVersion,
   setupSignature,
   type SaveStatus,
 } from '../utils/projectSetup';
@@ -239,6 +240,13 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   const [setupStatus, setSetupStatus] = useState<SaveStatus>('idle');
   const [setupSavedAt, setSetupSavedAt] = useState<string | null>(null);
   const [setupError, setSetupError] = useState<string | null>(null);
+  // 乐观并发控制：保存时把这一版号作为 If-Match 回传。
+  // 别人先改过就会拿到 409——这时**停止自动保存并提示**，而不是把别人的改动盖掉。
+  const [setupVersion, setSetupVersion] = useState<number | null>(null);
+  const setupVersionRef = React.useRef<number | null>(null);
+  const [setupConflict, setSetupConflict] = useState<string | null>(null);
+  /** 递增即可让下面的加载 effect 重跑（冲突后重新加载用） */
+  const [setupReloadKey, setSetupReloadKey] = useState(0);
   const [setupLoading, setSetupLoading] = useState(true);
   const [setupWarnings, setSetupWarnings] = useState<string[]>([]);
   /** 上次落库的配置签名；用它判断"有没有真的变"，避免每次重渲染都写库 */
@@ -286,19 +294,43 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     setSetupStatus('saving');
     setSetupError(null);
     try {
+      // 带上 If-Match：告诉后端"我是基于哪一版改的"。
+      // 期间有人改过就返回 409，而不是把我的改动**静默盖上去**
+      //（在此之前，后保存的人会无声抹掉先保存的人的工作）。
       const { data } = await axios.put(
         `${API_BASE_URL}/api/projects/${project.id}/setup`,
         payload,
-        { headers: currentAuthHeaders() },
+        {
+          headers: {
+            ...currentAuthHeaders(),
+            ...(setupVersionRef.current !== null
+              ? { 'If-Match': `"${setupVersionRef.current}"` }
+              : {}),
+          },
+        },
       );
+      setupVersionRef.current = setupDocumentVersion(data);
+      if (setupVersionRef.current !== null) setSetupVersion(setupVersionRef.current);
       lastSavedSignature.current = setupSignature(data?.setup ?? payload);
       setSetupSavedAt(data?.savedAt ?? null);
+      setSetupConflict(null);
       setSetupStatus('saved');
       return true;
     } catch (error: any) {
       console.error('保存项目配置失败:', error);
       if (isUnauthorized(error)) {
         notifySessionExpired('登录已失效，请重新登录后再保存配置。');
+      }
+      // 409 = 别人先改了。**必须停止自动保存并说出来**：
+      // 继续自动保存只会一次次撞 409，而用户完全不知道发生了什么。
+      if (errorStatus(error) === 409) {
+        setupVersionRef.current = null;      // 版本未知：后续保存一律先重新加载
+        setSetupStatus('conflict');
+        setSetupConflict(
+          error?.response?.data?.detail
+            || '这个项目已被其他人修改，你的改动**没有**保存，请先重新加载。',
+        );
+        return false;
       }
       // **不能显示成"已保存"**：用户会以为配置存下来了，下次打开才发现全丢了
       setSetupStatus('error');
@@ -332,6 +364,10 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
         setModelName(restored.geometryFilename);
         setSetupWarnings(restored.warnings);
         setSetupSavedAt(data?.savedAt ?? null);
+        const loadedVersion = setupDocumentVersion(data);
+        setupVersionRef.current = loadedVersion;
+        setSetupVersion(loadedVersion);
+        setSetupConflict(null);
 
         // 材料只有 id：去后端换成完整对象；换不到（材料被删了）就留空并说明
         if (restored.materialId) {
@@ -404,13 +440,17 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     };
     load();
     return () => { cancelled = true; };
-    // 只依赖项目 id：配置的其余状态由自动保存负责
+    // 只依赖项目 id 与"重新加载"计数：配置的其余状态由自动保存负责。
+    // `setupReloadKey` 用来在冲突之后手动重载服务器版本。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [API_BASE_URL, project.id]);
+  }, [API_BASE_URL, project.id, setupReloadKey]);
 
   // 自动保存（防抖 1.5 秒）。配置改变时写回后端，状态条如实显示结果。
   React.useEffect(() => {
     if (setupLoading) return;
+    // **冲突期间不自动保存**：这时手里的基线是过期的，继续写只会一次次撞 409，
+    // 而用户完全不知道发生了什么。先让他重新加载（或自己决定怎么办）。
+    if (setupConflict) return;
     // 只读用户不自动保存（也不显示"未修改"，而是显示"只读 · 不会保存"）
     if (!canEdit) {
       setSetupStatus('readonly');
@@ -424,8 +464,8 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
     const timer = setTimeout(() => { void saveSetup(); }, 1500);
     return () => clearTimeout(timer);
   }, [
-    setupLoading, canEdit, modelName, selectedMaterial, boundaryConditions,
-    meshSettings, solverSettings, saveSetup,
+    setupLoading, canEdit, setupConflict, modelName, selectedMaterial,
+    boundaryConditions, meshSettings, solverSettings, saveSetup,
   ]);
 
   /**
@@ -1380,7 +1420,26 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
                 重试
               </button>
             )}
+            {setupStatus === 'conflict' && (
+              <button
+                onClick={() => setSetupReloadKey(key => key + 1)}
+                className="ml-1 underline hover:text-white"
+                title="丢弃本地未保存的改动，重新读取服务器上的配置"
+              >
+                重新加载
+              </button>
+            )}
           </div>
+          {/* 冲突必须显式说出来，并说明"你的改动没有保存"。
+              只显示一个红色状态码不够——用户会以为已经被保存了。 */}
+          {setupConflict && (
+            <div className="mt-1 text-[11px] text-yellow-500 leading-snug max-w-[260px]">
+              这个项目已被其他人修改，**你的改动没有保存**。
+              {setupConflict}
+              <br />
+              重新加载会丢弃你本地未保存的改动。
+            </div>
+          )}
         </div>
 
         <div className="flex items-center gap-3">

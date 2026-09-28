@@ -480,6 +480,13 @@ def _bearer(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _with_header(headers: dict, name: str, value: str) -> dict:
+    """在已有请求头上加一项（不改原字典——它通常被多处复用）。"""
+    merged = dict(headers)
+    merged[name] = value
+    return merged
+
+
 def _http_download(url: str, headers: Optional[dict] = None) -> dict:
     """
     取一个文件并返回状态码、字节数与 Content-Type（**不解析正文**）。
@@ -4011,6 +4018,84 @@ def task_verify(args: argparse.Namespace) -> int:
                 "清空配置后项目还在、配置为空",
                 cleared.get("cleared") is True and after_clear.get("setup") is None,
                 f"setup={after_clear.get('setup')}",
+            )
+
+            # ---- 乐观并发控制：并发编辑不许静默覆盖 ----
+            # 在此之前，属主与 editor 同时改就是"后保存的赢"——先保存的人的工作
+            # **无声消失**。现在带 If-Match 的过期保存会被 409 拒绝。
+            #
+            # 版本号要**先读**（就像真实客户端那样）：这一节前面已经保存过几次，
+            # 写死一个版本号只会撞 409——第一版就是这么写的，而 verify 如实报了
+            # `HTTP Error 409: Conflict`（机制本身工作正常）。
+            before = _http_json(
+                "GET", f"{API_BASE}/api/projects/{created_id}/setup",
+                headers=alice_headers,
+            )
+            base_version = before["version"]
+            saved_first = _http_json(
+                "PUT", f"{API_BASE}/api/projects/{created_id}/setup",
+                setup_document,
+                headers=_with_header(alice_headers, "If-Match", f'"{base_version}"'),
+            )
+            check(
+                "带 If-Match 的保存成功并把版本号 +1",
+                saved_first.get("version") == base_version + 1,
+                f"version {base_version} -> {saved_first.get('version')}",
+            )
+            # 第二个人基于**同一个旧版本号**再保存 → 必须被拒
+            stale_status = _http_status(
+                "PUT", f"{API_BASE}/api/projects/{created_id}/setup",
+                dict(setup_document, geometryFilename="default_cube.step"),
+                headers=_with_header(alice_headers, "If-Match", f'"{base_version}"'),
+            )
+            stored_after_conflict = _http_json(
+                "GET", f"{API_BASE}/api/projects/{created_id}/setup",
+                headers=alice_headers,
+            )
+            check(
+                "过期保存被 409 拒绝，且库里的内容没被改动",
+                stale_status == 409
+                and stored_after_conflict["setup"]["geometryFilename"]
+                == setup_document["geometryFilename"]
+                and stored_after_conflict["version"] == base_version + 1,
+                f"HTTP {stale_status}；库里几何仍是"
+                f" {stored_after_conflict['setup']['geometryFilename']}"
+                "（**不是**被拒的那一份 default_cube.step）",
+            )
+            # 用当前版本号重试 → 成功，版本再 +1
+            retried = _http_json(
+                "PUT", f"{API_BASE}/api/projects/{created_id}/setup",
+                dict(setup_document, geometryFilename="default_cube.step"),
+                headers=_with_header(
+                    alice_headers, "If-Match", f'"{base_version + 1}"'
+                ),
+            )
+            check(
+                "拿到最新版本号后重试可以保存",
+                retried.get("version") == base_version + 2,
+                f"version={retried.get('version')}",
+            )
+            check(
+                "写坏 If-Match 是 400，而不是退化成无条件覆盖",
+                _http_status(
+                    "PUT", f"{API_BASE}/api/projects/{created_id}/setup",
+                    setup_document,
+                    headers=_with_header(alice_headers, "If-Match", "not-a-version"),
+                ) == 400,
+                "解析不出来必须报错——降级成无条件写入会丢掉这层保护",
+            )
+            check(
+                "不带 If-Match 仍然可以保存（老客户端兼容）",
+                _http_json(
+                    "PUT", f"{API_BASE}/api/projects/{created_id}/setup",
+                    setup_document, headers=alice_headers,
+                ).get("version") == base_version + 3,
+                "无条件覆盖这条路不能被并发控制弄坏",
+            )
+            # 把配置恢复成后面检查用的样子
+            _http_json(
+                "PUT", f"{API_BASE}/api/projects/{created_id}/setup",
+                setup_document, headers=alice_headers,
             )
 
             # ---- 共享与协作权限 ----

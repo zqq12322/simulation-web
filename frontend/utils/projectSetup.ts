@@ -166,7 +166,31 @@ export function restoreSetup(raw: unknown): RestoredSetup {
 }
 
 /** 自动保存的状态机取值。 */
-export type SaveStatus = 'idle' | 'saving' | 'saved' | 'error' | 'readonly';
+export type SaveStatus =
+  | 'idle'
+  | 'saving'
+  | 'saved'
+  | 'error'
+  | 'readonly'
+  //: 别人先改了（409）：改动**没有**保存，必须先重新加载
+  | 'conflict';
+
+/**
+ * 从 GET/PUT /setup 的响应里取版本号（乐观并发控制用）。
+ *
+ * 取不到时返回 
+ull，调用方据此**不发 If-Match**（等价于无条件保存）。
+ * 为什么不回落到 0：版本 0 是一个**真实存在**的版本，把它当成没有版本
+ * 会让基于旧基线的保存被误认为是最新的，正好绕开这一层保护。
+ */
+export function setupDocumentVersion(raw: unknown): number | null {
+  if (raw === null || typeof raw !== 'object') return null;
+  const value = (raw as Record<string, unknown>).version;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    return null;
+  }
+  return value;
+}
 
 /**
  * 保存状态 → 界面文案。
@@ -182,6 +206,8 @@ export function describeSaveStatus(
   switch (status) {
     case 'saving':
       return '保存中…';
+    case 'conflict':
+      return '有冲突：未保存';
     case 'saved': {
       const at = detail?.savedAt ? new Date(detail.savedAt) : null;
       if (!at || Number.isNaN(at.getTime())) return '已保存';
