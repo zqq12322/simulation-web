@@ -1852,6 +1852,432 @@ def _check_frontend_convergence_study_math(node: str) -> tuple[bool, str]:
     return ok, ("四态区分 / 缺失≠0 / 单位换算 / 趋势图横轴 均符合断言" if ok else detail)
 
 
+#: 结果导出（CSV / VTK）的纯逻辑。
+#:
+#: 这一层最要紧的一条契约是**精度不能丢**：导出的文本必须能精确还原原始双精度
+#: 数。写成 `toFixed(6)` 之类的做法会静默丢精度——文件看着完全正常，数值已经
+#: 不对了。所以这里直接断言 `Number(写出来的文本) === 原始值`。
+#:
+#: 另外钉两件事：长度不一致要**拒绝导出**（否则位移会被贴到别的节点上，
+#: 而文件依然合法、依然能打开）；行尾约定（CSV 用 CRLF、VTK 用 LF）不能被
+#: "顺手统一"。
+_RESULT_EXPORT_SELFTEST = r"""
+import { buildLegacyVtk, buildResultCsv, csvCell, describeExportProblem,
+         exportFilename, filenameStamp, validateExportFields,
+         validateExportMesh } from './resultExport.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+// 两个四面体的小网格（元素是 **0 基**索引，与 VTK 一致）
+const mesh = {
+  nodes: [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]],
+  elements: [[0, 1, 2, 3], [1, 2, 3, 4]],
+};
+const displacement = [
+  [0, 0, 0], [1e-9, -2.5e-10, 3.75e-11], [0.1, 0.2, 0.3],
+  [1 / 3, 2 / 3, 1], [-0, 1.5, -2.25],
+];
+const vonMises = [0, 1.2345678901234567e7, 0.1, 1e-300, 123456.789];
+const fields = {
+  vectors: [{ name: 'displacement_m', values: displacement }],
+  scalars: [{ name: 'von_mises_Pa', values: vonMises }],
+};
+
+// --- CSV ----------------------------------------------------------------------
+const csv = buildResultCsv(mesh, fields);
+check('CSV 能生成', typeof csv === 'string' && csv.length > 0);
+const csvLines = csv.split('\r\n');
+check('CSV 表头带单位', csvLines[0] === 'node,x,y,z,displacement_m_x,displacement_m_y,'
+      + 'displacement_m_z,von_mises_Pa', csvLines[0]);
+check('CSV 行数 = 节点数 + 表头 + 末尾空行', csvLines.length === mesh.nodes.length + 2,
+      String(csvLines.length));
+check('CSV 第 0 行数值正确',
+      csvLines[1] === '0,0,0,0,0,0,0,0', csvLines[1]);
+check('CSV 第 1 行数值正确',
+      csvLines[2] === '1,1,0,0,1e-9,-2.5e-10,3.75e-11,12345678.901234567', csvLines[2]);
+check('CSV 用 CRLF（RFC 4180，Excel 友好）',
+      csv.includes('\r\n') && !/(^|[^\r])\n/.test(csv), JSON.stringify(csv.slice(0, 40)));
+check('CSV 以换行收尾', csv.endsWith('\r\n'));
+
+// 精度：写出来的文本必须能**精确还原**原始双精度数
+const tricky = [0.1, 1 / 3, 1e-300, 1.2345678901234567e7, -0, 1e21, 5e-324];
+const precisionOk = tricky.every(value => {
+  const text = value === 0 ? '0' : String(value);
+  return Number(text) === value;
+});
+check('JS 的 String() 是精确往返的（这是选它的唯一理由）', precisionOk);
+check('CSV 里的数能精确还原',
+      Number(csvLines[2].split(',')[4]) === displacement[1][0]
+      && Number(csvLines[2].split(',')[7]) === vonMises[1],
+      `${Number(csvLines[2].split(',')[7])} vs ${vonMises[1]}`);
+check('toFixed 会丢精度（反证：所以不能用它）',
+      Number((1.2345678901234567e7).toFixed(6)) !== 1.2345678901234567e7);
+
+// 每行列数一致（否则不同解析器会各行其是）
+const columnCounts = new Set(csv.trimEnd().split('\r\n').map(line => line.split(',').length));
+check('CSV 每行列数一致', columnCounts.size === 1, JSON.stringify([...columnCounts]));
+check('列数 = 4 + 3 + 1', [...columnCounts][0] === 8, String([...columnCounts][0]));
+
+// 没有场时也能导出（只有几何）
+const plainCsv = buildResultCsv(mesh, {});
+check('没有结果场时 CSV 只有坐标', plainCsv.split('\r\n')[0] === 'node,x,y,z');
+
+// 转义：字段名里有逗号/引号时必须包起来
+check('csvCell 逗号转义', csvCell('a,b') === '"a,b"', csvCell('a,b'));
+check('csvCell 引号转义', csvCell('a"b') === '"a""b"', csvCell('a"b'));
+check('csvCell 换行转义', csvCell('a\nb') === '"a\nb"');
+check('csvCell 普通文本不动', csvCell('von_mises_Pa') === 'von_mises_Pa');
+check('字段名含逗号时表头被引起来',
+      buildResultCsv(mesh, { scalars: [{ name: 'a,b', values: vonMises }] })
+        .split('\r\n')[0].endsWith('"a,b"'));
+
+// --- VTK ----------------------------------------------------------------------
+const vtk = buildLegacyVtk(mesh, fields);
+check('VTK 能生成', typeof vtk === 'string' && vtk.length > 0);
+const vtkLines = vtk.split('\n');
+check('VTK 头四行固定',
+      vtkLines[0] === '# vtk DataFile Version 3.0'
+      && vtkLines[1] === 'SimCloud AI result export'
+      && vtkLines[2] === 'ASCII'
+      && vtkLines[3] === 'DATASET UNSTRUCTURED_GRID',
+      JSON.stringify(vtkLines.slice(0, 4)));
+check('VTK 用 LF（便于 diff；ParaView 两种都认）',
+      !vtk.includes('\r'), JSON.stringify(vtk.slice(0, 40)));
+check('POINTS 行给出节点数', vtkLines[4] === `POINTS ${mesh.nodes.length} double`,
+      vtkLines[4]);
+check('坐标行数 = 节点数', vtkLines[5] === '0 0 0' && vtkLines[9] === '1 1 1');
+check('CELLS 行给出单元数与连接表长度',
+      vtkLines[10] === `CELLS ${mesh.elements.length} ${mesh.elements.length * 5}`,
+      vtkLines[10]);
+check('每行单元是 4 + 四个索引',
+      vtkLines[11] === '4 0 1 2 3' && vtkLines[12] === '4 1 2 3 4', vtkLines[11]);
+check('CELL_TYPES 全部是 10（VTK_TETRA）',
+      vtkLines[13] === `CELL_TYPES ${mesh.elements.length}`
+      && vtkLines[14] === '10' && vtkLines[15] === '10');
+check('POINT_DATA 行给出节点数', vtkLines[16] === `POINT_DATA ${mesh.nodes.length}`,
+      vtkLines[16]);
+check('VECTORS 声明带场名与类型',
+      vtkLines[17] === 'VECTORS displacement_m double', vtkLines[17]);
+check('矢量数据行数与节点数一致且数值精确',
+      vtkLines[19] === '1e-9 -2.5e-10 3.75e-11'
+      && Number(vtkLines[19].split(' ')[0]) === displacement[1][0],
+      vtkLines[19]);
+check('SCALARS 声明带 LOOKUP_TABLE（legacy 格式硬性要求）',
+      vtkLines[23] === 'SCALARS von_mises_Pa double 1'
+      && vtkLines[24] === 'LOOKUP_TABLE default',
+      `${vtkLines[23]} / ${vtkLines[24]}`);
+check('标量数值精确',
+      Number(vtkLines[26]) === vonMises[1], vtkLines[26]);
+
+// 段计数自洽：这是"文件能被读回来"的最基本条件
+const pointsCount = Number(vtkLines[4].split(' ')[1]);
+const coordinateLines = vtkLines.slice(5, 5 + pointsCount).length;
+const cellsCount = Number(vtkLines[10].split(' ')[1]);
+const cellLines = vtkLines.slice(11, 11 + cellsCount).length;
+const pointDataCount = Number(vtkLines[16].split(' ')[1]);
+const vectorLines = vtkLines.slice(18, 18 + pointDataCount).length;
+const scalarLines = vtkLines.slice(25, 25 + pointDataCount).length;
+check('各段行数与声明一致',
+      coordinateLines === pointsCount && cellLines === cellsCount
+      && vectorLines === pointDataCount && scalarLines === pointDataCount,
+      `${coordinateLines}/${pointsCount} ${cellLines}/${cellsCount} `
+      + `${vectorLines}/${pointDataCount} ${scalarLines}/${pointDataCount}`);
+check('没有场时不写 POINT_DATA', !buildLegacyVtk(mesh, {}).includes('POINT_DATA'));
+
+// --- 数据不自洽必须**拒绝导出**，而不是生成一个看着正常的文件 ----------------
+check('长度不一致的标量场被拒',
+      buildResultCsv(mesh, { scalars: [{ name: 's', values: [1, 2] }] }) === null);
+check('长度不一致的矢量场被拒',
+      buildLegacyVtk(mesh, { vectors: [{ name: 'v', values: [[1, 2, 3]] }] }) === null);
+check('长度不一致会给出可读原因',
+      (describeExportProblem(mesh, { scalars: [{ name: 's', values: [1] }] }) || '')
+        .includes('不一致'),
+      describeExportProblem(mesh, { scalars: [{ name: 's', values: [1] }] }));
+check('NaN 被拒（CSV/VTK 里都没有合法写法）',
+      buildResultCsv(mesh, { scalars: [{ name: 's', values: [0, 0, 0, NaN, 0] }] }) === null
+      && buildLegacyVtk(mesh, {
+        vectors: [{ name: 'v', values: [[0, 0, 0], [0, 0, 0], [0, 0, 0],
+                                        [0, 0, Infinity], [0, 0, 0]] }],
+      }) === null);
+check('单元引用越界节点被拒',
+      buildResultCsv({ nodes: mesh.nodes, elements: [[0, 1, 2, 99]] }, {}) === null);
+check('单元索引非整数被拒',
+      buildResultCsv({ nodes: mesh.nodes, elements: [[0, 1, 2, 3.5]] }, {}) === null);
+check('空网格被拒',
+      buildResultCsv({ nodes: [], elements: [] }, {}) === null
+      && buildLegacyVtk(null, {}) === null);
+check('校验函数直接可用',
+      validateExportMesh(mesh) === null && validateExportMesh(null) !== null
+      && validateExportFields(mesh, fields) === null);
+check('没有结果场时说清楚是先求解',
+      (describeExportProblem(mesh, {}) || '').includes('求解'),
+      describeExportProblem(mesh, {}));
+check('数据可用时没有问题描述', describeExportProblem(mesh, fields) === null);
+
+// --- 文件名 -------------------------------------------------------------------
+check('去掉几何扩展名', exportFilename('零件1.STEP', 'result', 'csv') === '零件1_result.csv',
+      exportFilename('零件1.STEP', 'result', 'csv'));
+check('路径被砍掉（不把目录写进文件名）',
+      exportFilename('../../etc/passwd.step', 'result', 'vtk') === 'passwd_result.vtk',
+      exportFilename('../../etc/passwd.step', 'result', 'vtk'));
+check('Windows 反斜杠路径同样处理',
+      exportFilename('C:\\tmp\\part.stl', 'result', 'csv') === 'part_result.csv',
+      exportFilename('C:\\tmp\\part.stl', 'result', 'csv'));
+check('非法字符换成下划线',
+      exportFilename('a b:c*d?.step', 'result', 'csv') === 'a_b_c_d__result.csv',
+      exportFilename('a b:c*d?.step', 'result', 'csv'));
+check('空名字有兜底',
+      exportFilename('', 'result', 'csv') === 'result_result.csv',
+      exportFilename('', 'result', 'csv'));
+check('后缀里的非法字符被去掉',
+      exportFilename('p.step', 'a b/c', 'csv') === 'p_abc.csv',
+      exportFilename('p.step', 'a b/c', 'csv'));
+check('扩展名里的非法字符被去掉',
+      exportFilename('p.step', 'result', 'c sv') === 'p_result.csv',
+      exportFilename('p.step', 'result', 'c sv'));
+check('时间戳格式固定',
+      filenameStamp(new Date(2026, 2, 18, 14, 25, 30)) === '20260318-142530',
+      filenameStamp(new Date(2026, 2, 18, 14, 25, 30)));
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+def _check_frontend_result_export(node: str) -> tuple[bool, str]:
+    """用 node 执行 `frontend/utils/resultExport.ts` 里的纯逻辑并断言其行为。"""
+    ok, detail = _run_node_module_selftest(node, _RESULT_EXPORT_SELFTEST)
+    return ok, ("CSV/VTK 结构 / 精确往返 / 不自洽时拒绝导出 / 文件名清洗 均符合断言"
+                if ok else detail)
+
+
+#: 用 node 把**真实求解结果**写成 CSV/VTK 文件（路径由环境变量给出）。
+_EXPORT_REAL_RESULT_SCRIPT = r"""
+import { readFileSync, writeFileSync } from 'node:fs';
+import { buildLegacyVtk, buildResultCsv } from './resultExport.ts';
+
+const payload = JSON.parse(readFileSync(process.env.SIMCLOUD_EXPORT_PAYLOAD, 'utf8'));
+const fields = {
+  vectors: [{ name: 'displacement_m', values: payload.displacements }],
+  scalars: [{ name: 'von_mises_Pa', values: payload.stresses }],
+};
+const csv = buildResultCsv({ nodes: payload.nodes, elements: payload.elements }, fields);
+const vtk = buildLegacyVtk({ nodes: payload.nodes, elements: payload.elements }, fields);
+if (csv === null || vtk === null) {
+  console.error('FAIL: 导出返回 null（数据被判定为不自洽）');
+  process.exit(1);
+}
+writeFileSync(process.env.SIMCLOUD_EXPORT_CSV, csv, 'utf8');
+writeFileSync(process.env.SIMCLOUD_EXPORT_VTK, vtk, 'utf8');
+console.log('OK');
+"""
+
+
+def _parse_legacy_vtk(text: str) -> dict:
+    """
+    读回 VTK legacy ASCII 文件（结构化网格 + 逐节点场）。
+
+    刻意手写而不是引入 vtk 库：这里要证明的是"**我们的导出确实是合法格式**"，
+    用一个宽容的库来读会把格式错误掩盖掉。手写解析对格式的要求更硬
+    （段名、计数、每行元素个数、CELL_TYPES 的值都要对）。
+    """
+    lines = text.split("\n")
+    if not lines[0].startswith("# vtk DataFile Version"):
+        raise ValueError(f"首行不是 VTK 头：{lines[0]!r}")
+    if lines[2] != "ASCII" or lines[3] != "DATASET UNSTRUCTURED_GRID":
+        raise ValueError(f"编码/数据集声明不对：{lines[2]!r} / {lines[3]!r}")
+
+    index = 4
+    parts = lines[index].split()
+    if parts[0] != "POINTS":
+        raise ValueError(f"缺少 POINTS 段：{lines[index]!r}")
+    point_count = int(parts[1])
+    index += 1
+    points = []
+    for _ in range(point_count):
+        values = lines[index].split()
+        if len(values) != 3:
+            raise ValueError(f"坐标行不是三个数：{lines[index]!r}")
+        points.append([float(value) for value in values])
+        index += 1
+
+    parts = lines[index].split()
+    if parts[0] != "CELLS":
+        raise ValueError(f"缺少 CELLS 段：{lines[index]!r}")
+    cell_count, connectivity = int(parts[1]), int(parts[2])
+    index += 1
+    cells = []
+    for _ in range(cell_count):
+        values = lines[index].split()
+        if int(values[0]) != 4 or len(values) != 5:
+            raise ValueError(f"单元行不是「4 + 四个索引」：{lines[index]!r}")
+        cells.append([int(value) for value in values[1:]])
+        index += 1
+    if connectivity != cell_count * 5:
+        raise ValueError(f"连接表长度声明不符：{connectivity} != {cell_count * 5}")
+
+    parts = lines[index].split()
+    if parts[0] != "CELL_TYPES":
+        raise ValueError(f"缺少 CELL_TYPES 段：{lines[index]!r}")
+    type_count = int(parts[1])
+    index += 1
+    cell_types = [int(lines[index + offset]) for offset in range(type_count)]
+    index += type_count
+
+    result: dict = {
+        "points": points,
+        "cells": cells,
+        "cell_types": cell_types,
+        "vectors": {},
+        "scalars": {},
+    }
+
+    if index < len(lines) and lines[index].startswith("POINT_DATA"):
+        data_count = int(lines[index].split()[1])
+        index += 1
+        while index < len(lines) and lines[index].strip():
+            parts = lines[index].split()
+            if parts[0] == "VECTORS":
+                name = parts[1]
+                index += 1
+                values = []
+                for _ in range(data_count):
+                    components = lines[index].split()
+                    if len(components) != 3:
+                        raise ValueError(f"矢量行不是三个数：{lines[index]!r}")
+                    values.append([float(value) for value in components])
+                    index += 1
+                result["vectors"][name] = values
+            elif parts[0] == "SCALARS":
+                name = parts[1]
+                index += 2          # SCALARS 行 + 必需的 LOOKUP_TABLE 行
+                values = []
+                for _ in range(data_count):
+                    values.append(float(lines[index]))
+                    index += 1
+                result["scalars"][name] = values
+            else:
+                raise ValueError(f"未知的 POINT_DATA 子段：{parts[0]!r}")
+    return result
+
+
+def _check_result_export_roundtrip(
+    node: str, mesh: dict, result: dict
+) -> tuple[bool, str]:
+    """
+    真实结果 -> 前端导出 -> **Python 读回来逐位比对**。
+
+    这是本轮最重要的检查，因为它同时钉住三件事：
+
+    1. **精度**：文本里的数值必须能精确还原原始双精度数（用 `toFixed` 会静默丢精度）；
+    2. **格式合法**：手写的 VTK 解析对段名/计数/每行元素个数都要求很硬，
+       比引入一个宽容的 vtk 库更能暴露格式错误；
+    3. **数据对应关系没错位**：节点数、单元索引、场的长度全部对齐——
+       错位的文件"看起来完全正常"，只是把位移贴到了别的节点上。
+    """
+    import json
+    import tempfile
+
+    payload = {
+        "nodes": mesh["nodes"],
+        "elements": mesh["elements"],
+        "displacements": result["displacements"],
+        "stresses": result["stresses"],
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        payload_path = os.path.join(tmp, "payload.json")
+        csv_path = os.path.join(tmp, "result.csv")
+        vtk_path = os.path.join(tmp, "result.vtk")
+        with open(payload_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+        ok, detail = _run_node_module_selftest(
+            node,
+            _EXPORT_REAL_RESULT_SCRIPT,
+            {
+                "SIMCLOUD_EXPORT_PAYLOAD": payload_path,
+                "SIMCLOUD_EXPORT_CSV": csv_path,
+                "SIMCLOUD_EXPORT_VTK": vtk_path,
+            },
+        )
+        if not ok:
+            return False, f"导出脚本失败：{detail}"
+
+        with open(csv_path, encoding="utf-8", newline="") as handle:
+            csv_text = handle.read()
+        with open(vtk_path, encoding="utf-8") as handle:
+            vtk_text = handle.read()
+
+        try:
+            parsed = _parse_legacy_vtk(vtk_text)
+        except ValueError as exc:
+            return False, f"VTK 读不回来：{exc}"
+
+    node_count = len(payload["nodes"])
+    cell_count = len(payload["elements"])
+
+    # --- VTK ------------------------------------------------------------------
+    if len(parsed["points"]) != node_count or len(parsed["cells"]) != cell_count:
+        return False, (f"点数/单元数不符：{len(parsed['points'])}/{node_count}，"
+                       f"{len(parsed['cells'])}/{cell_count}")
+    if any(value != 10 for value in parsed["cell_types"]):
+        return False, "CELL_TYPES 里出现了非四面体（10）"
+    # 逐位比对：文本走的是最短往返表示，所以这里必须是**完全相等**而不是近似
+    for index, node_coords in enumerate(payload["nodes"]):
+        if [float(value) for value in node_coords] != parsed["points"][index]:
+            return False, f"第 {index} 个节点坐标不一致"
+    for index, cell in enumerate(payload["elements"]):
+        if list(cell) != parsed["cells"][index]:
+            return False, f"第 {index} 个单元连接不一致"
+    vtk_displacements = parsed["vectors"].get("displacement_m")
+    vtk_stresses = parsed["scalars"].get("von_mises_Pa")
+    if vtk_displacements is None or vtk_stresses is None:
+        return False, "VTK 里没有位移或应力场"
+    for index, displacement in enumerate(payload["displacements"]):
+        if [float(value) for value in displacement] != vtk_displacements[index]:
+            return False, f"第 {index} 个节点的位移不一致"
+    for index, stress in enumerate(payload["stresses"]):
+        if float(stress) != vtk_stresses[index]:
+            return False, f"第 {index} 个节点的应力不一致"
+
+    # --- CSV ------------------------------------------------------------------
+    lines = csv_text.split("\r\n")
+    if lines[0] != "node,x,y,z,displacement_m_x,displacement_m_y,displacement_m_z,von_mises_Pa":
+        return False, f"CSV 表头不符：{lines[0]!r}"
+    if lines[-1] != "":
+        return False, "CSV 没有以换行收尾"
+    body = lines[1:-1]
+    if len(body) != node_count:
+        return False, f"CSV 数据行数 {len(body)} != 节点数 {node_count}"
+    for index, line in enumerate(body):
+        columns = line.split(",")
+        if len(columns) != 8:
+            return False, f"CSV 第 {index} 行列数不是 8"
+        if int(columns[0]) != index:
+            return False, f"CSV 第 {index} 行的节点索引是 {columns[0]}"
+        expected_node = [float(value) for value in payload["nodes"][index]]
+        if [float(value) for value in columns[1:4]] != expected_node:
+            return False, f"CSV 第 {index} 行坐标不一致"
+        expected_disp = [float(value) for value in payload["displacements"][index]]
+        if [float(value) for value in columns[4:7]] != expected_disp:
+            return False, f"CSV 第 {index} 行位移不一致"
+        if float(columns[7]) != float(payload["stresses"][index]):
+            return False, f"CSV 第 {index} 行应力不一致"
+        # 同一个节点在 CSV 与 VTK 里必须一致（两条独立路径写同一份数据）
+        if [float(value) for value in columns[4:7]] != vtk_displacements[index]:
+            return False, f"CSV 与 VTK 在第 {index} 个节点上不一致"
+
+    return True, (f"{node_count} 节点 / {cell_count} 单元，坐标·位移·应力"
+                  f"在 CSV 与 VTK 两个文件里都与求解结果逐位一致")
+
+
 #: 把**后端真实返回**的收敛检查结果喂给前端解析逻辑。
 #:
 #: 与网格质量、模态那两条同理：后端字段一旦改名（`last_relative_change` →
@@ -2059,6 +2485,9 @@ def task_verify(args: argparse.Namespace) -> int:
 
             passed, detail = _check_frontend_convergence_study_math(node_bin)
             check("收敛检查显示逻辑（四态区分，node 执行前端纯函数）", passed, detail)
+
+            passed, detail = _check_frontend_result_export(node_bin)
+            check("结果导出（CSV/VTK 结构与精度，node 执行前端纯函数）", passed, detail)
         else:
             check("TypeScript 类型检查", False, "未找到 node")
 
@@ -2475,6 +2904,15 @@ def task_verify(args: argparse.Namespace) -> int:
                 nan_count == 0,
                 f"NaN={nan_count}, max={result['max_stress']:.2f}",
             )
+
+            # --- 结果导出：真实结果 -> 前端生成文件 -> Python 读回来逐位比对 ----
+            # 这是"导出"这件事唯一值得信任的验证方式：精度（最短往返表示）、
+            # 格式合法性（手写 VTK 解析对段名/计数要求很硬）、以及数据对应关系
+            # （错位的文件看起来完全正常，只是把位移贴到了别的节点上）。
+            if node_bin:
+                passed, detail = _check_result_export_roundtrip(node_bin, mesh, result)
+                check("结果导出（真实结果 -> CSV/VTK -> Python 读回逐位比对）",
+                      passed, detail)
 
             # --- 用户模型的 h-收敛检查 ------------------------------------------
             # 上面那条基准证明的是"这套离散会按理论阶收敛"，是**格式**的性质；

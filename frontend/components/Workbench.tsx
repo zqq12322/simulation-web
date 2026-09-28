@@ -24,7 +24,8 @@ import {
   FileBox,
   Save,
   RefreshCw,
-  TrendingUp
+  TrendingUp,
+  FileDown
 } from 'lucide-react';
 import axios from 'axios';
 import { currentAuthHeaders, errorStatus, isUnauthorized, notifySessionExpired } from '../utils/authApi';
@@ -58,6 +59,13 @@ import { MeshQuality, toMeshQuality } from '../utils/meshQuality';
 import MeshQualityPanel from './MeshQualityPanel';
 import { ConvergenceStudy, toConvergenceStudy } from '../utils/convergenceStudy';
 import ConvergencePanel from './ConvergencePanel';
+import {
+  buildLegacyVtk,
+  buildResultCsv,
+  describeExportProblem,
+  exportFilename,
+  filenameStamp,
+} from '../utils/resultExport';
 
 interface WorkbenchProps {
   project: Project;
@@ -106,6 +114,90 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   const [isStudying, setIsStudying] = useState(false);
   const [studyJobStatus, setStudyJobStatus] = useState<string>('');
   const [studyError, setStudyError] = useState<string | null>(null);
+
+  /**
+   * 导出结果用的网格与场。
+   *
+   * 单位按后端的口径写明在**列名里**（`displacement_m`、`von_mises_Pa`、
+   * `temperature_K`）：导出文件最常见的用途就是给别人看，而"这个数是米还是
+   * 毫米"必须写在文件里，不能靠口头约定。
+   *
+   * 模态振型是**归一化的无量纲相对量**，所以列名里不能带单位——带上会让人
+   * 把颜色/幅值读成真实位移。
+   */
+  const buildExportPayload = () => {
+    const nodes = Array.isArray(meshData?.nodes) ? meshData.nodes : null;
+    const elements = Array.isArray(meshData?.elements) ? meshData.elements : null;
+    if (!nodes || !elements || nodes.length === 0 || elements.length === 0) return null;
+
+    const resultKind = meshData?.resultKind;
+    if (resultKind === 'thermal') {
+      const temperatures = Array.isArray(meshData?.temperatures_k)
+        ? meshData.temperatures_k
+        : [];
+      if (temperatures.length !== nodes.length) return null;
+      return {
+        mesh: { nodes, elements },
+        fields: { scalars: [{ name: 'temperature_K', values: temperatures }] },
+      };
+    }
+    if (resultKind === 'modal') {
+      const shape = Array.isArray(meshData?.displacements) ? meshData.displacements : [];
+      if (shape.length !== nodes.length) return null;
+      return {
+        mesh: { nodes, elements },
+        fields: { vectors: [{ name: 'mode_shape_normalized', values: shape }] },
+      };
+    }
+    const displacements = Array.isArray(meshData?.displacements) ? meshData.displacements : [];
+    const stresses = Array.isArray(meshData?.stresses) ? meshData.stresses : [];
+    if (displacements.length !== nodes.length || stresses.length !== nodes.length) return null;
+    return {
+      mesh: { nodes, elements },
+      fields: {
+        vectors: [{ name: 'displacement_m', values: displacements }],
+        scalars: [{ name: 'von_mises_Pa', values: stresses }],
+      },
+    };
+  };
+
+  const exportPayload = buildExportPayload();
+  const hasExportableResult = exportPayload !== null;
+
+  /**
+   * 把结果写成文件并触发下载。
+   *
+   * 文本由 `utils/resultExport.ts` 的纯函数生成（可被 node 单独验证，
+   * 见 verify 的"真实结果 -> CSV/VTK -> Python 读回逐位比对"），这里只负责
+   * Blob + 触发下载这段**必须依赖浏览器**的胶水。
+   */
+  const handleExportResult = (format: 'csv' | 'vtk') => {
+    const problem = describeExportProblem(exportPayload?.mesh, exportPayload?.fields);
+    if (problem || !exportPayload) {
+      alert(problem || '无法导出：没有可用的结果数据。');
+      return;
+    }
+    const text = format === 'csv'
+      ? buildResultCsv(exportPayload.mesh, exportPayload.fields)
+      : buildLegacyVtk(exportPayload.mesh, exportPayload.fields);
+    if (text === null) {
+      alert('导出失败：结果数据不自洽（长度或数值有问题），请看控制台。');
+      return;
+    }
+    const name = exportFilename(modelName, `result_${filenameStamp(new Date())}`, format);
+    const blob = new Blob([text], {
+      type: format === 'csv' ? 'text/csv;charset=utf-8' : 'text/vtk;charset=utf-8',
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = name;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    // 立刻释放：文件已经在下载队列里了，晚释放只会泄漏内存
+    URL.revokeObjectURL(url);
+  };
   const [facesData, setFacesData] = useState<any[]>([]); // Store B-Rep faces data
   const [edgesData, setEdgesData] = useState<any[]>([]); // Store B-Rep edges data
   const [verticesData, setVerticesData] = useState<any[]>([]); // Store B-Rep vertices data
@@ -1394,9 +1486,29 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
                         {expandedNodes['simulation'] ? <ChevronDown size={14} className="mr-1 text-gray-400" /> : <ChevronRight size={14} className="mr-1 text-gray-400" />}
                         <Database size={14} className="mr-2 text-blue-400" />
                         <span>Simulation Runs</span>
+                        {/* 导出：把结果带出这个工具（给协作者核对、存档、写报告）。
+                            只在真有结果时出现——列一个点了会报错的按钮没有意义。 */}
+                        {hasExportableResult && (
+                          <div className="ml-auto mr-2 flex items-center gap-1">
+                            <button
+                              onClick={(e) => { e.stopPropagation(); handleExportResult('csv'); }}
+                              className="text-gray-400 hover:text-white"
+                              title="导出逐节点结果表（CSV）"
+                            >
+                              <FileDown size={13} />
+                            </button>
+                            <button
+                              onClick={(e) => { e.stopPropagation(); handleExportResult('vtk'); }}
+                              className="text-gray-400 hover:text-white text-[10px] font-medium"
+                              title="导出 VTK（ParaView 可直接打开）"
+                            >
+                              VTK
+                            </button>
+                          </div>
+                        )}
                         <button 
                           onClick={(e) => { e.stopPropagation(); handleSolve(); }}
-                          className="ml-auto mr-2 bg-blue-600 hover:bg-blue-500 text-white p-1 rounded transition-colors"
+                          className={`${hasExportableResult ? '' : 'ml-auto '}mr-2 bg-blue-600 hover:bg-blue-500 text-white p-1 rounded transition-colors`}
                           title="Run Simulation"
                         >
                           <Play size={12} fill="currentColor" />
