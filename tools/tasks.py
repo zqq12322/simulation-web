@@ -1234,8 +1234,8 @@ def _check_frontend_auth_math(node: str) -> tuple[bool, str]:
 #: 写一次库）、以及恢复时对不认识的内容必须丢弃并报告。
 _PROJECT_SETUP_SELFTEST = r"""
 import { SETUP_VERSION, buildSetupPayload, describeSaveStatus,
-         describeSetupBadge, restoreSetup, setupSignature,
-         stableStringify } from './projectSetup.ts';
+         describeSetupBadge, restoreSetup, setupDocumentVersion,
+         setupSignature, stableStringify } from './projectSetup.ts';
 
 let failures = [];
 const check = (name, ok, detail = '') => {
@@ -1337,6 +1337,26 @@ check('已保存文案', describeSaveStatus('saved',
 check('时间戳非法时有兜底',
       describeSaveStatus('saved', { savedAt: 'garbage' }) === '已保存');
 check('初始状态文案', describeSaveStatus('idle') === '未修改');
+
+// 4b) 并发冲突（409）：文案**绝不能**显示成"已保存"——用户的改动其实没保存。
+// 这一条是后补的：加冲突功能时只写了实现，没有同时加自检，于是"前端纯逻辑
+// 必须有 node 自检"这条规矩被绕过去了。规矩的意义正在于**新代码也一样适用**。
+const conflicted = describeSaveStatus('conflict', { savedAt: '2026-03-18T00:00:00+00:00' });
+check('冲突文案不说已保存', !conflicted.includes('已保存'), conflicted);
+check('冲突文案点出问题', conflicted.includes('冲突'), conflicted);
+
+// 4c) 版本号读取：取不到必须是 null（= 不发 If-Match），**不能是 0**。
+// 0 是一个真实存在的版本号，把它当成"没有版本"会让基于旧基线的保存被误认为
+// 是最新的，正好绕开乐观并发控制。
+check('读到版本号', setupDocumentVersion({ version: 3, setup: {} }) === 3);
+check('版本号为 0 也是有效值', setupDocumentVersion({ version: 0 }) === 0);
+check('缺字段是 null', setupDocumentVersion({ setup: {} }) === null
+      && setupDocumentVersion(null) === null
+      && setupDocumentVersion(undefined) === null);
+check('非法版本号是 null', setupDocumentVersion({ version: -1 }) === null
+      && setupDocumentVersion({ version: 1.5 }) === null
+      && setupDocumentVersion({ version: '3' }) === null
+      && setupDocumentVersion('nonsense') === null);
 
 // 5) 仪表盘标记
 check('已配置标记', describeSetupBadge(true) === '已配置');
@@ -2390,6 +2410,80 @@ def _check_frontend_result_export(node: str) -> tuple[bool, str]:
                 if passed else detail)
 
 
+#: `frontend/utils/jobResult.ts`：任务结果被服务端回收时该怎么判断与怎么说。
+_JOB_RESULT_SELFTEST = r"""
+import { droppedResultMessage, jobResultMegabytes,
+         resultWasDropped } from './jobResult.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+// 1) 体积换算：取不到/非法一律 0（界面上不许出现 undefined MB 或 NaN MB）
+check('MB 换算', jobResultMegabytes({ resultBytes: 70 * 1024 * 1024 }) === 70);
+check('不足 1 MB 会四舍五入', jobResultMegabytes({ resultBytes: 400 * 1024 }) === 0);
+check('缺字段是 0', jobResultMegabytes({}) === 0
+      && jobResultMegabytes(null) === 0 && jobResultMegabytes(undefined) === 0);
+check('非法值是 0', jobResultMegabytes({ resultBytes: -5 }) === 0
+      && jobResultMegabytes({ resultBytes: 'big' }) === 0
+      && jobResultMegabytes({ resultBytes: NaN }) === 0
+      && jobResultMegabytes('nonsense') === 0);
+
+// 2) 判定条件：resultDropped 且 result 为空**两个都要满足**。
+// 只看 resultDropped 不够——将来若有"留摘要、丢明细"的做法，那时 result 非空，
+// 就不该再报"结果没保留"。
+check('被回收：标记为真且结果为空',
+      resultWasDropped({ resultDropped: true, result: null }) === true);
+check('有结果就不算被回收',
+      resultWasDropped({ resultDropped: true, result: { nodes: [] } }) === false);
+check('没有标记不算被回收',
+      resultWasDropped({ result: null }) === false);
+check('正常结果不算被回收',
+      resultWasDropped({ resultDropped: false, result: { answer: 42 } }) === false);
+check('非法输入不算被回收', resultWasDropped(null) === false
+      && resultWasDropped(undefined) === false && resultWasDropped('x') === false);
+
+// 3) 说明文案：该说的时候说、不该说的时候**不许说**，且必须给出原因与下一步
+const message = droppedResultMessage({
+  resultDropped: true, result: null, resultBytes: 70 * 1024 * 1024,
+});
+check('被回收时有说明', typeof message === 'string' && message.length > 0);
+check('说明里带上体积', message.includes('70 MB'), message);
+check('说明里点出"未保留"', message.includes('未保留'), message);
+// **说明里必须给出原因**：只说"未保留"，用户不知道是超了限制还是出了别的问题，
+// 也就无从判断该不该重试。（这一条是变异测试补出来的：把"超过…上限"删掉时，
+// 原来的断言全都还是通过的。）
+check('说明里给出原因（超过上限）', message.includes('上限'), message);
+check('说明里给出下一步', message.includes('重试'), message);
+check('说明里不出现 NaN/undefined',
+      !message.includes('NaN') && !message.includes('undefined'), message);
+
+const noSize = droppedResultMessage({ resultDropped: true, result: null });
+check('没有体积信息也不说 0 MB',
+      !noSize.includes('0 MB') && noSize.includes('未保留'), noSize);
+
+check('正常结果没有说明', droppedResultMessage({ result: { answer: 42 } }) === null);
+check('失败任务没有说明',
+      droppedResultMessage({ status: 'failed', error: 'boom' }) === null);
+check('非法输入没有说明', droppedResultMessage(null) === null
+      && droppedResultMessage(undefined) === null);
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
+def _check_frontend_job_result(node: str) -> tuple[bool, str]:
+    """用 node 执行 `frontend/utils/jobResult.ts` 里的纯逻辑并断言其行为。"""
+    passed, detail = _run_node_module_selftest(node, _JOB_RESULT_SELFTEST)
+    return passed, ("回收判定 / 体积换算 / 文案含原因与下一步 均符合断言"
+                if passed else detail)
+
+
 #: 用 node 把**真实求解结果**写成 CSV/VTK 文件（路径由环境变量给出）。
 _EXPORT_REAL_RESULT_SCRIPT = r"""
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -2974,6 +3068,9 @@ def task_verify(args: argparse.Namespace) -> int:
 
             passed, detail = _check_frontend_clip_plane(node_bin)
             check("剖切面几何（平面符号与节点分类，node 执行前端纯函数）", passed, detail)
+
+            passed, detail = _check_frontend_job_result(node_bin)
+            check("任务结果回收判定与说明（不能说错话，node 执行前端纯函数）", passed, detail)
         else:
             check("TypeScript 类型检查", False, "未找到 node")
 

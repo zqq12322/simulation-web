@@ -62,6 +62,7 @@ import { ConvergenceStudy, toConvergenceStudy } from '../utils/convergenceStudy'
 import { ClipSpec, DEFAULT_CLIP_SPEC } from '../utils/clipPlane';
 import ConvergencePanel from './ConvergencePanel';
 import { RunAnalysis, RunList, RunRecord, toRunAnalysis, toRunList } from '../utils/runsApi';
+import { droppedResultMessage } from '../utils/jobResult';
 import RunHistoryPanel from './RunHistoryPanel';
 import {
   buildLegacyVtk,
@@ -498,13 +499,9 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
         // 服务端按**体积**保留结果（见 backend/jobs.py）：单条结果过大时不保留
         // 内容，只留 `resultDropped`。**必须说出来**——否则用户看到的是
         // "求解完成"却是空结果，会以为是自己看错了或者功能坏了。
-        if (data.resultDropped && data.result == null) {
-          const megabytes = Math.round((data.resultBytes || 0) / (1024 * 1024));
-          throw new Error(
-            `求解已完成，但结果约 ${megabytes} MB，超过服务端保留上限，未保留。`
-            + '请减小网格规模（或降低模态阶数）后重试。',
-          );
-        }
+        // 判断与文案在 utils/jobResult.ts 里，由 verify 的 node 自检钉住。
+        const dropped = droppedResultMessage(data);
+        if (dropped) throw new Error(dropped);
         return data.result;
       }
 
