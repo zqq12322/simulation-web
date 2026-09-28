@@ -5,8 +5,17 @@ import * as THREE from 'three';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { Material, AnyBoundaryCondition, MeshSettings } from '../types';
-import { Eye, EyeOff, MousePointer2, Hexagon, Component, BoxSelect } from 'lucide-react';
+import { Eye, EyeOff, MousePointer2, Hexagon, Component, BoxSelect, Scissors } from 'lucide-react';
 import { SimulationResultShader } from './resultShader';
+import {
+  ClipSpec,
+  DEFAULT_CLIP_SPEC,
+  classifyNodes,
+  clipPosition,
+  describeClip,
+  modelBounds,
+  planeEquation,
+} from '../utils/clipPlane';
 import {
   computeDeformationScale,
   displacementMagnitudes,
@@ -42,6 +51,14 @@ interface ModelViewerProps {
   controlsRef?: React.RefObject<any>;
   /** 变形放大系数（无量纲），由 Scene3D 按模型尺度算出并传下来。 */
   deformationScale?: number;
+  /**
+   * 剖切面（世界坐标下的 three.js 平面），由 Scene3D 用纯函数算好后传下来。
+   *
+   * 为什么在这里才生效：材质定义在 ModelViewer 里，而 `clippingPlanes` 是
+   * 材质属性。几何计算与界面控件都在 Scene3D，两边通过这一个 prop 对接，
+   * 避免把同一套平面算法写两遍。
+   */
+  clipPlane?: THREE.Plane | null;
 }
 
 const ModelViewer: React.FC<ModelViewerProps> = ({ 
@@ -60,7 +77,8 @@ const ModelViewer: React.FC<ModelViewerProps> = ({
   showLabels = true,
   pickingMode = 'face',
   controlsRef,
-  deformationScale = 1
+  deformationScale = 1,
+  clipPlane = null,
 }) => {
   const meshRef = useRef<THREE.Mesh>(null);
   const [loadedGeometry, setLoadedGeometry] = useState<THREE.BufferGeometry | null>(null);
@@ -590,6 +608,16 @@ const ModelViewer: React.FC<ModelViewerProps> = ({
     side: THREE.DoubleSide
   }), []);
 
+  // --- 剖切面（材质侧）-------------------------------------------------------
+  useEffect(() => {
+    // 恒定挂**一个**平面（未启用时它被放在包围盒之外）：three.js 的剖切面
+    // 数量参与着色器程序缓存键，数量一变就要重编译，滑杆每动一下都会卡。
+    const planes = clipPlane ? [clipPlane] : [];
+    for (const material of [geometryMaterial, meshMaterial, resultMaterial]) {
+      material.clippingPlanes = planes;
+    }
+  }, [clipPlane, geometryMaterial, meshMaterial, resultMaterial]);
+
   // Update uniforms when result data changes
   useEffect(() => {
     const scalarField: number[] | undefined = meshData?.scalarField ?? meshData?.stresses;
@@ -844,6 +872,10 @@ interface Scene3DProps {
   selectedMode?: number;
   /** 切换阶次 */
   onSelectMode?: (index: number) => void;
+  /** 剖切面状态（由工作台持有，便于与导出/记录等功能共享同一份状态） */
+  clipSpec?: ClipSpec;
+  /** 修改剖切状态 */
+  onClipChange?: (spec: ClipSpec) => void;
 }
 
 const Scene3D: React.FC<Scene3DProps> = (props) => {
@@ -853,6 +885,33 @@ const Scene3D: React.FC<Scene3DProps> = (props) => {
   // Declared here (not inside ModelViewer) because <OrbitControls> lives in this
   // component's <Canvas>; ModelViewer receives it to auto-frame the camera.
   const controlsRef = useRef<any>(null);
+
+  // --- 剖切面：几何全部由 utils/clipPlane.ts 的纯函数算 ----------------------
+  // 那一层有精确断言（平面方程符号、剖掉多少节点），这里只做两件事：
+  // 把状态喂给纯函数、把结果交给 three.js（材质在 ModelViewer 里，通过 prop 传）。
+  const clipSpec = props.clipSpec ?? DEFAULT_CLIP_SPEC;
+  const clipBounds = useMemo(() => modelBounds(meshData?.nodes), [meshData?.nodes]);
+  const clipPlane = useMemo(() => {
+    if (!clipBounds) return null;
+    const equation = planeEquation(clipSpec, clipBounds);
+    return new THREE.Plane(new THREE.Vector3(...equation.normal), equation.constant);
+  }, [clipBounds, clipSpec]);
+  const clipCounts = useMemo(
+    () => (clipPlane
+      ? classifyNodes(meshData?.nodes, {
+          normal: [clipPlane.normal.x, clipPlane.normal.y, clipPlane.normal.z],
+          constant: clipPlane.constant,
+        })
+      : { kept: 0, removed: 0, keptFraction: 1 }),
+    [clipPlane, meshData?.nodes],
+  );
+  const clipText = clipBounds && clipPlane
+    ? describeClip(
+        clipSpec,
+        clipPosition(clipBounds, clipSpec.axis, clipSpec.fraction),
+        clipCounts,
+      )
+    : null;
   
   const displayMode = useMemo(() => {
     if (meshSettings?.status === 'solved') return 'result';
@@ -1078,6 +1137,78 @@ const Scene3D: React.FC<Scene3DProps> = (props) => {
           </div>
         </div>
 
+        {/* 剖切面：把零件切开看内部。几何（平面方程、剖掉多少节点）由
+            utils/clipPlane.ts 的纯函数算，那部分有精确断言；这里只放控件。 */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={clipSpec.enabled}
+              onChange={(event) => props.onClipChange?.({ ...clipSpec, enabled: event.target.checked })}
+              disabled={!clipBounds}
+            />
+            <Scissors size={12} />
+            剖切面
+          </label>
+          {clipSpec.enabled && clipBounds && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              <div style={{ display: 'flex', gap: '4px' }}>
+                {(['x', 'y', 'z'] as const).map(axis => (
+                  <button
+                    key={axis}
+                    onClick={() => props.onClipChange?.({ ...clipSpec, axis })}
+                    style={{
+                      flex: 1, padding: '3px 0', fontSize: '11px', borderRadius: '4px',
+                      cursor: 'pointer',
+                      border: '1px solid #334155',
+                      background: clipSpec.axis === axis ? '#2563eb' : 'transparent',
+                      color: clipSpec.axis === axis ? '#fff' : '#94a3b8',
+                    }}
+                  >
+                    {axis.toUpperCase()}
+                  </button>
+                ))}
+                <button
+                  onClick={() => props.onClipChange?.({
+                    ...clipSpec,
+                    keepSide: clipSpec.keepSide === 'below' ? 'above' : 'below',
+                  })}
+                  title="切换保留哪一侧"
+                  style={{
+                    padding: '3px 6px', fontSize: '11px', borderRadius: '4px',
+                    cursor: 'pointer', border: '1px solid #334155',
+                    background: 'transparent', color: '#94a3b8',
+                  }}
+                >
+                  {clipSpec.keepSide === 'below' ? '留小侧' : '留大侧'}
+                </button>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.01}
+                value={clipSpec.fraction}
+                onChange={(event) => props.onClipChange?.({
+                  ...clipSpec,
+                  fraction: Number(event.target.value),
+                })}
+                style={{ width: '100%' }}
+              />
+              {clipText && (
+                <div style={{ fontSize: '11px', color: '#94a3b8', lineHeight: 1.4 }}>
+                  {clipText}
+                </div>
+              )}
+            </div>
+          )}
+          {!clipBounds && (
+            <div style={{ fontSize: '11px', color: '#64748b', fontStyle: 'italic' }}>
+              需要先生成网格
+            </div>
+          )}
+        </div>
+
         {/* Boundary Conditions List */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
           <span style={{ fontSize: '11px', color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em' }}>边界条件 ({props.boundaryConditions?.length || 0})</span>
@@ -1108,12 +1239,17 @@ const Scene3D: React.FC<Scene3DProps> = (props) => {
         </div>
       </div>
 
-      <Canvas shadows camera={{ position: [15, 15, 15], fov: 45 }}>
+      <Canvas
+        shadows
+        camera={{ position: [15, 15, 15], fov: 45 }}
+        // 剖切必须在渲染器上打开；材质上的 `clippingPlanes` 才会生效
+        onCreated={({ gl }) => { gl.localClippingEnabled = true; }}
+      >
         <color attach="background" args={['#f0f4f8']} />
         
         <Suspense fallback={null}>
              {/* Removed Center to rule out bounding box issues */}
-             <ModelViewer {...props} showLabels={showLabels} pickingMode={pickingMode} controlsRef={controlsRef} deformationScale={deformationScale} />
+             <ModelViewer {...props} showLabels={showLabels} pickingMode={pickingMode} controlsRef={controlsRef} deformationScale={deformationScale} clipPlane={clipPlane} />
         </Suspense>
         
         <OrbitControls ref={controlsRef} makeDefault />

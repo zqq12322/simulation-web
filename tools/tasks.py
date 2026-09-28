@@ -2055,6 +2055,141 @@ console.log('OK');
 """
 
 
+def _check_frontend_clip_plane(node: str) -> tuple[bool, str]:
+    """用 node 执行 `frontend/utils/clipPlane.ts` 里的纯逻辑并断言其行为。"""
+    ok, detail = _run_node_module_selftest(node, _CLIP_PLANE_SELFTEST)
+    return ok, ("平面方程符号 / 节点分类精确值 / 退化与非法输入 均符合断言"
+                if ok else detail)
+
+
+#: 剖切面的几何（纯函数）。
+#:
+#: 这是"剖切"里唯一能精确验证的部分，所以断言要写死数值：立方体 8 个顶点、
+#: 平面切在正中 ⇒ 恰好 4 个节点被保留；符号方向错一格就会变成"剖掉全部"，
+#: 而画面上只是"模型不见了"，很容易被当成别的问题。
+#:
+#: 也刻意钉住 `enabled=false` 的行为：**保留全部**（平面挪到包围盒之外），
+#: 而不是"没有平面"——后者会让 three.js 因为剖切面数量变化而重编译着色器。
+_CLIP_PLANE_SELFTEST = r"""
+import { DEFAULT_CLIP_SPEC, classifyNodes, clipPosition, describeClip,
+         modelBounds, planeDistance, planeEquation } from './clipPlane.ts';
+
+let failures = [];
+const check = (name, ok, detail = '') => {
+  if (!ok) failures.push(`${name}${detail ? ' -> ' + detail : ''}`);
+};
+
+// 单位立方体的 8 个顶点（0..1）
+const cube = [
+  [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
+  [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1],
+];
+
+// --- 包围盒 -------------------------------------------------------------------
+const bounds = modelBounds(cube);
+check('包围盒', bounds.min.join(',') === '0,0,0' && bounds.max.join(',') === '1,1,1',
+      JSON.stringify(bounds));
+const offset = [[5, -2, 10], [7, -2, 10], [6, 3, 10]];
+const offsetBounds = modelBounds(offset);
+check('包围盒支持负数与非零原点',
+      offsetBounds.min.join(',') === '5,-2,10' && offsetBounds.max.join(',') === '7,3,10',
+      JSON.stringify(offsetBounds));
+check('没有节点时返回 null',
+      modelBounds([]) === null && modelBounds(null) === null);
+check('节点里有非法值时返回 null（不编一个包围盒出来）',
+      modelBounds([[0, 0, 0], [1, NaN, 1]]) === null
+      && modelBounds([[0, 0], [1, 1, 1]]) === null);
+
+// --- 平面位置 -----------------------------------------------------------------
+check('fraction=0 在最负端', clipPosition(bounds, 'x', 0) === 0);
+check('fraction=1 在最正端', clipPosition(bounds, 'x', 1) === 1);
+check('fraction=0.5 在正中', clipPosition(bounds, 'x', 0.5) === 0.5);
+check('fraction 被夹到 [0,1]',
+      clipPosition(bounds, 'x', -3) === 0 && clipPosition(bounds, 'x', 9) === 1);
+check('非法 fraction 当作 0',
+      clipPosition(bounds, 'x', NaN) === 0 && clipPosition(bounds, 'x', 'x') === 0);
+check('按轴取位置（z 轴）', clipPosition(offsetBounds, 'z', 0.5) === 10);
+
+// --- 平面方程与符号 -----------------------------------------------------------
+const below = planeEquation({ enabled: true, axis: 'x', fraction: 0.5, keepSide: 'below' }, bounds);
+check('保留小侧：normal = -x', below.normal.join(',') === '-1,0,0' && below.constant === 0.5,
+      JSON.stringify(below));
+check('保留小侧：坐标小的为正距离',
+      planeDistance(below, [0, 0.5, 0.5]) > 0 && planeDistance(below, [1, 0.5, 0.5]) < 0);
+
+const above = planeEquation({ enabled: true, axis: 'x', fraction: 0.5, keepSide: 'above' }, bounds);
+check('保留大侧：normal = +x', above.normal.join(',') === '1,0,0' && above.constant === -0.5,
+      JSON.stringify(above));
+check('保留大侧：坐标大的为正距离',
+      planeDistance(above, [1, 0.5, 0.5]) > 0 && planeDistance(above, [0, 0.5, 0.5]) < 0);
+check('两种方向互为相反数',
+      planeDistance(below, [0.25, 0, 0]) === -planeDistance(above, [0.25, 0, 0]));
+
+check('y / z 轴的 normal 位置正确',
+      planeEquation({ enabled: true, axis: 'y', fraction: 0.5, keepSide: 'above' }, bounds)
+        .normal.join(',') === '0,1,0'
+      && planeEquation({ enabled: true, axis: 'z', fraction: 0.5, keepSide: 'below' }, bounds)
+        .normal.join(',') === '0,0,-1');
+
+// --- 节点分类：可以数出来的确切值 ---------------------------------------------
+check('正中切开：恰好留一半',
+      classifyNodes(cube, below).kept === 4 && classifyNodes(cube, below).removed === 4,
+      JSON.stringify(classifyNodes(cube, below)));
+check('留大侧也是 4 个', classifyNodes(cube, above).kept === 4);
+check('保留比例', classifyNodes(cube, below).keptFraction === 0.5);
+check('切在最负端：只剩该端面上的 4 个点',
+      classifyNodes(cube, planeEquation(
+        { enabled: true, axis: 'x', fraction: 0, keepSide: 'below' }, bounds)).kept === 4);
+check('切在最正端：全留（距离为 0 算保留）',
+      classifyNodes(cube, planeEquation(
+        { enabled: true, axis: 'x', fraction: 1, keepSide: 'below' }, bounds)).kept === 8);
+check('切在最正端留大侧：只剩该端面的 4 个点',
+      classifyNodes(cube, planeEquation(
+        { enabled: true, axis: 'x', fraction: 1, keepSide: 'above' }, bounds)).kept === 4);
+
+// --- 不剖切时必须一个都不剖 ---------------------------------------------------
+const off = planeEquation({ ...DEFAULT_CLIP_SPEC, enabled: false, axis: 'x' }, bounds);
+const offCounts = classifyNodes(cube, off);
+check('未启用时平面在包围盒之外', off.constant > bounds.max[0], String(off.constant));
+check('未启用时全部保留（不是"没有平面"）',
+      offCounts.kept === 8 && offCounts.removed === 0, JSON.stringify(offCounts));
+check('未启用时 keptFraction = 1', offCounts.keptFraction === 1);
+check('默认状态就是不剖切', DEFAULT_CLIP_SPEC.enabled === false);
+
+// 退化包围盒（该轴跨度为 0）：仍然必须"全部保留"
+const flat = [[0, 0, 0], [1, 0, 0]];
+const flatPlane = planeEquation({ ...DEFAULT_CLIP_SPEC, enabled: false, axis: 'y' }, modelBounds(flat));
+check('退化轴未启用时也全部保留',
+      classifyNodes(flat, flatPlane).kept === 2, JSON.stringify(classifyNodes(flat, flatPlane)));
+
+// --- 非法输入 -----------------------------------------------------------------
+check('没有节点时分类不崩',
+      classifyNodes(null, below).kept === 0
+      && classifyNodes([], below).keptFraction === 1);
+check('非法节点被跳过而不是算成保留',
+      classifyNodes([[0, 0, 0], [NaN, 0, 0]], below).kept
+      + classifyNodes([[0, 0, 0], [NaN, 0, 0]], below).removed === 1);
+check('非法点算不出距离', planeDistance(below, [0, 'x', 0]) === null);
+
+// --- 说明文本 -----------------------------------------------------------------
+const text = describeClip(
+  { enabled: true, axis: 'x', fraction: 0.5, keepSide: 'below' },
+  0.5, classifyNodes(cube, below));
+check('说明里带轴、位置、两侧节点数与百分比',
+      text.includes('x = 0.5000') && text.includes('留下 4') && text.includes('剖掉 4')
+      && text.includes('50.0%'),
+      text);
+check('未启用时没有说明',
+      describeClip(DEFAULT_CLIP_SPEC, 0.5, classifyNodes(cube, off)) === null);
+
+if (failures.length) {
+  console.error('FAIL: ' + failures.join(' | '));
+  process.exit(1);
+}
+console.log('OK');
+"""
+
+
 def _check_frontend_runs_math(node: str) -> tuple[bool, str]:
     """用 node 执行 `frontend/utils/runsApi.ts` 里的纯逻辑并断言其行为。"""
     ok, detail = _run_node_module_selftest(node, _RUNS_API_SELFTEST)
@@ -2682,6 +2817,9 @@ def task_verify(args: argparse.Namespace) -> int:
 
             passed, detail = _check_frontend_runs_math(node_bin)
             check("求解记录显示逻辑（坏记录隔离，node 执行前端纯函数）", passed, detail)
+
+            passed, detail = _check_frontend_clip_plane(node_bin)
+            check("剖切面几何（平面符号与节点分类，node 执行前端纯函数）", passed, detail)
         else:
             check("TypeScript 类型检查", False, "未找到 node")
 

@@ -58,6 +58,7 @@ import {
 import { MeshQuality, toMeshQuality } from '../utils/meshQuality';
 import MeshQualityPanel from './MeshQualityPanel';
 import { ConvergenceStudy, toConvergenceStudy } from '../utils/convergenceStudy';
+import { ClipSpec, DEFAULT_CLIP_SPEC } from '../utils/clipPlane';
 import ConvergencePanel from './ConvergencePanel';
 import { RunAnalysis, RunList, RunRecord, toRunAnalysis, toRunList } from '../utils/runsApi';
 import RunHistoryPanel from './RunHistoryPanel';
@@ -125,6 +126,8 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
   /** 跨运行对比（按配置签名分组后的收敛判定）。 */
   const [runAnalysis, setRunAnalysis] = useState<RunAnalysis | null>(null);
+  /** 剖切面状态（由工作台持有，Scene3D 只负责渲染）。 */
+  const [clipSpec, setClipSpec] = useState<ClipSpec>(DEFAULT_CLIP_SPEC);
 
   /**
    * 导出结果用的网格与场。
@@ -1827,6 +1830,8 @@ const Workbench: React.FC<WorkbenchProps> = ({ project, onBack }) => {
             rigidBodyModes={meshData?.rigid_body_modes}
             selectedMode={selectedMode}
             onSelectMode={handleSelectMode}
+            clipSpec={clipSpec}
+            onClipChange={setClipSpec}
           />
 
           {/* Bottom Overlay Info */}
