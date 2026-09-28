@@ -2829,6 +2829,36 @@ def collect_test_count() -> int:
     return int(completed.stdout.strip().splitlines()[-1])
 
 
+def check_undefined_names(paths: list) -> tuple:
+    """
+    用 pyflakes 查**未定义的名字 / 未使用的导入**（可选依赖）。
+
+    为什么专门为 `tools/tasks.py` 加这一条：`ast.parse` 只查语法，不查名字解析，
+    所以"调了一个不存在的函数"能一路通过语法检查、在任务**跑完最后一步**时才炸。
+    本文件恰恰没有单元测试覆盖，而且写成什么样都得靠手跑一遍才知道——
+    这一轮就真的犯了：`clone-verify` 结尾把成功提示写成了不存在的 `ok_msg`，
+    结果 135 项全过、退出码却是 1。
+
+    pyflakes 是可选依赖（`pip install pyflakes`）：`tools/tasks.py` 刻意只用标准库，
+    所以没装时跳过并在说明里写明——CI 会装，因此那边始终生效。
+    """
+    python = venv_python()
+    if not python.exists():
+        python = Path(sys.executable)
+    completed = subprocess.run(
+        [str(python), "-m", "pyflakes", *paths],
+        cwd=str(ROOT), capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
+    output = (completed.stdout or "") + (completed.stderr or "")
+    if "No module named pyflakes" in output:
+        return True, "未安装 pyflakes，已跳过（pip install pyflakes 可启用）"
+    lines = [line for line in output.splitlines() if line.strip()]
+    if completed.returncode != 0 or lines:
+        return False, "；".join(line.split(":", 1)[-1].strip() for line in lines[:5])
+    return True, f"{len(paths)} 个文件没有未定义名字或未使用导入"
+
+
 def task_verify(args: argparse.Namespace) -> int:
     checks: list[tuple[str, bool, str]] = []
 
@@ -4398,6 +4428,14 @@ def task_verify(args: argparse.Namespace) -> int:
                 except Exception:  # noqa: BLE001 - 清理失败不该影响验证结论
                     pass
 
+    # --- 任务脚本自己不能有未定义的名字 --------------------------------------
+    # 放在计数闸门**之前**：闸门要数"检查项总数"，而总数包含这一条。
+    try:
+        passed, detail = check_undefined_names([str(ROOT / "tools" / "tasks.py")])
+        check("任务脚本无未定义名字（pyflakes）", passed, detail)
+    except Exception as exc:  # noqa: BLE001 - 这个闸门自己不许把 verify 弄崩
+        check("任务脚本无未定义名字（pyflakes）", False, f"{type(exc).__name__}: {exc}")
+
     # --- 验证工具自己也会撒谎 ------------------------------------------------
     # `clone-verify` 靠 `summarise_verify` 判断克隆里到底过没过。这个解析一旦
     # 写错（比如把 FAIL 漏掉），它会**谎报成功**——一个验证工具谎报验证结果，
@@ -4714,7 +4752,7 @@ def task_clone_verify(args: argparse.Namespace) -> int:
 
     print()
     if ok:
-        ok_msg("干净检出可以跑通：单元测试 + 端到端验证")
+        ok("干净检出可以跑通：单元测试 + 端到端验证")
         return 0
     fail("干净检出**跑不通**——上面列出的失败项在别人 clone 之后同样会失败")
     return 1

@@ -101,6 +101,12 @@ jobs:
       - name: 安装后端依赖
         run: pip install -r backend/requirements.txt
 
+      # verify 里有一条"任务脚本无未定义名字"的检查靠它；
+      # `tools/tasks.py` 本身只用标准库，所以它是**可选**依赖，缺了就跳过。
+      # CI 装上，于是这条在 CI 上始终生效。
+      - name: 安装 pyflakes（静态检查未定义名字）
+        run: pip install pyflakes
+
       # verify 的 1/7 会跑 tsc，所以前端依赖也要装
       - name: 安装前端依赖
         working-directory: frontend
