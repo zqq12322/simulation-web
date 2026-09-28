@@ -4398,6 +4398,21 @@ def task_verify(args: argparse.Namespace) -> int:
                 except Exception:  # noqa: BLE001 - 清理失败不该影响验证结论
                     pass
 
+    # --- 验证工具自己也会撒谎 ------------------------------------------------
+    # `clone-verify` 靠 `summarise_verify` 判断克隆里到底过没过。这个解析一旦
+    # 写错（比如把 FAIL 漏掉），它会**谎报成功**——一个验证工具谎报验证结果，
+    # 是这套体系里最坏的一种错误。所以在这里钉一下它的行为。
+    sample = "  [PASS] 甲  ok\n  [FAIL] 乙  no\n  [PASS] 丙\n"
+    sample_summary = summarise_verify(sample)
+    check(
+        "验证输出解析（clone-verify 靠它判成败）",
+        sample_summary["passed"] == 2
+        and sample_summary["failed"] == 1
+        and sample_summary["failures"] == ["乙  no"],
+        f"PASS={sample_summary['passed']} FAIL={sample_summary['failed']} "
+        f"failures={sample_summary['failures']}",
+    )
+
     # --- 文档计数不能漂移 -----------------------------------------------------
     # 三份文档都写着"当前多少个用例、多少项检查"，而它们漂移过好几次
     # （CONTRIBUTING 里曾长期留着「84 项」，实际早已过百）。靠"记得同步"是
@@ -4467,12 +4482,251 @@ def task_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+#: clone-verify 用的端口范围（避开 `dev` 的 8000，也避开常见的 8080）
+CLONE_VERIFY_PORT_RANGE = (8011, 8020)
+
+
+def summarise_verify(text: str) -> dict:
+    """
+    从 `verify` 的输出里数出 PASS / FAIL 与失败项（纯函数）。
+
+    为什么要单独抽出来并给它一条自检：**如果这个解析写错，clone-verify 会
+    谎报成功**——一个验证工具谎报验证结果，是这套体系里最坏的一种错误。
+    """
+    passed = text.count("[PASS]")
+    failed = text.count("[FAIL]")
+    failures = []
+    for line in text.splitlines():
+        if "[FAIL]" not in line:
+            continue
+        name = line.split("[FAIL]", 1)[1].strip()
+        failures.append(name[:60])
+    return {"passed": passed, "failed": failed, "failures": failures}
+
+
+def uncommitted_paths() -> list:
+    """
+    工作区里未提交的改动。
+
+    `clone-verify` 克隆的是**已提交**的内容，所以工作区有改动时必须提醒：
+    否则"克隆里通过了"会被误读成"我刚写的代码通过了"。
+    """
+    completed = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=str(ROOT),
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    return [
+        line[3:].strip() for line in completed.stdout.splitlines() if line.strip()
+    ]
+
+
+def pick_free_port(start: int, end: int) -> int:
+    """在 `[start, end]` 里找一个能绑上的端口（不启动服务，只探测）。"""
+    import socket
+
+    for port in range(start, end + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError(f"{start}~{end} 之间没有空闲端口")
+
+
+def _link_node_modules(clone: Path) -> bool:
+    """
+    把本机的 `frontend/node_modules` 借给克隆（CI 里对应 `npm ci`）。
+
+    没有它，`verify` 的 1/7（`tsc` 类型检查）跑不了——而那是"前端源码在干净
+    检出里能不能编译"的证据，值得保留。用目录链接而不是复制：几十兆的依赖
+    复制一遍既慢又没必要。
+    """
+    target = FRONTEND / "node_modules"
+    link = clone / "frontend" / "node_modules"
+    if not target.exists() or link.exists():
+        return link.exists()
+    try:
+        if IS_WINDOWS:
+            completed = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                capture_output=True, text=True,
+            )
+            return completed.returncode == 0 and link.exists()
+        link.symlink_to(target, target_is_directory=True)
+        return link.exists()
+    except OSError:
+        return False
+
+
+def task_clone_verify(args: argparse.Namespace) -> int:
+    """
+    在**新鲜克隆**里跑一遍单元测试与 `verify`。
+
+    这是本项目对"只在我机器上验证过"这类漏洞的防线：克隆里只有**被跟踪的
+    文件**——没有 venv、没有 `node_modules`、没有 `*.msh` 缓存。任何"悄悄
+    依赖了不进版本库的生成物"的测试，在这里都会露出来（历史上真的抓到一条：
+    `test_convergence_study.py` 依赖 `test_part.step.msh` 存在，本机一直绿，
+    干净检出里必然 FileNotFoundError）。
+
+    它也是本地能给出的、最接近"CI 在干净机器上跑"的证据。CI 本身就是干净
+    检出，所以不需要跑这个任务——它的价值在本地。
+
+    注意：克隆的是**已提交**的内容。工作区有改动时会明确列出来提醒。
+    """
+    import shutil
+    import tempfile
+    import time
+    import urllib.error
+    import urllib.request
+
+    python = venv_python()
+    if not python.exists():
+        # 没有 venv（例如 CI 风格的机器）就用当前解释器——前提是它有依赖
+        python = Path(sys.executable)
+        info(f"未找到 venv，改用当前解释器：{python}")
+
+    dirty = uncommitted_paths()
+    if dirty:
+        warn(
+            f"工作区有 {len(dirty)} 处未提交改动，**克隆里不会有它们**："
+        )
+        for path in dirty[:8]:
+            print(f"    {path}")
+        if len(dirty) > 8:
+            print(f"    …另有 {len(dirty) - 8} 处")
+        info("（这正是这个任务要说明的事：它验证的是已提交状态的干净检出）")
+
+    workdir = Path(tempfile.mkdtemp(prefix="dsh-clone-verify-"))
+    clone = workdir / "repo"
+    server = None
+    ok = True
+    try:
+        info(f"克隆到 {clone} …")
+        completed = subprocess.run(
+            ["git", "clone", "--quiet", "--no-hardlinks", str(ROOT), str(clone)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        if completed.returncode != 0:
+            fail(f"git clone 失败：{completed.stderr.strip()[:200]}")
+            return 1
+
+        tracked = subprocess.run(
+            ["git", "ls-files"], cwd=str(clone),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        ).stdout.splitlines()
+        info(f"克隆里被跟踪的文件：{len(tracked)} 个")
+
+        # --- 1) 后端单元测试（等价于 CI 的 backend job）-----------------------
+        info("\n=== 克隆里的后端测试 ===")
+        unit = subprocess.run(
+            [str(python), "-m", "unittest", "discover", "-s", "tests", "-t", "."],
+            cwd=str(clone / "backend"), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        tail = (unit.stdout or unit.stderr or "").strip().splitlines()
+        for line in tail[-4:]:
+            print(f"    {line}")
+        if unit.returncode != 0:
+            ok = False
+            fail("克隆里的后端测试**失败**——有测试依赖了不进版本库的生成物？")
+            for line in (unit.stderr or "").splitlines()[-12:]:
+                print(f"    ! {line}")
+        else:
+            ok_line = next(
+                (line for line in reversed(tail) if line.startswith("Ran ")), ""
+            )
+            info(f"    通过（{ok_line.strip()}）")
+
+        # --- 2) 启动克隆的后端 + 跑 verify ------------------------------------
+        frontend_ready = _link_node_modules(clone)
+        if not frontend_ready:
+            warn("没借到 node_modules，verify 将跳过前端类型检查（--skip-frontend）")
+
+        port = pick_free_port(*CLONE_VERIFY_PORT_RANGE)
+        env = dict(os.environ)
+        env["GMSH_TERMINAL"] = "0"
+        env["SIMCLOUD_API"] = f"http://127.0.0.1:{port}"
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        info(f"\n=== 从克隆启动后端（端口 {port}）===")
+        log_path = clone / "backend" / "clone-verify-backend.log"
+        with open(log_path, "wb") as log:
+            server = subprocess.Popen(
+                [str(python), "-m", "uvicorn", "main:app",
+                 "--host", "127.0.0.1", "--port", str(port)],
+                cwd=str(clone / "backend"), stdout=log, stderr=subprocess.STDOUT,
+                env=env,
+            )
+
+        healthy = False
+        for _ in range(90):
+            if server.poll() is not None:
+                break
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=3):
+                    healthy = True
+                    break
+            except (urllib.error.URLError, OSError):
+                time.sleep(1)
+        if not healthy:
+            ok = False
+            fail("克隆的后端没起来，日志尾部：")
+            print(log_path.read_text(encoding="utf-8", errors="replace")[-1500:])
+        else:
+            info("    后端已就绪")
+            verify_args = ["verify"]
+            if not frontend_ready or args.skip_frontend:
+                verify_args.append("--skip-frontend")
+            info(f"\n=== 克隆里跑 {' '.join(verify_args)} ===")
+            verified = subprocess.run(
+                [str(python), str(clone / "tools" / "tasks.py"), *verify_args],
+                cwd=str(clone), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", env=env,
+            )
+            text = (verified.stdout or "") + (verified.stderr or "")
+            summary = summarise_verify(text)
+            for line in text.splitlines()[-4:]:
+                print(f"    {line}")
+            if verified.returncode != 0 or summary["failed"]:
+                ok = False
+                fail(
+                    f"克隆里的 verify 失败：PASS {summary['passed']} / "
+                    f"FAIL {summary['failed']}"
+                )
+                for name in summary["failures"][:10]:
+                    print(f"    ! {name}")
+            else:
+                info(
+                    f"    通过：PASS {summary['passed']} / FAIL {summary['failed']}"
+                )
+    finally:
+        if server is not None and server.poll() is None:
+            server.terminate()
+            try:
+                server.wait(timeout=15)
+            except subprocess.TimeoutExpired:  # pragma: no cover - 兜底
+                server.kill()
+        if getattr(args, "keep", False):
+            info(f"\n保留现场（--keep）：{clone}")
+        else:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    print()
+    if ok:
+        ok_msg("干净检出可以跑通：单元测试 + 端到端验证")
+        return 0
+    fail("干净检出**跑不通**——上面列出的失败项在别人 clone 之后同样会失败")
+    return 1
+
+
 TASKS = {
     "setup": task_setup,
     "dev": task_dev,
     "stop": task_stop,
     "test": task_test,
     "verify": task_verify,
+    "clone-verify": task_clone_verify,
     "build": task_build,
     "clean": task_clean,
     "doctor": task_doctor,
@@ -4497,6 +4751,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--detach",
         action="store_true",
         help="dev 时后台运行并立即返回（配合 stop 使用；适合脚本/CI）",
+    )
+    parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="clone-verify 结束时保留克隆目录（排查失败原因时用）",
     )
     args = parser.parse_args(argv)
     return TASKS[args.task](args)

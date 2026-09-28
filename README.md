@@ -111,7 +111,18 @@ make setup              # 或 python3 tools/tasks.py setup
 
 # 启动前后端（Ctrl+C 一起停）
 make dev                # 或 python3 tools/tasks.py dev
+
+# 改动之后：单元测试 / 端到端验证
+make test               # 481 个后端用例，不需要起服务
+make verify             # 135 项端到端检查（解析解物理校准都在这里），需要后端在跑
+
+# 「干净检出能不能过」——克隆一份只有被跟踪文件的副本，跑单元测试 + verify
+python3 tools/tasks.py clone-verify
 ```
+
+`clone-verify` 是本项目对"只在我机器上验证过"这类漏洞的防线：克隆里没有 venv、
+没有 `node_modules`、没有 `*.msh` 缓存，任何"悄悄依赖了不进版本库的生成物"的
+测试都会露出来（历史上真的抓到过一条）。CI 本身就是干净检出，所以它主要供本地用。
 
 Windows 也可以用原来的写法（薄封装，转发到同一个实现）：
 
@@ -213,7 +224,7 @@ cd frontend && npm run dev
 
 - `tsc --noEmit` 无错误；`vite build` 成功；
 - **`python3 tools/tasks.py test`：481 个后端用例全部通过**（约 14 秒，无需启动服务器）；
-- **`python3 tools/tasks.py verify`：134 项端到端检查全部通过**；
+- **`python3 tools/tasks.py verify`：135 项端到端检查全部通过**；
 - 全流程跑通：上传 → 网格 → 求解 → 云图（含变形显示）；
 - 求解器物理正确性抽查：10×10×10 立方体轴向拉伸，加载面中心位移 `4.17e-10` vs 解析解 `FL/AE = 5e-10`（比值 0.835，全约束端略刚于自由杆，符合预期）；支反力合计与施加载荷精确抵消。
 
