@@ -34,8 +34,25 @@ jobs:
         run: pip install -r backend/requirements.txt
 
       - name: 运行测试（含物理回归）
+        id: tests
         working-directory: backend
-        run: python -m unittest discover -s tests -t . -v
+        # 先把输出落盘再判定成败：**失败原因要能变成注解**（见下面的步骤）。
+        # Actions 的日志下载需要 admin 权限，而注解可通过公开 API 读到——
+        # 第一次 CI 失败时，没有仓库权限的人完全看不到原因。
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -t . -v 2>&1 | tee ../ci-tests.log
+
+      - name: 失败原因发成注解
+        if: always()
+        run: python tools/ci_annotate.py ci-tests.log --mode failures --max 25 --title "后端测试"
+
+      - name: 测试失败则让 job 失败
+        if: steps.tests.outcome == 'failure'
+        run: |
+          echo "后端测试失败（失败项见上面的注解）"
+          exit 1
 
   frontend:
     name: 前端类型检查与构建
@@ -114,26 +131,46 @@ jobs:
 
       # 后端与 verify 放在**同一个 step** 里：跨 step 的后台进程能不能活下来
       # 取决于 runner 怎么处理进程组，放在一起就不必赌这件事。
+      #
+      # 第一次运行这个 step 是**失败的**：后端在 60 秒内没就绪（`curl` 一直连不上），
+      # 而失败原因只在 job 日志里——那份日志要 admin 权限才下得下来。所以现在：
+      # verify 的输出也落盘，失败时由下一步发成**注解**（公开可读）。
       - name: 启动后端并跑端到端验证
         run: |
+          # pipefail 必须开：`... | tee file` 的退出码默认是 tee 的 0，
+          # 那样 verify 失败会被**报告成成功**——这是最坏的一种 CI 错误。
+          set -o pipefail
           cd backend
           nohup python -m uvicorn main:app --host 127.0.0.1 --port 8000 \
             > ci-backend.log 2>&1 &
-          for attempt in $(seq 1 60); do
+          server_pid=$!          # 用 $! 而不是 pgrep：进程刚 fork 时 pgrep 可能还找不到
+          for attempt in $(seq 1 120); do
             if curl -fsS http://127.0.0.1:8000/api/health > /dev/null; then
               echo "后端已就绪（第 ${attempt} 次探测）"
               break
             fi
-            if [ "${attempt}" = "60" ]; then
-              echo "后端未在 60 秒内就绪"
+            # 进程已经死了就不必再等：真正的死因在日志里
+            if ! kill -0 "${server_pid}" 2>/dev/null; then
+              echo "后端进程已退出（pid ${server_pid}），日志："
+              tail -100 ci-backend.log
+              exit 1
+            fi
+            if [ "${attempt}" = "120" ]; then
+              echo "后端未在 120 秒内就绪"
               tail -100 ci-backend.log
               exit 1
             fi
             sleep 1
           done
           cd ..
-          python tools/tasks.py verify
+          python tools/tasks.py verify 2>&1 | tee ci-verify.log
 
-      - name: 失败时输出后端日志
+      - name: 失败原因发成注解（不用管理员权限也能看）
         if: failure()
-        run: tail -200 backend/ci-backend.log || true
+        run: |
+          echo "--- 后端启动日志尾部 ---"
+          python tools/ci_annotate.py backend/ci-backend.log --mode tail --max 30 \
+            --title "后端启动日志" || true
+          echo "--- verify 失败项 ---"
+          python tools/ci_annotate.py ci-verify.log --mode failures --max 25 \
+            --title "verify 失败项" || true

@@ -71,10 +71,27 @@ make dev                # 或 python3 tools/tasks.py dev
 | 命令（跨平台） | Windows 等价 | 验证什么 | 需要服务在跑吗 | 何时用 |
 |---|---|---|---|---|
 | `make test` / `python3 tools/tasks.py test` | `scripts\test.ps1` | 后端单元 + 物理回归（**513** 个用例，约 14 秒） | **不需要** | 改动任何后端逻辑后**必跑** |
-| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准 + 认证/隔离/配置/共享（**146** 项） | 需要 | 提交前跑一次 |
+| `make verify` / `python3 tools/tasks.py verify` | `scripts\verify.ps1` | 端到端：类型检查 + 真实 HTTP + 解析解校准 + 认证/隔离/配置/共享（**147** 项） | 需要 | 提交前跑一次 |
 | `make build` | — | 前端类型检查 + 生产构建 | 不需要 | 改前端后 |
 | `python3 tools/tasks.py clone-verify` | — | **干净检出**（只有被跟踪的文件）里的单元测试 + `verify` | 不需要（它自己起一个临时后端，端口自动选） | 改动可能依赖生成物时；推送前 |
+| `python3 tools/tasks.py check-ci` | — | CI 能不能跑起来里**本地查得了的部分**（见下） | 不需要（要联网） | 推送前 |
 | CI（`.github/workflows/ci.yml`） | — | 上面几项的自动化版本 | 不需要 | push / PR 时自动跑 |
+
+**`check-ci` 查什么**：CI 第一步（装依赖）的失败**本地永远复现不了**——本地依赖早就
+装好了，`pip install -r` 只会说 "Requirement already satisfied"，所以"pins 在 PyPI 上
+真的存在"这件事只能主动去核对。它做四件事：
+
+1. `requirements.txt` / `requirements.lock.txt` 里**每个 pin 去 PyPI 核对是否存在**
+   （版本写错、被 yank、名字拼错 → CI 第一步就红）；
+2. `npm ci --dry-run` 核对 `package-lock.json` 与 `package.json` **是否同步**
+   （不同步的话 npm 会直接 EUSAGE 硬失败）；
+3. workflow 的 job 齐不齐、关键命令在不在、**引用到的路径是否都存在且进了版本库**
+   （干净检出里没有未跟踪文件）；
+4. **如实列出本地查不了的部分**：bash 片段的语法（本机可能没有 bash）、apt 包在
+   runner 上是否可得、runner 的 Node/Python 版本、各 action 的可用性。
+
+第 3 项已经**离线**进了 `verify`（每次跑都盯着 CI 配置漂移），所以 CI 配置被改坏
+会在 `make verify` 里当场红，而不是等推上去。第 1、2 项要联网，留在 `check-ci` 里。
 
 **可选依赖 `pyflakes`**（`pip install pyflakes`）：`verify` 里有一条检查用它查
 `tools/tasks.py` 的未定义名字。没装就跳过并在说明里写明——**CI 会装，所以那条在

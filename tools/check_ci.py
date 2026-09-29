@@ -202,19 +202,94 @@ def check_workflow() -> list:
     return problems
 
 
+def check_declared_dependencies() -> list:
+    """
+    后端源码/测试里 import 的第三方包，是否都在 `requirements.txt` 里声明了。
+
+    **为什么这是 CI 专属的失败**：本机的 venv 是三十多轮里一点点长出来的，装过
+    一堆没写进 requirements 的东西；那种代码在本机永远绿，而 CI 上
+    `pip install -r requirements.txt` 装完就缺包——这正是"本地复现不了"的典型。
+
+    （第一次 CI 运行就出现了这个形态：后端测试 job 在 12 秒内失败，而本地 513
+    个用例全过。前端 job 与所有安装步骤都是成功的。）
+    """
+    import ast
+    import sys
+    from importlib.metadata import packages_distributions
+
+    try:
+        import importlib.metadata as metadata
+    except ImportError:  # pragma: no cover - 3.8+ 都有
+        return []
+
+    declared = set()
+    for path in REQUIREMENTS:
+        for name, _version in parse_pins(path):
+            declared.add(name.lower().replace("_", "-"))
+
+    local_modules = {
+        path.stem for path in (ROOT / "backend").glob("*.py")
+    }
+    mapping = packages_distributions()
+    problems = []
+    seen = set()
+    targets = list((ROOT / "backend").glob("*.py"))
+    targets += list((ROOT / "backend" / "tests").glob("*.py"))
+    for path in targets:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:  # 语法错误由别的检查负责
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module.split(".")[0]] if node.module else []
+            else:
+                continue
+            for name in names:
+                if name in sys.stdlib_module_names or name in local_modules:
+                    continue
+                if name.startswith("tests") or name in seen:
+                    continue
+                distributions = mapping.get(name)
+                if not distributions:
+                    seen.add(name)
+                    problems.append(
+                        f"{path.name} 导入了 {name}，但本机没装它（无法判断归属）"
+                    )
+                    continue
+                # 该模块由某个发行版提供；只要**任一**提供者在 requirements 里就算声明过
+                if not any(
+                    dist.lower().replace("_", "-") in declared
+                    for dist in distributions
+                ):
+                    seen.add(name)
+                    problems.append(
+                        f"{path.name} 导入了 {name}（来自 {distributions[0]}），"
+                        "但 requirements.txt 里没有声明它"
+                    )
+    if not problems:
+        info("  后端源码/测试的第三方 import 都能在 requirements.txt 里找到")
+    return problems
+
+
 def main() -> int:
     problems = []
 
-    info("=== 1/3 PyPI 上的 pinned 版本 ===")
+    info("=== 1/4 PyPI 上的 pinned 版本 ===")
     problems += check_pins()
 
-    info("\n=== 2/3 npm lock 文件同步 ===")
+    info("\n=== 2/4 npm lock 文件同步 ===")
     npm_problems, checked = check_npm_lock()
     problems += npm_problems
     if not checked:
         info("  跳过：本机没有 npm（CI 上这一步是 npm ci）")
 
-    info("\n=== 3/3 workflow 结构与引用 ===")
+    info("\n=== 3/4 依赖声明完整性（本地装了但没声明 = CI 上必挂）===")
+    problems += check_declared_dependencies()
+
+    info("\n=== 4/4 workflow 结构与引用 ===")
     problems += check_workflow()
 
     info("\n=== 本地查不了的部分（不算通过）===")

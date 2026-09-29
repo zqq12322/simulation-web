@@ -35,11 +35,41 @@ class ResolveUploadPathTests(unittest.TestCase):
         self.assertEqual(path.suffix.lower(), ".step")
 
     def test_case_is_canonicalised_for_existing_files(self):
-        """已存在文件会被规范化成磁盘上的真实大小写（行为记录）。"""
+        """
+        已存在文件会被规范化成磁盘上的真实大小写——**这是大小写不敏感文件系统
+        （Windows）的行为**，在 Linux 上要把两种情形分开断言。
+
+        第一版只写了 Windows 那一半，于是：
+
+        - 本机（Windows）：`零件1.step` 与磁盘上的 `零件1.STEP` 是同一个文件，
+          `resolve()` 把它规范化成真实大小写 → 通过；
+        - CI（Linux）：大小写敏感，`零件1.step` 就是"另一个不存在的文件"，
+          没有任何东西可规范化，`.name` 保持小写 → **必然失败**。
+
+        而且这条测试在夹具不存在时会 skip，所以"夹具被提交进仓库"之前它在 CI 上
+        是静默跳过的——**skip 掩盖了这个平台差异**。这正是第一次 CI 运行暴露出来的
+        问题（后端测试 job 12 秒失败，本机 513 个用例全绿）。
+
+        现在两种平台都有断言：既不放弃 Windows 的行为记录，也不再假装 Linux 上
+        会发生同样的事。
+        """
         existing = config.UPLOAD_DIR / "零件1.STEP"
         if not existing.exists():
             self.skipTest("测试夹具 零件1.STEP 不存在")
-        self.assertEqual(config.resolve_upload_path("零件1.step").name, "零件1.STEP")
+
+        resolved = config.resolve_upload_path("零件1.step")
+        # 两种平台都必须成立的契约：留在上传目录内、扩展名不变
+        self.assertEqual(resolved.parent, config.UPLOAD_DIR.resolve())
+        self.assertEqual(resolved.suffix.lower(), ".step")
+
+        # 直接问文件系统"小写名能不能找到"，而不是猜平台：这才是判据本身
+        lower_exists = (config.UPLOAD_DIR / "零件1.step").exists()
+        if lower_exists:
+            self.assertEqual(resolved.name, "零件1.STEP",
+                             "大小写不敏感的文件系统上应规范化为真实大小写")
+        else:
+            self.assertEqual(resolved.name, "零件1.step",
+                             "大小写敏感的文件系统上不该把请求名改写成别的已存在文件")
 
     def test_rejects_path_traversal(self):
         bad_names = [

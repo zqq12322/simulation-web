@@ -114,15 +114,23 @@ make dev                # 或 python3 tools/tasks.py dev
 
 # 改动之后：单元测试 / 端到端验证
 make test               # 513 个后端用例，不需要起服务
-make verify             # 146 项端到端检查（解析解物理校准都在这里），需要后端在跑
+make verify             # 147 项端到端检查（解析解物理校准都在这里），需要后端在跑
 
 # 「干净检出能不能过」——克隆一份只有被跟踪文件的副本，跑单元测试 + verify
 python3 tools/tasks.py clone-verify
+
+# 推送前：查「CI 会在哪一步红」里本地能查的部分（pins 是否存在、lock 是否同步…）
+python3 tools/tasks.py check-ci
 ```
 
 `clone-verify` 是本项目对"只在我机器上验证过"这类漏洞的防线：克隆里没有 venv、
 没有 `node_modules`、没有 `*.msh` 缓存，任何"悄悄依赖了不进版本库的生成物"的
 测试都会露出来（历史上真的抓到过一条）。CI 本身就是干净检出，所以它主要供本地用。
+
+`check-ci` 补的是另一类：CI 第一步（装依赖）的失败**本地永远复现不了**（本地依赖
+早就装好了，pip 只会说 already satisfied）。它会去 PyPI 核对每个 pin、用
+`npm ci --dry-run` 核对 lock 文件，并**如实列出本地查不了的部分**（bash 语法、
+apt 包、runner 版本）——那些只能等推上去才知道。
 
 Windows 也可以用原来的写法（薄封装，转发到同一个实现）：
 
@@ -224,7 +232,7 @@ cd frontend && npm run dev
 
 - `tsc --noEmit` 无错误；`vite build` 成功；
 - **`python3 tools/tasks.py test`：513 个后端用例全部通过**（约 14 秒，无需启动服务器）；
-- **`python3 tools/tasks.py verify`：146 项端到端检查全部通过**；
+- **`python3 tools/tasks.py verify`：147 项端到端检查全部通过**；
 - 全流程跑通：上传 → 网格 → 求解 → 云图（含变形显示）；
 - 求解器物理正确性抽查：10×10×10 立方体轴向拉伸，加载面中心位移 `4.17e-10` vs 解析解 `FL/AE = 5e-10`（比值 0.835，全约束端略刚于自由杆，符合预期）；支反力合计与施加载荷精确抵消。
 
