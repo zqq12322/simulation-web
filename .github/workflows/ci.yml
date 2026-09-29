@@ -23,15 +23,27 @@ jobs:
           cache: pip
           cache-dependency-path: backend/requirements.txt
 
-      # Gmsh 的 Python wheel 自带原生库，但无头环境下仍需要这些系统库
+      # Gmsh 的 Python wheel 自带原生库，但无头环境下仍需要这些系统库。
+      # `libgl1` / `libxext6` 本来会作为 `libglu1-mesa` 的依赖被装上，但**显式列出来**
+      # 更稳：第一次 CI 失败时，我无法确认"gmsh 到底加载成功没有"，只能推断。
       - name: 安装 Gmsh 所需的系统库
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libglu1-mesa libxrender1 libxcursor1 libxft2 libxinerama1
+            libglu1-mesa libgl1 libxext6 libxrender1 libxcursor1 libxft2 libxinerama1
 
       - name: 安装后端依赖
         run: pip install -r backend/requirements.txt
+
+      # 把"依赖坏了"和"代码坏了"分开，**靠的就是这一步的名字**：
+      # job 的步骤名和结论是公开可读的，日志不是（下载要 admin 权限）。
+      # 第一次 CI 失败时后端测试与 verify 同时挂掉，我无法判断是不是 gmsh 在
+      # Linux 上加载不了——加了这一步之后，下次一眼就能看出来。
+      - name: 冒烟：依赖能不能真的加载（gmsh / numpy / scipy / skfem）
+        run: |
+          python -c "import gmsh; gmsh.initialize(); print('gmsh ok', getattr(gmsh, '__version__', '')); gmsh.finalize()"
+          python -c "import numpy, scipy, skfem; print('numpy', numpy.__version__, 'scipy', scipy.__version__, 'skfem', skfem.__version__)"
+          python -c "import sys; sys.path.insert(0, 'backend'); import main; print('app import ok')"
 
       - name: 运行测试（含物理回归）
         id: tests
@@ -113,10 +125,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libglu1-mesa libxrender1 libxcursor1 libxft2 libxinerama1
+            libglu1-mesa libgl1 libxext6 libxrender1 libxcursor1 libxft2 libxinerama1
 
       - name: 安装后端依赖
         run: pip install -r backend/requirements.txt
+
+      # 与 backend job 同样的冒烟步骤：把"依赖坏了"与"启动方式坏了"分开。
+      # 第一次运行时这个 job 的失败是"后端 60 秒没起来"，而步骤名是公开的、
+      # 日志不是——所以这个区分必须落在**步骤**上。
+      - name: 冒烟：依赖能不能真的加载（gmsh / numpy / scipy / skfem）
+        run: |
+          python -c "import gmsh; gmsh.initialize(); print('gmsh ok', getattr(gmsh, '__version__', '')); gmsh.finalize()"
+          python -c "import numpy, scipy, skfem; print('numpy', numpy.__version__, 'scipy', scipy.__version__, 'skfem', skfem.__version__)"
+          python -c "import sys; sys.path.insert(0, 'backend'); import main; print('app import ok')"
 
       # verify 里有一条"任务脚本无未定义名字"的检查靠它；
       # `tools/tasks.py` 本身只用标准库，所以它是**可选**依赖，缺了就跳过。

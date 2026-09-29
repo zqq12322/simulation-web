@@ -32,7 +32,13 @@ import sys
 #: GitHub workflow command 里的转义规则
 _ESCAPES = (("%", "%25"), ("\r", "%0D"), ("\n", "%0A"))
 
-_FAILURE = re.compile(r"^(FAIL|ERROR):\s*(.+)$")
+#: 两种失败标记都要认：
+#: - unittest 的 `FAIL: 用例名 (模块.类)`
+#: - verify 自己的 `  [FAIL] 检查名   说明`
+#: 第一版只认前一种，于是 verify 那一半的注解**什么也抓不到**——接线检查
+#: （读自己的 workflow）才发现的。摘要行与失败行在 verify 里是同一行，
+#: 所以 group(1) 会把两者都带上，这是可以接受的。
+_FAILURE = re.compile(r"^(?:\[FAIL\]|(FAIL|ERROR):)\s*(.+)$")
 
 
 def escape(text: str) -> str:
@@ -43,11 +49,11 @@ def escape(text: str) -> str:
 
 def failure_lines(text: str) -> list:
     """
-    抽出 (失败用例, 说明) 对。
+    抽出 (失败用例/检查名, 说明) 对，**两种格式都认**：
 
-    说明取的是**分隔线之后的第一行**——unittest 在那里打印用例的首行 docstring，
-    而这个仓库把 docstring 当"这条在检查什么"来写，所以它往往比用例名有用得多。
-    （第一版只看紧跟失败行的下一行，结果那一行是 `------` 分隔线，说明全是空的。）
+    - unittest：`FAIL: 用例名 (模块.类)`，说明在分隔线之后的第一行（unittest 在那里
+      打印用例首行 docstring，而本仓库把它当"这条在检查什么"来写）；
+    - verify：`  [FAIL] 检查名   说明`，两者在同一行。
     """
     lines = text.splitlines()
     found = []
@@ -55,16 +61,19 @@ def failure_lines(text: str) -> list:
         match = _FAILURE.match(line.strip())
         if not match:
             continue
-        detail = ""
-        for candidate in lines[index + 1: index + 6]:
-            stripped = candidate.strip()
-            if not stripped or set(stripped) <= {"-", "="}:
-                continue          # 分隔线 / 空行：继续往下找
-            if stripped.startswith("Traceback"):
-                break             # 说明行在 Traceback 之前；没有就算了
-            detail = stripped
-            break
-        found.append((match.group(2).strip(), detail))
+        if match.group(1):                      # unittest 形式：说明在下面几行
+            detail = ""
+            for candidate in lines[index + 1: index + 6]:
+                stripped = candidate.strip()
+                if not stripped or set(stripped) <= {"-", "="}:
+                    continue                    # 分隔线 / 空行：继续往下找
+                if stripped.startswith("Traceback"):
+                    break                       # 说明在 Traceback 之前；没有就算了
+                detail = stripped
+                break
+            found.append((match.group(2).strip(), detail))
+        else:                                   # verify 形式：整行就是全部信息
+            found.append((match.group(2).strip(), ""))
     return found
 
 

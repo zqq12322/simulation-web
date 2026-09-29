@@ -4716,6 +4716,52 @@ def task_verify(args: argparse.Namespace) -> int:
                 except Exception:  # noqa: BLE001 - 清理失败不该影响验证结论
                     pass
 
+    # --- 给 CI 失败做注解的工具，本身必须是被测过的 --------------------------
+    # 注解是我在 CI 失败时**唯一**能读到的信息（日志下载要 admin 权限）。它抓不到
+    # 就等于我又回到"只看得到红、看不到为什么"。第一次写它时漏了 verify 的
+    # `[FAIL]` 格式，接线检查才发现——所以这里让它的自测每次都跑。
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "test_ci_annotate.py")],
+            cwd=str(ROOT), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        caught = completed.stdout.count("[抓住]")
+        # 数**标记**而不是数"没抓住"四个字：自测的摘要行是"没抓住的数量：0"，
+        # 它本身就含那三个字，第一版因此把通过当成了失败（假阴性）。
+        missed = completed.stdout.count("[**没抓住**]")
+        check(
+            "CI 注解器自测（两种失败格式都要抓到）",
+            completed.returncode == 0 and missed == 0,
+            f"{caught} 项自测通过"
+            if completed.returncode == 0
+            else (completed.stdout or completed.stderr).strip()[-160:],
+        )
+    except Exception as exc:  # noqa: BLE001 - 这个闸门自己不许把 verify 弄崩
+        check("CI 注解器自测（两种失败格式都要抓到）", False,
+              f"{type(exc).__name__}: {exc}")
+
+    # --- 跨平台可移植性 ------------------------------------------------------
+    # 这个项目在 Windows 上开发，而 CI 跑在 Linux 上。有一整类问题在 Windows 上
+    # **永远看不出来**（import 大小写不匹配最典型），而 `clone-verify` 也是在
+    # Windows 上克隆的，同样抓不到。这个检查只用标准库、不需要联网，所以放在这里
+    # 每次跑都盯着。
+    try:
+        import check_portability
+
+        problems = check_portability.check_import_case() + \
+            check_portability.check_windows_paths()
+        check(
+            "跨平台可移植性（import 大小写 / 反斜杠路径）",
+            not problems,
+            "；".join(problems[:4]) if problems else "本地模块名与 import 一致，无 Windows 专属路径",
+        )
+    except Exception as exc:  # noqa: BLE001 - 这个闸门自己不许把 verify 弄崩
+        check(
+            "跨平台可移植性（import 大小写 / 反斜杠路径）", False,
+            f"{type(exc).__name__}: {exc}",
+        )
+
     # --- CI 配置不许悄悄坏掉 ------------------------------------------------
     # 离线能查的那部分（job 齐不齐、引用到的路径是否存在且进了版本库）放进
     # verify，这样每次跑都盯着。需要联网/需要真 runner 的部分留给 `check-ci`。
